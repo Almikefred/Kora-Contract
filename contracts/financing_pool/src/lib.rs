@@ -28,6 +28,7 @@ pub enum DataKey {
     AccessControl,
     RepaymentLock(u64),
     UpgradeProposal,
+    MaxPositionBps,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -46,11 +47,16 @@ impl FinancingPoolContract {
         access_control: Address,
         late_penalty_bps: u32,
         price_oracle: Address,
+        max_position_bps: u32,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
         kora_shared::validation::require_valid_fee_bps(late_penalty_bps)?;
+        // max_position_bps must be in [1, 10_000]: zero would block all funding
+        if max_position_bps == 0 || max_position_bps > 10_000 {
+            return Err(KoraError::InvalidFeeRate);
+        }
         kora_shared::validation::require_not_self(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &invoice_nft)?;
         kora_shared::validation::require_not_self(&env, &risk_registry)?;
@@ -68,6 +74,7 @@ impl FinancingPoolContract {
         env.storage().instance().set(&DataKey::AccessControl, &access_control);
         env.storage().instance().set(&DataKey::LatePenaltyBps, &late_penalty_bps);
         env.storage().instance().set(&DataKey::PriceOracle, &price_oracle);
+        env.storage().instance().set(&DataKey::MaxPositionBps, &max_position_bps);
         Ok(())
     }
 
@@ -130,6 +137,25 @@ impl FinancingPoolContract {
         Ok(())
     }
 
+    /// Update the per-investor concentration cap. Admin only.
+    pub fn set_max_position_bps(env: Env, admin: Address, max_position_bps: u32) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        if max_position_bps == 0 || max_position_bps > 10_000 {
+            return Err(KoraError::InvalidFeeRate);
+        }
+        env.storage().instance().set(&DataKey::MaxPositionBps, &max_position_bps);
+        Ok(())
+    }
+
+    /// Returns the current per-investor concentration cap in basis points.
+    pub fn get_max_position_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxPositionBps)
+            .unwrap_or(5_000)
+    }
+
     /// Register an investor position. Admin only.
     pub fn record_position(
         env: Env,
@@ -155,6 +181,16 @@ impl FinancingPoolContract {
             .checked_mul(10_000)
             .and_then(|v| v.checked_div(total_pool))
             .ok_or(KoraError::ArithmeticOverflow)? as u32;
+
+        // Enforce per-investor concentration cap
+        let max_position_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPositionBps)
+            .unwrap_or(5_000);
+        if share_bps > max_position_bps {
+            return Err(KoraError::ExceedsFundingTarget);
+        }
 
         let position = Position {
             investor: investor.clone(),
@@ -878,6 +914,82 @@ mod tests {
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &treasury, &ac, &10_000u32, &oracle);
         assert!(result.is_ok());
+    }
+
+    // ── Concentration cap tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_record_position_at_cap_accepted() {
+        // Default cap is 5000 bps (50%). Investor contributing exactly 50% must be accepted.
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        let investor = Address::generate(&env);
+        // 5_000 / 10_000 = 50% = 5000 bps, exactly at default cap
+        let result = client.try_record_position(
+            &admin, &1u64, &investor, &5_000i128, &10_000i128,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_record_position_over_cap_rejected() {
+        // Default cap is 5000 bps (50%). Investor contributing 51% must be rejected.
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        let investor = Address::generate(&env);
+        // 5_100 / 10_000 = 51% = 5100 bps, exceeds default cap of 5000
+        let result = client.try_record_position(
+            &admin, &1u64, &investor, &5_100i128, &10_000i128,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_position_diversified_investors_pass_cap() {
+        // Two investors each at 50% of a pool: both should succeed because
+        // each individual share is at or below the cap.
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        let i1 = Address::generate(&env);
+        let i2 = Address::generate(&env);
+        assert!(client.try_record_position(
+            &admin, &1u64, &i1, &5_000i128, &10_000i128,
+        ).is_ok());
+        assert!(client.try_record_position(
+            &admin, &1u64, &i2, &5_000i128, &10_000i128,
+        ).is_ok());
+    }
+
+    #[test]
+    fn test_set_max_position_bps_updates_cap() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        // Lower the cap to 2000 bps (20%)
+        client.set_max_position_bps(&admin, &2_000u32);
+        assert_eq!(client.get_max_position_bps(), 2_000u32);
+
+        let investor = Address::generate(&env);
+        // 21% should now be rejected
+        let result = client.try_record_position(
+            &admin, &1u64, &investor, &2_100i128, &10_000i128,
+        );
+        assert!(result.is_err());
+        // 20% should still be accepted
+        let result = client.try_record_position(
+            &admin, &1u64, &investor, &2_000i128, &10_000i128,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_set_max_position_bps_zero_rejected() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        let result = client.try_set_max_position_bps(&admin, &0u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_max_position_bps_non_admin_rejected() {
+        let (env, _admin, _nft, _treasury, _ac, client) = setup();
+        let stranger = Address::generate(&env);
+        let result = client.try_set_max_position_bps(&stranger, &3_000u32);
+        assert!(result.is_err());
     }
 }
 
