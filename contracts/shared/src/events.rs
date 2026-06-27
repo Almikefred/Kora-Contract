@@ -96,6 +96,16 @@ pub fn listing_cancelled(env: &Env, invoice_id: u64, seller: &Address) {
     );
 }
 
+/// Emitted when a seller or admin requests cancellation of a partially-funded listing.
+/// Phase 1 of the two-phase cancellation flow.
+pub fn cancellation_requested(env: &Env, invoice_id: u64, requester: &Address) {
+    emit(
+        env,
+        symbol_short!("CXL_REQ"),
+        (invoice_id, requester.clone(), env.ledger().timestamp()),
+    );
+}
+
 /// Standardized marketplace event: listing expired (funding deadline passed).
 /// Schema: topic, actor (seller), listing (invoice_id), amount (0), ledger_seq (timestamp)
 pub fn listing_expired(env: &Env, invoice_id: u64, seller: &Address) {

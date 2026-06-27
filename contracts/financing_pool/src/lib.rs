@@ -4,9 +4,9 @@ use kora_shared::{
     errors::KoraError,
     events,
     types::{Pool, Position},
-    validation::{bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Symbol, Vec};
 
 const MAX_AMOUNT: i128 = i128::MAX / 2;
 
@@ -28,6 +28,7 @@ pub enum DataKey {
     AccessControl,
     RepaymentLock(u64),
     UpgradeProposal,
+    PriceOracle,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────

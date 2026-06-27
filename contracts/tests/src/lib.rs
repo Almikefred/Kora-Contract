@@ -66,9 +66,9 @@ mod integration {
         // Initialize all contracts
         ac.initialize(&admin);
         nft.initialize(&admin, &ac_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &50u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &ac_id, &50u32);
         let oracle_addr = Address::generate(&env);
-        pool.initialize(&admin, &nft_id, &treasury_id, &ac_id, &200u32, &oracle_addr);
+        pool.initialize(&admin, &nft_id, &rr_id, &treasury_id, &ac_id, &200u32, &oracle_addr);
         treasury.initialize(&admin, &50u32);
         rr.initialize(&admin, &nft_id);
 
@@ -691,5 +691,153 @@ mod integration {
         // Total distributed must not exceed what was repaid
         let total_distributed = (bal_a_after - bal_a_before) + (bal_b_after - bal_b_before);
         assert!(total_distributed <= partial_repayment);
+    }
+
+    /// Fee-accounting reconciliation: verifies zero token leakage across
+    /// marketplace/treasury/financing_pool under a multi-invoice, multi-investor scenario.
+    ///
+    /// For every funded invoice the invariant is:
+    ///   investor_paid == fee_to_treasury + net_to_pool
+    ///
+    /// After all operations, the sum of every token movement is independently
+    /// tracked and asserted to reconcile exactly.
+    #[test]
+    fn test_full_fee_accounting_reconciliation() {
+        use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+        let k = deploy_protocol();
+
+        // Deploy a real token so we can track balances
+        let token_id = k.env.register_stellar_asset_contract_v2(k.admin.clone());
+        let token_addr = token_id.address();
+        let token = TokenClient::new(&k.env, &token_addr);
+        let token_admin = StellarAssetClient::new(&k.env, &token_addr);
+
+        k.marketplace.whitelist_token(&k.admin, &token_addr);
+
+        // fee_bps for marketplace = 50 (0.5%)
+        let fee_bps: i128 = 50;
+
+        // ── Scenario: 3 invoices, varying investor counts ─────────────────────
+
+        struct InvoiceScenario {
+            asking_price: i128,
+            face_value: i128,
+            // (investor_index, amount)
+            fundings: [(usize, i128); 2],
+        }
+
+        let scenarios = [
+            InvoiceScenario {
+                asking_price: 9_000_0000000i128,
+                face_value: 10_000_0000000i128,
+                fundings: [(0, 5_000_0000000i128), (1, 4_000_0000000i128)],
+            },
+            InvoiceScenario {
+                asking_price: 8_000_0000000i128,
+                face_value: 9_000_0000000i128,
+                fundings: [(1, 4_000_0000000i128), (2, 4_000_0000000i128)],
+            },
+            InvoiceScenario {
+                asking_price: 7_500_0000000i128,
+                face_value: 8_000_0000000i128,
+                fundings: [(0, 4_000_0000000i128), (2, 3_500_0000000i128)],
+            },
+        ];
+
+        let investors: [Address; 3] = [
+            Address::generate(&k.env),
+            Address::generate(&k.env),
+            Address::generate(&k.env),
+        ];
+        let sme = Address::generate(&k.env);
+
+        // Pre-mint tokens: each investor gets enough for all their contributions
+        let large_mint: i128 = 20_000_0000000i128;
+        token_admin.mint(&investors[0], &large_mint);
+        token_admin.mint(&investors[1], &large_mint);
+        token_admin.mint(&investors[2], &large_mint);
+
+        let treasury_bal_before = token.balance(&k.treasury.address);
+        let pool_bal_before = token.balance(&k.pool.address);
+
+        // Track expected totals independently
+        let mut total_investor_paid: i128 = 0;
+        let mut total_expected_fee: i128 = 0;
+        let mut total_expected_net: i128 = 0;
+
+        let (debtor_hash, _, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
+
+        for scenario in &scenarios {
+            // Mint invoice
+            let invoice_id = k.invoice_nft.mint_invoice(
+                &sme,
+                &debtor_hash,
+                &scenario.face_value,
+                &currency,
+                &due_date,
+                &ipfs_cid,
+                &risk_score,
+            );
+
+            let funding_deadline = k.env.ledger().timestamp() + 86_400 * 30;
+            k.marketplace.list_invoice(
+                &sme,
+                &invoice_id,
+                &scenario.asking_price,
+                &scenario.face_value,
+                &token_addr,
+                &funding_deadline,
+            );
+
+            // Fund the invoice — compute and track expected fee/net per funding
+            for &(inv_idx, amount) in &scenario.fundings {
+                let fee = amount * fee_bps / 10_000;
+                let net = amount - fee;
+                total_investor_paid += amount;
+                total_expected_fee += fee;
+                total_expected_net += net;
+
+                k.marketplace
+                    .fund_invoice(&investors[inv_idx], &invoice_id, &amount);
+            }
+        }
+
+        // ── Reconcile balances ────────────────────────────────────────────────
+
+        let treasury_bal_after = token.balance(&k.treasury.address);
+        let pool_bal_after = token.balance(&k.pool.address);
+
+        let actual_fee_collected = treasury_bal_after - treasury_bal_before;
+        let actual_net_to_pool = pool_bal_after - pool_bal_before;
+
+        // Fee collected by treasury must match expectation exactly
+        assert_eq!(
+            actual_fee_collected,
+            total_expected_fee,
+            "treasury fee mismatch: expected {}, got {}",
+            total_expected_fee,
+            actual_fee_collected
+        );
+
+        // Net sent to pool must match expectation exactly
+        assert_eq!(
+            actual_net_to_pool,
+            total_expected_net,
+            "pool net mismatch: expected {}, got {}",
+            total_expected_net,
+            actual_net_to_pool
+        );
+
+        // Zero leakage: fee + net == total investor paid
+        assert_eq!(
+            actual_fee_collected + actual_net_to_pool,
+            total_investor_paid,
+            "token leakage detected: fee({}) + net({}) != paid({})",
+            actual_fee_collected,
+            actual_net_to_pool,
+            total_investor_paid
+        );
     }
 }
