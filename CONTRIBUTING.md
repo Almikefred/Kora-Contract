@@ -104,11 +104,75 @@ docs(README): add mainnet deployment instructions
 
 ---
 
+## Testing & Verification
+
+Before opening a pull request, you **must** run the full local verification suite to ensure your changes pass all checks.
+
+### Verification Commands
+
+Run these commands in order from the repository root:
+
+```bash
+# 1. Format all code
+make fmt
+
+# 2. Lint with clippy (treats warnings as errors)
+make lint
+
+# 3. Run all unit and integration tests
+cargo test --all
+```
+
+All three must pass with no errors or warnings before opening a PR.
+
+### Understanding AUDIT FIX Comments
+
+When reviewing code, you may see comments marked with `// AUDIT FIX:` These indicate code changes made in response to audit findings or internal reviews.
+
+**Format:**
+```rust
+// AUDIT FIX: Brief description of what was changed and why.
+```
+
+**Example:**
+```rust
+// AUDIT FIX: Removed duplicate sme_invoice_counted event — use sme_invoice_count_incremented instead.
+```
+
+When you find an audit fix comment:
+1. Read the comment to understand the issue that was addressed
+2. Verify the fix is still correct and complete
+3. If adding new code in response to an audit finding, use the same convention
+4. Reference the audit finding ID or GitHub issue if available
+
+### Extending AUDIT FIX Comments
+
+If you discover a bug or security issue and fix it:
+
+1. Add an `// AUDIT FIX:` comment immediately above or within the fixed code
+2. Briefly describe what was wrong and how it was fixed
+3. In your commit message, reference the GitHub issue (e.g., `Closes #XYZ`)
+4. Link to or record the issue in [AUDIT_LOG.md](AUDIT_LOG.md)
+
+### PR Expectations
+
+Every PR must:
+
+- **Pass all checks** — `make fmt`, `make lint`, and `cargo test --all` with zero failures
+- **Include tests** — new features need unit and integration tests; bug fixes need regression tests
+- **Be clear and focused** — address one issue or feature per PR
+- **Have a complete template** — fill in the PR template completely (Summary, Changes, Testing, Security Considerations, Breaking Changes)
+- **Be rebaseable** — use conventional commits; avoid force-pushing after review has started
+
+For PRs that touch storage layout, fee logic, or access control, expect longer review times and requests from two maintainers plus security sign-off.
+
+---
+
 ## Pull Request Process
 
 1. **Branch** from `develop` using the naming convention above.
 2. **Write tests** for every change. New features need both unit and integration tests. Bug fixes need a regression test.
-3. **Run the full suite** locally: `make fmt && make lint && make test`.
+3. **Run the full verification suite** locally: see [Testing & Verification](#testing--verification) above.
 4. **Open the PR** against `develop`. Fill in the PR template completely.
 5. **Request review** from at least one core maintainer.
 6. **Address feedback** — do not force-push after review has started; add new commits instead.
