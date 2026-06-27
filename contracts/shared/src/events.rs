@@ -396,3 +396,25 @@ pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i1
         ),
     );
 }
+
+/// Emitted when a portion of the protocol fee is paid to a referrer.
+/// Payload: (invoice_id, referrer, referral_fee, treasury_fee, timestamp)
+pub fn referral_fee_paid(
+    env: &Env,
+    invoice_id: u64,
+    referrer: &Address,
+    referral_fee: i128,
+    treasury_fee: i128,
+) {
+    emit(
+        env,
+        symbol_short!("REF_FEE"),
+        (
+            invoice_id,
+            referrer.clone(),
+            referral_fee,
+            treasury_fee,
+            env.ledger().timestamp(),
+        ),
+    );
+}
