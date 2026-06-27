@@ -168,15 +168,65 @@ For PRs that touch storage layout, fee logic, or access control, expect longer r
 
 ---
 
+## Changelog Process
+
+We follow [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format. Every PR that affects user-facing behavior or includes an audit fix must include a CHANGELOG entry.
+
+### Adding Changelog Entries
+
+Edit `CHANGELOG.md` under the `## [Unreleased]` section:
+
+```markdown
+## [Unreleased]
+
+### Added
+- New features that users should know about
+
+### Fixed
+- Bug fixes and audit fixes
+
+### Changed
+- Breaking changes or significant behavior modifications
+
+### Deprecated
+- Warnings about planned removal of features
+
+### Security
+- Security vulnerabilities fixed (or new security features)
+```
+
+### Audit Fix Entries
+
+When an audit fix is made, add an entry to the `[Unreleased]` section under **Fixed**:
+
+```markdown
+### Fixed
+- **Removed duplicate sme_invoice_counted event** — use sme_invoice_count_incremented instead (see AUDIT_LOG.md)
+```
+
+Link to [AUDIT_LOG.md](AUDIT_LOG.md) where applicable to track findings across versions.
+
+### Release Process
+
+When cutting a new release:
+
+1. Move all `[Unreleased]` sections to a new version header: `## [X.Y.Z] — YYYY-MM-DD`
+2. Retain an empty `## [Unreleased]` section for the next cycle
+3. Update all old version links at the bottom of the file
+4. Create a git tag: `git tag vX.Y.Z`
+
+---
+
 ## Pull Request Process
 
 1. **Branch** from `develop` using the naming convention above.
 2. **Write tests** for every change. New features need both unit and integration tests. Bug fixes need a regression test.
-3. **Run the full verification suite** locally: see [Testing & Verification](#testing--verification) above.
-4. **Open the PR** against `develop`. Fill in the PR template completely.
-5. **Request review** from at least one core maintainer.
-6. **Address feedback** — do not force-push after review has started; add new commits instead.
-7. **Squash on merge** — maintainers will squash your branch into a single clean commit on `develop`.
+3. **Update CHANGELOG.md** if your change affects user-facing behavior or includes an audit fix (see [Changelog Process](#changelog-process)).
+4. **Run the full verification suite** locally: see [Testing & Verification](#testing--verification) above.
+5. **Open the PR** against `develop`. Fill in the PR template completely.
+6. **Request review** from at least one core maintainer.
+7. **Address feedback** — do not force-push after review has started; add new commits instead.
+8. **Squash on merge** — maintainers will squash your branch into a single clean commit on `develop`.
 
 PRs that touch contract storage layout, fee logic, or access control require review from two maintainers and a security checklist sign-off.
 
