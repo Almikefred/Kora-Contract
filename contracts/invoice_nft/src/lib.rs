@@ -18,8 +18,8 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, RiskTier},
     validation::{
-        require_future_timestamp, require_non_empty_bytes, require_non_empty_string,
-        require_non_zero_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY,
+        require_future_timestamp, require_non_empty_bytes, require_non_zero_amount,
+        require_valid_ipfs_cid, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY,
     },
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol};
@@ -139,7 +139,7 @@ impl InvoiceNftContract {
         require_future_timestamp(&env, due_date)?;
         require_valid_risk_score(risk_score)?;
         require_non_empty_bytes(&debtor_hash)?;
-        require_non_empty_string(&ipfs_cid)?;
+        require_valid_ipfs_cid(&ipfs_cid)?;
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
 
