@@ -308,6 +308,19 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the full security policy.
 
 ---
 
+## Release Process
+
+See [docs/RELEASE.md](docs/RELEASE.md) for the complete release workflow, including:
+- Semantic versioning (MAJOR.MINOR.PATCH)
+- Building and recording WASM hashes
+- Creating git tags and GitHub releases
+- Verifying deployed code matches released binaries
+- Promoting from testnet to mainnet
+
+**TL;DR:** Version bumps go in `Cargo.toml`, changelog updates go in `CHANGELOG.md`, and WASM hashes are recorded in `releases/vX.Y.Z.hashes`.
+
+---
+
 ## Recognition
 
 All contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md). Significant contributions may be recognized with a protocol grant from the Kora Foundation.
