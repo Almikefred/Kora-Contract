@@ -10,6 +10,25 @@
 #   - stellar CLI installed (https://developers.stellar.org/docs/tools/stellar-cli)
 #   - DEPLOYER_SECRET env var set (or use --source flag)
 #   - Contracts built: make build
+#
+# =============================================================================
+# Environment Variables (all optional — defaults shown)
+# =============================================================================
+#
+# Protocol Economics
+#   TREASURY_FEE_BPS          Treasury protocol fee in basis points (default: 50  = 0.5%)
+#   MARKETPLACE_FEE_BPS       Marketplace protocol fee in basis points (default: 50 = 0.5%)
+#   MARKETPLACE_REFERRER_BPS  Fraction of marketplace fee paid to referrer in bps (default: 0 = off)
+#   LATE_PENALTY_BPS          Late-repayment penalty in basis points (default: 200 = 2%)
+#   MAX_POSITION_BPS          Max per-investor share of any pool in basis points (default: 5000 = 50%)
+#
+# Oracle
+#   ORACLE_BASE_CURRENCY      Symbol used as the oracle's base quote currency (default: USDC)
+#
+# Admin
+#   DEPLOYER_SECRET           Required. Stellar secret key / account alias for the deployer.
+#                             The derived public key is used as the initial admin for all contracts.
+#
 # =============================================================================
 
 set -euo pipefail
@@ -19,6 +38,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WASM_DIR="$ROOT_DIR/target/wasm32-unknown-unknown/release"
 DEPLOY_LOG="$ROOT_DIR/deployments/$NETWORK.json"
+
+# ── Protocol parameter defaults ───────────────────────────────────────────────
+
+TREASURY_FEE_BPS="${TREASURY_FEE_BPS:-50}"
+MARKETPLACE_FEE_BPS="${MARKETPLACE_FEE_BPS:-50}"
+MARKETPLACE_REFERRER_BPS="${MARKETPLACE_REFERRER_BPS:-0}"
+LATE_PENALTY_BPS="${LATE_PENALTY_BPS:-200}"
+MAX_POSITION_BPS="${MAX_POSITION_BPS:-5000}"
+ORACLE_BASE_CURRENCY="${ORACLE_BASE_CURRENCY:-USDC}"
 
 # ── Network config ────────────────────────────────────────────────────────────
 
@@ -81,6 +109,15 @@ ADMIN=$(stellar keys address "$SOURCE" 2>/dev/null || echo "$SOURCE")
 echo "Admin   : $ADMIN"
 echo ""
 
+echo "--- Protocol parameters ---"
+echo "  TREASURY_FEE_BPS       : $TREASURY_FEE_BPS"
+echo "  MARKETPLACE_FEE_BPS    : $MARKETPLACE_FEE_BPS"
+echo "  MARKETPLACE_REFERRER_BPS: $MARKETPLACE_REFERRER_BPS"
+echo "  LATE_PENALTY_BPS       : $LATE_PENALTY_BPS"
+echo "  MAX_POSITION_BPS       : $MAX_POSITION_BPS"
+echo "  ORACLE_BASE_CURRENCY   : $ORACLE_BASE_CURRENCY"
+echo ""
+
 echo "--- Deploying contracts ---"
 
 ACCESS_CONTROL_ID=$(deploy_contract "access_control" "$WASM_DIR/kora_access_control.wasm")
@@ -101,6 +138,9 @@ echo "  marketplace    : $MARKETPLACE_ID"
 RISK_REGISTRY_ID=$(deploy_contract "risk_registry" "$WASM_DIR/kora_risk_registry.wasm")
 echo "  risk_registry  : $RISK_REGISTRY_ID"
 
+PRICE_ORACLE_ID=$(deploy_contract "price_oracle" "$WASM_DIR/kora_price_oracle.wasm")
+echo "  price_oracle   : $PRICE_ORACLE_ID"
+
 echo ""
 echo "--- Initializing contracts ---"
 
@@ -110,26 +150,41 @@ echo "  access_control initialized"
 invoke "$INVOICE_NFT_ID" initialize --admin "$ADMIN" --access_control "$ACCESS_CONTROL_ID"
 echo "  invoice_nft initialized"
 
-invoke "$TREASURY_ID" initialize --admin "$ADMIN" --fee_bps 50
-echo "  treasury initialized (fee: 0.5%)"
+invoke "$TREASURY_ID" initialize \
+  --admin "$ADMIN" \
+  --fee_bps "$TREASURY_FEE_BPS"
+echo "  treasury initialized (fee: ${TREASURY_FEE_BPS} bps)"
 
 invoke "$POOL_ID" initialize \
   --admin "$ADMIN" \
   --invoice_nft "$INVOICE_NFT_ID" \
+  --risk_registry "$RISK_REGISTRY_ID" \
   --treasury "$TREASURY_ID" \
-  --late_penalty_bps 200
-echo "  financing_pool initialized (late penalty: 2%)"
+  --access_control "$ACCESS_CONTROL_ID" \
+  --late_penalty_bps "$LATE_PENALTY_BPS" \
+  --price_oracle "$PRICE_ORACLE_ID" \
+  --max_position_bps "$MAX_POSITION_BPS"
+echo "  financing_pool initialized (late penalty: ${LATE_PENALTY_BPS} bps, max position: ${MAX_POSITION_BPS} bps)"
 
 invoke "$MARKETPLACE_ID" initialize \
   --admin "$ADMIN" \
   --invoice_nft "$INVOICE_NFT_ID" \
   --financing_pool "$POOL_ID" \
   --treasury "$TREASURY_ID" \
-  --fee_bps 50
-echo "  marketplace initialized"
+  --access_control "$ACCESS_CONTROL_ID" \
+  --fee_bps "$MARKETPLACE_FEE_BPS" \
+  --referrer_split_bps "$MARKETPLACE_REFERRER_BPS"
+echo "  marketplace initialized (fee: ${MARKETPLACE_FEE_BPS} bps, referrer split: ${MARKETPLACE_REFERRER_BPS} bps)"
 
-invoke "$RISK_REGISTRY_ID" initialize --admin "$ADMIN"
+invoke "$RISK_REGISTRY_ID" initialize \
+  --admin "$ADMIN" \
+  --invoice_nft "$INVOICE_NFT_ID"
 echo "  risk_registry initialized"
+
+invoke "$PRICE_ORACLE_ID" initialize \
+  --admin "$ADMIN" \
+  --base_currency "$ORACLE_BASE_CURRENCY"
+echo "  price_oracle initialized (base: $ORACLE_BASE_CURRENCY)"
 
 # ── Write deployment manifest ─────────────────────────────────────────────────
 
@@ -138,13 +193,22 @@ cat > "$DEPLOY_LOG" <<EOF
   "network": "$NETWORK",
   "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "admin": "$ADMIN",
+  "parameters": {
+    "treasury_fee_bps": $TREASURY_FEE_BPS,
+    "marketplace_fee_bps": $MARKETPLACE_FEE_BPS,
+    "marketplace_referrer_bps": $MARKETPLACE_REFERRER_BPS,
+    "late_penalty_bps": $LATE_PENALTY_BPS,
+    "max_position_bps": $MAX_POSITION_BPS,
+    "oracle_base_currency": "$ORACLE_BASE_CURRENCY"
+  },
   "contracts": {
     "access_control": "$ACCESS_CONTROL_ID",
     "invoice_nft":    "$INVOICE_NFT_ID",
     "treasury":       "$TREASURY_ID",
     "financing_pool": "$POOL_ID",
     "marketplace":    "$MARKETPLACE_ID",
-    "risk_registry":  "$RISK_REGISTRY_ID"
+    "risk_registry":  "$RISK_REGISTRY_ID",
+    "price_oracle":   "$PRICE_ORACLE_ID"
   }
 }
 EOF
