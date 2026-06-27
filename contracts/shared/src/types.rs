@@ -119,6 +119,9 @@ pub struct SmeProfile {
     pub total_invoices: u32,
     pub defaults: u32,
     pub registered_at: u64,
+    /// Maximum aggregate face value (in stroops) the SME may have outstanding
+    /// across all non-Repaid/non-Defaulted invoices. 0 means no limit.
+    pub credit_limit: i128,
 }
 
 /// Action types that can be proposed for multisig execution

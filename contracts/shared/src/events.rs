@@ -60,6 +60,22 @@ pub fn invoice_defaulted(env: &Env, invoice_id: u64, sme: &Address) {
     );
 }
 
+pub fn invoice_amended(env: &Env, invoice_id: u64, sme: &Address) {
+    emit(
+        env,
+        symbol_short!("INV_AMD"),
+        (invoice_id, sme.clone(), env.ledger().timestamp()),
+    );
+}
+
+pub fn invoice_withdrawn(env: &Env, invoice_id: u64, sme: &Address) {
+    emit(
+        env,
+        symbol_short!("INV_WTH"),
+        (invoice_id, sme.clone(), env.ledger().timestamp()),
+    );
+}
+
 // ── Repayment Events ──────────────────────────────────────────────────────────
 
 pub fn repayment_made(env: &Env, invoice_id: u64, payer: &Address, amount: i128) {
@@ -274,6 +290,16 @@ pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score
         env,
         symbol_short!("SME_UPD"),
         (verifier.clone(), sme.clone(), new_score, env.ledger().timestamp()),
+    );
+}
+
+/// Emitted when a verifier sets an SME's credit limit.
+/// Payload: (verifier, sme, credit_limit, timestamp)
+pub fn sme_credit_limit_set(env: &Env, verifier: &Address, sme: &Address, credit_limit: i128) {
+    emit(
+        env,
+        symbol_short!("SME_CRL"),
+        (verifier.clone(), sme.clone(), credit_limit, env.ledger().timestamp()),
     );
 }
 

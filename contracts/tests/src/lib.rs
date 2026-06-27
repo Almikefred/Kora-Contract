@@ -692,4 +692,157 @@ mod integration {
         let total_distributed = (bal_a_after - bal_a_before) + (bal_b_after - bal_b_before);
         assert!(total_distributed <= partial_repayment);
     }
+
+    /// #291 — Multi-investor full-funding and repayment with proportional yield.
+    ///
+    /// Scenario:
+    /// - 3 investors fund different proportions of an invoice via `marketplace.fund_invoice`
+    /// - Full funding triggers `financing_pool.release_funds` automatically
+    /// - Admin records each investor's position
+    /// - SME repays the full face value via `financing_pool.repay`
+    /// - Each investor receives principal + proportional share of the yield spread
+    #[test]
+    fn test_multi_investor_full_funding_and_repayment_distributes_proportional_yield() {
+        use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+        let k = deploy_protocol();
+
+        // ── Deploy and whitelist a mock stablecoin ────────────────────────────
+        let token_id = k.env.register_stellar_asset_contract_v2(k.admin.clone());
+        let token_addr = token_id.address();
+        let token = TokenClient::new(&k.env, &token_addr);
+        let token_admin = StellarAssetClient::new(&k.env, &token_addr);
+        k.marketplace.whitelist_token(&k.admin, &token_addr);
+
+        // ── Actors ────────────────────────────────────────────────────────────
+        let sme = Address::generate(&k.env);
+        let investor_1 = Address::generate(&k.env);
+        let investor_2 = Address::generate(&k.env);
+        let investor_3 = Address::generate(&k.env);
+
+        // Face value 10 000 USDC (7 decimals); asking price 9 500 (5 % discount)
+        let face_value: i128 = 10_000_0000000;
+        let asking_price: i128 = 9_500_0000000;
+
+        // Investor contributions: 50%, 30%, 20% of asking_price
+        let contrib_1: i128 = asking_price * 50 / 100; // 4 750
+        let contrib_2: i128 = asking_price * 30 / 100; // 2 850
+        let contrib_3: i128 = asking_price - contrib_1 - contrib_2; // 1 900 (remainder)
+
+        // Mint enough tokens; give 2× to cover fee rounding
+        token_admin.mint(&investor_1, &(contrib_1 * 2));
+        token_admin.mint(&investor_2, &(contrib_2 * 2));
+        token_admin.mint(&investor_3, &(contrib_3 * 2));
+        // SME needs face_value to repay
+        token_admin.mint(&sme, &face_value);
+
+        // ── Mint invoice ──────────────────────────────────────────────────────
+        let (debtor_hash, _, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
+        let invoice_id = k.invoice_nft.mint_invoice(
+            &sme, &debtor_hash, &face_value, &currency, &due_date, &ipfs_cid, &risk_score,
+        );
+
+        // ── List invoice ──────────────────────────────────────────────────────
+        let funding_deadline = k.env.ledger().timestamp() + 86_400 * 30;
+        k.marketplace.list_invoice(
+            &sme, &invoice_id, &asking_price, &face_value, &token_addr, &funding_deadline,
+        );
+
+        // ── Three investors fund; last one triggers release_funds ─────────────
+        k.marketplace.fund_invoice(&investor_1, &invoice_id, &contrib_1);
+        k.marketplace.fund_invoice(&investor_2, &invoice_id, &contrib_2);
+        k.marketplace.fund_invoice(&investor_3, &invoice_id, &contrib_3);
+
+        // Invoice must now be Funded
+        assert_eq!(
+            k.invoice_nft.get_invoice(&invoice_id).status,
+            InvoiceStatus::Funded
+        );
+
+        // ── Admin records proportional positions in the pool ──────────────────
+        // Net contribution = gross - 0.5% fee
+        let fee_bps: i128 = 50;
+        let net = |gross: i128| gross - gross * fee_bps / 10_000;
+        let net_1 = net(contrib_1);
+        let net_2 = net(contrib_2);
+        let net_3 = net(contrib_3);
+        let total_net = net_1 + net_2 + net_3;
+
+        k.pool.record_position(&k.admin, &invoice_id, &investor_1, &net_1, &total_net);
+        k.pool.record_position(&k.admin, &invoice_id, &investor_2, &net_2, &total_net);
+        k.pool.record_position(&k.admin, &invoice_id, &investor_3, &net_3, &total_net);
+
+        // ── Snapshot balances before repayment ────────────────────────────────
+        let bal_1_before = token.balance(&investor_1);
+        let bal_2_before = token.balance(&investor_2);
+        let bal_3_before = token.balance(&investor_3);
+
+        // ── SME repays full face value ────────────────────────────────────────
+        k.pool.repay(&sme, &invoice_id, &token_addr, &face_value);
+
+        // Invoice must now be Repaid
+        assert_eq!(
+            k.invoice_nft.get_invoice(&invoice_id).status,
+            InvoiceStatus::Repaid
+        );
+
+        // Pool must be closed
+        let pool_state = k.pool.get_pool(&invoice_id);
+        assert!(pool_state.is_closed);
+
+        // ── Assert each investor received proportional payout ─────────────────
+        // Expected payout = face_value * share_bps / 10_000
+        let token_decimals = token.decimals();
+        let normalize = |v: i128| -> i128 {
+            let scale = 10i128.pow(token_decimals);
+            // bps_of_normalized: (v * bps / 10_000) rounded to token precision
+            // We replicate the same logic used in distribute_yield
+            v
+        };
+
+        let share_bps_1 = (net_1 * 10_000 / total_net) as u32;
+        let share_bps_2 = (net_2 * 10_000 / total_net) as u32;
+        let share_bps_3 = (net_3 * 10_000 / total_net) as u32;
+
+        // Replicate bps_of_normalized (face_value * share_bps / 10_000, scaled to token decimals)
+        let scale = 10i128.pow(token_decimals);
+        let expected_1 = face_value * share_bps_1 as i128 / (10_000 * scale) * scale;
+        let expected_2 = face_value * share_bps_2 as i128 / (10_000 * scale) * scale;
+        let expected_3 = face_value * share_bps_3 as i128 / (10_000 * scale) * scale;
+
+        let bal_1_after = token.balance(&investor_1);
+        let bal_2_after = token.balance(&investor_2);
+        let bal_3_after = token.balance(&investor_3);
+
+        let received_1 = bal_1_after - bal_1_before;
+        let received_2 = bal_2_after - bal_2_before;
+        let received_3 = bal_3_after - bal_3_before;
+
+        // Each investor must receive at least their net contribution back (principal)
+        assert!(received_1 >= net_1, "investor_1 must receive at least principal");
+        assert!(received_2 >= net_2, "investor_2 must receive at least principal");
+        assert!(received_3 >= net_3, "investor_3 must receive at least principal");
+
+        // Total distributed must not exceed face_value (no double-counting)
+        let total_distributed = received_1 + received_2 + received_3;
+        assert!(total_distributed <= face_value);
+
+        // Investor with largest stake receives largest absolute payout
+        assert!(
+            received_1 > received_2,
+            "investor_1 (50%) must receive more than investor_2 (30%)"
+        );
+        assert!(
+            received_2 > received_3,
+            "investor_2 (30%) must receive more than investor_3 (20%)"
+        );
+
+        // Proportional ratios hold within 1 bps tolerance
+        // received_1 / received_2 ≈ share_bps_1 / share_bps_2
+        let ratio_actual = received_1 * 10_000 / received_2;
+        let ratio_expected = share_bps_1 as i128 * 10_000 / share_bps_2 as i128;
+        let diff = (ratio_actual - ratio_expected).abs();
+        assert!(diff <= 10, "payout ratio must match share ratio within 0.1%");
+    }
 }

@@ -124,6 +124,7 @@ impl RiskRegistryContract {
             total_invoices: 0,
             defaults: 0,
             registered_at: env.ledger().timestamp(),
+            credit_limit: 0,
         };
 
         env.storage()
@@ -159,6 +160,35 @@ impl RiskRegistryContract {
             .set(&DataKey::SmeProfile(sme.clone()), &profile);
         Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
         events::sme_score_updated(&env, &verifier, &sme, new_score);
+        Ok(())
+    }
+
+    /// Set (or update) an SME's aggregate credit limit. Verifier only.
+    /// A limit of 0 means no limit is enforced.
+    pub fn set_credit_limit(
+        env: Env,
+        verifier: Address,
+        sme: Address,
+        credit_limit: i128,
+    ) -> Result<(), KoraError> {
+        verifier.require_auth();
+        Self::require_verifier(&env, &verifier)?;
+        if credit_limit < 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        let mut profile: SmeProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SmeProfile(sme.clone()))
+            .ok_or(KoraError::SMENotRegistered)?;
+
+        profile.credit_limit = credit_limit;
+        env.storage()
+            .persistent()
+            .set(&DataKey::SmeProfile(sme.clone()), &profile);
+        Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
+        events::sme_credit_limit_set(&env, &verifier, &sme, credit_limit);
         Ok(())
     }
 

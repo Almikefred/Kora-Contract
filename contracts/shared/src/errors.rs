@@ -61,4 +61,11 @@ pub enum KoraError {
     // Upgrade
     NoUpgradeProposed = 100,
     UpgradeTimelockNotElapsed = 101,
+
+    // Invoice amendment / withdrawal
+    NotInvoiceOwner = 102,
+
+    // Credit limit
+    CreditLimitExceeded = 103,
+    ListingFullyFunded = 104,
 }
