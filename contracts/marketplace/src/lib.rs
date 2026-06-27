@@ -29,6 +29,8 @@ pub enum DataKey {
     Listing(u64),
     WhitelistedToken(Address),
     UpgradeProposal,
+    Contribution(u64, Address),
+    RefundClaimed(u64, Address),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -188,6 +190,12 @@ impl MarketplaceContract {
 
         let nft_client =
             kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+
+        let invoice = nft_client.get_invoice(&invoice_id);
+        if invoice.amount != face_value {
+            return Err(KoraError::InvalidAmount);
+        }
+
         nft_client.set_listed(&env.current_contract_address(), &invoice_id);
 
         let listing = Listing {
@@ -398,23 +406,19 @@ impl MarketplaceContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
-        if let Some(ac_contract) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::AccessControl)
-        {
-            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
-            if ac.is_paused() {
-                return Err(KoraError::ProtocolPaused);
-            }
-        }
-        Ok(())
-    }
-
     fn require_whitelisted_token(env: &Env, token: &Address) -> Result<(), KoraError> {
         let ok: bool = env
             .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::WhitelistedToken(token.clone()))
+            .unwrap_or(false);
+        if ok {
+            Ok(())
+        } else {
+            Err(KoraError::TokenNotWhitelisted)
+        }
+    }
+
     /// Returns whether a token is whitelisted.
     pub fn is_token_whitelisted(env: Env, token: Address) -> bool {
         env.storage()
@@ -524,6 +528,15 @@ impl MarketplaceContract {
             return Err(KoraError::ProtocolPaused);
         }
         Ok(())
+    }
+
+    /// Extend the TTL of a persistent storage entry.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_BUMP,
+        );
     }
 
     /// Extend the TTL of a listing's persistent storage entry.
@@ -919,6 +932,44 @@ mod tests {
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_list_invoice_face_value_matches_invoice_amount_succeeds() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let invoice = t.nft.get_invoice(&id);
+        let deadline = t.env.ledger().timestamp() + 86_400 * 30;
+        let asking_price = invoice.amount - 500_000_000i128;
+        assert!(t.mp
+            .try_list_invoice(
+                &t.seller,
+                &id,
+                &asking_price,
+                &invoice.amount,
+                &t.token,
+                &deadline,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn test_list_invoice_face_value_mismatch_rejected() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let invoice = t.nft.get_invoice(&id);
+        let deadline = t.env.ledger().timestamp() + 86_400 * 30;
+        let wrong_face_value = invoice.amount + 1_000_000_000i128;
+        let asking_price = wrong_face_value - 500_000_000i128;
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &id,
+            &asking_price,
+            &wrong_face_value,
+            &t.token,
+            &deadline,
+        );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
