@@ -1898,4 +1898,68 @@ mod tests {
         let result = client.try_withdraw_invoice(&sme, &id);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
     }
+
+    // ── Per-invoice emergency freeze ──────────────────────────────────────────
+
+    fn mint_one(env: &Env, client: &InvoiceNftContractClient<'static>) -> u64 {
+        let sme = Address::generate(env);
+        let debtor_hash = Bytes::from_slice(env, &[0xABu8; 32]);
+        let ipfs_cid = String::from_str(
+            env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32,
+        )
+    }
+
+    #[test]
+    fn test_is_invoice_frozen_false_by_default() {
+        let (_, _, client) = setup();
+        // is_invoice_frozen returns false for a non-existent or unfrozen invoice.
+        assert!(!client.is_invoice_frozen(&999u64));
+    }
+
+    #[test]
+    fn test_freeze_invoice_sets_frozen_flag() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+        assert!(!client.is_invoice_frozen(&id));
+        client.freeze_invoice(&admin, &id).unwrap();
+        assert!(client.is_invoice_frozen(&id));
+    }
+
+    #[test]
+    fn test_unfreeze_invoice_clears_frozen_flag() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+        client.freeze_invoice(&admin, &id).unwrap();
+        assert!(client.is_invoice_frozen(&id));
+        client.unfreeze_invoice(&admin, &id).unwrap();
+        assert!(!client.is_invoice_frozen(&id));
+    }
+
+    #[test]
+    fn test_freeze_invoice_non_admin_rejected() {
+        let (env, _, client) = setup();
+        let id = mint_one(&env, &client);
+        let stranger = Address::generate(&env);
+        let err = client
+            .try_freeze_invoice(&stranger, &id)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::NotAdmin);
+    }
+
+    #[test]
+    fn test_freeze_nonexistent_invoice_rejected() {
+        let (_, admin, client) = setup();
+        let err = client
+            .try_freeze_invoice(&admin, &9999u64)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::InvoiceNotFound);
+    }
 }
