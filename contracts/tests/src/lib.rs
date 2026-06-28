@@ -66,9 +66,9 @@ mod integration {
         // Initialize all contracts
         ac.initialize(&admin);
         nft.initialize(&admin, &ac_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &50u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &ac_id, &50u32);
         let oracle_addr = Address::generate(&env);
-        pool.initialize(&admin, &nft_id, &treasury_id, &ac_id, &200u32, &oracle_addr);
+        pool.initialize(&admin, &nft_id, &rr_id, &treasury_id, &ac_id, &200u32, &oracle_addr);
         treasury.initialize(&admin, &50u32);
         rr.initialize(&admin, &nft_id);
 
