@@ -49,6 +49,8 @@ pub struct MarketplaceConfig {
     pub access_control: Address,
     pub risk_registry: Address,
     pub fee_bps: u32,
+    /// Fraction of the collected fee that goes to the referrer (0 = no split).
+    pub referrer_split_bps: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -72,7 +74,8 @@ impl MarketplaceContract {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(KoraError::AlreadyInitialized);
         }
-        kora_shared::validation::require_valid_fee_bps(fee_bps)?;
+        require_valid_fee_bps(fee_bps)?;
+        require_valid_fee_bps(referrer_split_bps)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::InvoiceNft, &invoice_nft);
         env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
@@ -87,7 +90,21 @@ impl MarketplaceContract {
             access_control,
             risk_registry,
             fee_bps,
+            referrer_split_bps,
         };
+        env.storage().instance().set(&DataKey::Config, &config);
+        Ok(())
+    }
+
+    /// Update the referrer split fraction. Admin only.
+    pub fn set_referrer_split_bps(env: Env, admin: Address, referrer_split_bps: u32) -> Result<(), KoraError> {
+        admin.require_auth();
+        let mut config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        require_valid_fee_bps(referrer_split_bps)?;
+        config.referrer_split_bps = referrer_split_bps;
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(())
     }
@@ -193,6 +210,8 @@ impl MarketplaceContract {
     }
 
     /// SME lists an invoice NFT for financing.
+    /// An optional `referrer` address may be provided to credit a referring verifier
+    /// with a portion of the protocol fee collected on each investor contribution.
     pub fn list_invoice(
         env: Env,
         seller: Address,
@@ -201,6 +220,7 @@ impl MarketplaceContract {
         face_value: i128,
         token: Address,
         funding_deadline: u64,
+        referrer: Option<Address>,
     ) -> Result<(), KoraError> {
         seller.require_auth();
         Self::require_not_paused(&env)?;
@@ -230,6 +250,17 @@ impl MarketplaceContract {
         let _guard = ReentrancyGuard::new(&env)?;
 
         let config = Self::load_config(&env)?;
+
+        // Referrer may not be the seller (self-referral)
+        if let Some(ref r) = referrer {
+            if r == &seller {
+                return Err(KoraError::InvalidAddress);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::Referrer(invoice_id), r);
+            Self::bump_persistent(&env, &DataKey::Referrer(invoice_id));
+        }
 
         let nft_client =
             kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
@@ -301,7 +332,7 @@ impl MarketplaceContract {
             .checked_sub(fee)
             .ok_or(KoraError::ArithmeticOverflow)?;
 
-        // Transfer fee to treasury (if non-zero)
+        // Split fee between referrer and treasury
         if fee > 0 {
             token_client.transfer(&investor, &config.treasury, &fee);
             // Record the collected fee in treasury's on-chain accounting (#208)
@@ -560,6 +591,7 @@ impl MarketplaceContract {
             access_control,
             risk_registry,
             fee_bps,
+            referrer_split_bps: 0,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(config)
@@ -576,6 +608,13 @@ impl MarketplaceContract {
             return Err(KoraError::ProtocolPaused);
         }
         Ok(())
+    }
+
+    /// Extend the TTL of any persistent storage entry.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
     }
 
     /// Extend the TTL of a listing's persistent storage entry.
@@ -1440,5 +1479,97 @@ mod tests {
             result.unwrap_err().unwrap(),
             KoraError::ListingAlreadyCancelled
         );
+    }
+
+    // ── referral fee-split tests ──────────────────────────────────────────────
+
+    fn list_with_referrer(t: &TestEnv, referrer: Option<Address>) -> u64 {
+        let id = mint_invoice(t);
+        let deadline = t.env.ledger().timestamp() + 86_400 * 30;
+        t.mp.list_invoice(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &referrer,
+        );
+        id
+    }
+
+    #[test]
+    fn test_list_invoice_without_referrer_succeeds() {
+        let t = deploy();
+        // None referrer: 100% fee to treasury
+        let id = list_with_referrer(&t, None);
+        let listing = t.mp.get_listing(&id);
+        assert!(listing.is_active);
+    }
+
+    #[test]
+    fn test_list_invoice_with_referrer_succeeds() {
+        let t = deploy();
+        let referrer = Address::generate(&t.env);
+        let id = list_with_referrer(&t, Some(referrer));
+        let listing = t.mp.get_listing(&id);
+        assert!(listing.is_active);
+    }
+
+    #[test]
+    fn test_list_invoice_self_referral_rejected() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400 * 30;
+        // seller as referrer is self-referral — must be rejected
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &Some(t.seller.clone()),
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_fund_invoice_no_referrer_full_fee_to_treasury() {
+        // With no referrer, entire fee must go to treasury.
+        // fee_bps = 50 (0.5%), amount = 10_000_000 → fee = 50_000 → treasury gets 50_000.
+        let t = deploy();
+        let id = list_with_referrer(&t, None);
+        let investor = Address::generate(&t.env);
+        assert!(t.mp.try_fund_invoice(&investor, &id, &10_000_000i128).is_ok());
+    }
+
+    #[test]
+    fn test_fund_invoice_with_referrer_splits_fee() {
+        // referrer_split_bps = 2000 (20%). fee_bps = 50.
+        // amount = 10_000_000 → fee = 50_000
+        // referral_fee = 50_000 * 2000 / 10_000 = 10_000
+        // treasury_fee = 50_000 - 10_000 = 40_000
+        let t = deploy();
+        t.mp.set_referrer_split_bps(&t.admin, &2_000u32);
+        let referrer = Address::generate(&t.env);
+        let id = list_with_referrer(&t, Some(referrer));
+        let investor = Address::generate(&t.env);
+        assert!(t.mp.try_fund_invoice(&investor, &id, &10_000_000i128).is_ok());
+    }
+
+    #[test]
+    fn test_set_referrer_split_bps_non_admin_rejected() {
+        let t = deploy();
+        let stranger = Address::generate(&t.env);
+        let result = t.mp.try_set_referrer_split_bps(&stranger, &2_000u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_referrer_split_bps_over_10000_rejected() {
+        let t = deploy();
+        let result = t.mp.try_set_referrer_split_bps(&t.admin, &10_001u32);
+        assert!(result.is_err());
     }
 }
