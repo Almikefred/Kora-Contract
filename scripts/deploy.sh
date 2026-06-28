@@ -188,6 +188,13 @@ echo "  price_oracle initialized (base: $ORACLE_BASE_CURRENCY)"
 
 # ── Write deployment manifest ─────────────────────────────────────────────────
 
+AC_HASH=$(sha256sum "$WASM_DIR/kora_access_control.wasm" | awk '{print $1}')
+INVOICE_HASH=$(sha256sum "$WASM_DIR/kora_invoice_nft.wasm" | awk '{print $1}')
+TREASURY_HASH=$(sha256sum "$WASM_DIR/kora_treasury.wasm" | awk '{print $1}')
+POOL_HASH=$(sha256sum "$WASM_DIR/kora_financing_pool.wasm" | awk '{print $1}')
+MARKETPLACE_HASH=$(sha256sum "$WASM_DIR/kora_marketplace.wasm" | awk '{print $1}')
+RISK_HASH=$(sha256sum "$WASM_DIR/kora_risk_registry.wasm" | awk '{print $1}')
+
 cat > "$DEPLOY_LOG" <<EOF
 {
   "network": "$NETWORK",
@@ -202,13 +209,30 @@ cat > "$DEPLOY_LOG" <<EOF
     "oracle_base_currency": "$ORACLE_BASE_CURRENCY"
   },
   "contracts": {
-    "access_control": "$ACCESS_CONTROL_ID",
-    "invoice_nft":    "$INVOICE_NFT_ID",
-    "treasury":       "$TREASURY_ID",
-    "financing_pool": "$POOL_ID",
-    "marketplace":    "$MARKETPLACE_ID",
-    "risk_registry":  "$RISK_REGISTRY_ID",
-    "price_oracle":   "$PRICE_ORACLE_ID"
+    "access_control": {
+      "address": "$ACCESS_CONTROL_ID",
+      "wasm_hash": "$AC_HASH"
+    },
+    "invoice_nft": {
+      "address": "$INVOICE_NFT_ID",
+      "wasm_hash": "$INVOICE_HASH"
+    },
+    "treasury": {
+      "address": "$TREASURY_ID",
+      "wasm_hash": "$TREASURY_HASH"
+    },
+    "financing_pool": {
+      "address": "$POOL_ID",
+      "wasm_hash": "$POOL_HASH"
+    },
+    "marketplace": {
+      "address": "$MARKETPLACE_ID",
+      "wasm_hash": "$MARKETPLACE_HASH"
+    },
+    "risk_registry": {
+      "address": "$RISK_REGISTRY_ID",
+      "wasm_hash": "$RISK_HASH"
+    }
   }
 }
 EOF
