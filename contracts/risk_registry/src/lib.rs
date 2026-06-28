@@ -1319,4 +1319,77 @@ mod tests {
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         assert!(client.try_get_admin().is_err());
     }
+
+    // ── set_debtor_score cooldown ─────────────────────────────────────────────
+
+    #[test]
+    fn test_set_debtor_score_first_call_always_succeeds() {
+        // There is no prior timestamp, so the first update is always allowed.
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xBBu8; 32]);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        assert!(client
+            .try_set_debtor_score(&verifier, &debtor_hash, &40u32)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_set_debtor_score_cooldown_blocks_immediate_second_update() {
+        // A second update before MIN_SCORE_UPDATE_INTERVAL seconds have passed
+        // must be rejected with ScoreUpdateCooldownNotElapsed.
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xCCu8; 32]);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        client.set_debtor_score(&verifier, &debtor_hash, &40u32).unwrap();
+        // Advance time by one second less than the cooldown — still blocked.
+        env.ledger().set(LedgerInfo {
+            timestamp: MIN_SCORE_UPDATE_INTERVAL - 1,
+            ..env.ledger().get()
+        });
+        let err = client
+            .try_set_debtor_score(&verifier, &debtor_hash, &60u32)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::ScoreUpdateCooldownNotElapsed);
+    }
+
+    #[test]
+    fn test_set_debtor_score_cooldown_allows_update_at_exact_boundary() {
+        // At exactly timestamp == last_update + MIN_SCORE_UPDATE_INTERVAL the
+        // condition `current < next_allowed` is false, so the call must succeed.
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xDDu8; 32]);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        // First update at t=0.
+        client.set_debtor_score(&verifier, &debtor_hash, &40u32).unwrap();
+        // Advance to exactly the boundary.
+        env.ledger().set(LedgerInfo {
+            timestamp: MIN_SCORE_UPDATE_INTERVAL,
+            ..env.ledger().get()
+        });
+        assert!(client
+            .try_set_debtor_score(&verifier, &debtor_hash, &55u32)
+            .is_ok());
+        assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 55);
+    }
+
+    #[test]
+    fn test_set_debtor_score_cooldown_is_per_verifier() {
+        // Different verifiers operate independent cooldowns for the same debtor_hash.
+        let (env, admin, _, _, client) = setup();
+        let verifier_a = Address::generate(&env);
+        let verifier_b = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xEEu8; 32]);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128).unwrap();
+        client.add_verifier(&admin, &verifier_b, &1_000_000i128).unwrap();
+        // verifier_a sets the score; its cooldown now ticks.
+        client.set_debtor_score(&verifier_a, &debtor_hash, &40u32).unwrap();
+        // verifier_b has never updated this debtor → no cooldown → must succeed.
+        assert!(client
+            .try_set_debtor_score(&verifier_b, &debtor_hash, &55u32)
+            .is_ok());
+    }
 }

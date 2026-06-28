@@ -68,6 +68,16 @@ pub enum DataKey {
     Marketplace,
     /// Instance key: authorized financing pool contract address
     FinancingPool,
+    /// Instance key: authorized risk registry contract address
+    RiskRegistry,
+    /// Persistent: aggregate exposure (i128) for an investor address
+    OutstandingExposure(Address),
+    /// Persistent: marks a currency symbol as allowed for invoices
+    CurrencyAllowlist(Symbol),
+    /// Persistent bool: true when this invoice is individually frozen by an admin.
+    /// Checked by marketplace.fund_invoice and financing_pool.repay in addition
+    /// to the protocol-wide pause, enabling targeted freeze of disputed invoices.
+    InvoiceFrozen(u64),
 }
 
 // ── Migration helpers ─────────────────────────────────────────────────────────
@@ -614,6 +624,47 @@ impl InvoiceNftContract {
             .persistent()
             .get(&DataKey::OutstandingExposure(sme))
             .unwrap_or(0i128)
+    }
+
+    // ── Per-invoice emergency freeze ──────────────────────────────────────────
+    //
+    // Complements the protocol-wide pause in AccessControl by letting an admin
+    // freeze a single disputed invoice without halting all protocol activity.
+    // The freeze state is stored in persistent storage so it survives ledger
+    // closings. Marketplace.fund_invoice and financing_pool.repay call
+    // is_invoice_frozen before executing any state-changing logic.
+
+    /// Freeze a specific invoice, blocking fund_invoice and repay for it.
+    pub fn freeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        // Verify the invoice exists before freezing.
+        Self::load_invoice(&env, invoice_id)?;
+        let key = DataKey::InvoiceFrozen(invoice_id);
+        env.storage().persistent().set(&key, &true);
+        Self::bump_persistent(&env, &key);
+        events::invoice_frozen(&env, invoice_id, &admin);
+        Ok(())
+    }
+
+    /// Unfreeze a previously frozen invoice, restoring normal fund/repay access.
+    pub fn unfreeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        // Verify the invoice exists before unfreezing.
+        Self::load_invoice(&env, invoice_id)?;
+        let key = DataKey::InvoiceFrozen(invoice_id);
+        env.storage().persistent().remove(&key);
+        events::invoice_unfrozen(&env, invoice_id, &admin);
+        Ok(())
+    }
+
+    /// Returns true if this invoice has been individually frozen by an admin.
+    pub fn is_invoice_frozen(env: Env, invoice_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InvoiceFrozen(invoice_id))
+            .unwrap_or(false)
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
