@@ -21,6 +21,7 @@ pub enum KoraError {
     InvalidAmount = 14,
     InvalidDueDate = 15,
     InvalidRiskScore = 16,
+    InvalidCid = 17,
 
     // Marketplace
     ListingNotFound = 20,

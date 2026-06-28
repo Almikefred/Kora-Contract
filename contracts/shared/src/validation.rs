@@ -166,6 +166,58 @@ pub fn require_non_empty_string(s: &String) -> Result<(), KoraError> {
     Ok(())
 }
 
+/// Maximum supported IPFS CID length in bytes.
+const CID_MAX_LEN: u32 = 128;
+
+/// Validate that a string is a structurally valid IPFS CID (v0 or v1).
+///
+/// CIDv0: exactly 46 base58btc characters, "Qm" prefix.
+/// CIDv1: multibase-prefixed ('b'/'B' base32, 'z' base58, 'f'/'F' base16,
+///        'u'/'U' base64url, 'k'/'K' base36), minimum 10 characters.
+pub fn require_valid_ipfs_cid(cid: &String) -> Result<(), KoraError> {
+    let len = cid.len();
+    if len < 2 || len > CID_MAX_LEN {
+        return Err(KoraError::InvalidCid);
+    }
+    let mut buf = [0u8; CID_MAX_LEN as usize];
+    cid.copy_into_slice(&mut buf[..len as usize]);
+    let first = buf[0];
+    let second = buf[1];
+    // CIDv0: "Qm" prefix, exactly 46 chars, base58btc alphabet
+    if first == b'Q' && second == b'm' {
+        if len != 46 {
+            return Err(KoraError::InvalidCid);
+        }
+        for &c in &buf[..46] {
+            if !is_base58_char(c) {
+                return Err(KoraError::InvalidCid);
+            }
+        }
+        return Ok(());
+    }
+    // CIDv1: multibase prefix — common encodings only
+    if matches!(first, b'b' | b'B' | b'z' | b'f' | b'F' | b'u' | b'U' | b'k' | b'K') {
+        if len < 10 {
+            return Err(KoraError::InvalidCid);
+        }
+        return Ok(());
+    }
+    Err(KoraError::InvalidCid)
+}
+
+/// Returns true for characters in the base58btc alphabet.
+/// Excludes: '0' (zero), 'O' (uppercase O), 'I' (uppercase I), 'l' (lowercase L).
+fn is_base58_char(c: u8) -> bool {
+    matches!(c,
+        b'1'..=b'9'
+        | b'A'..=b'H'
+        | b'J'..=b'N'
+        | b'P'..=b'Z'
+        | b'a'..=b'k'
+        | b'm'..=b'z'
+    )
+}
+
 /// Reject empty byte slices. Returns `EmptyBytes` (distinct from `EmptyString`).
 ///
 /// # Examples
@@ -530,6 +582,68 @@ mod tests {
 
         assert!(require_non_empty_string(&empty_str).is_err());
         assert!(require_non_empty_string(&non_empty_str).is_ok());
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_valid_cidv0() {
+        let env = Env::default();
+        // 46-char CIDv0: "Qm" prefix, base58btc alphabet
+        let cid = SorobanString::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
+        assert!(require_valid_ipfs_cid(&cid).is_ok());
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_valid_cidv1() {
+        let env = Env::default();
+        // CIDv1 base32lower (starts with 'b'), 59 chars
+        let cid = SorobanString::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        assert!(require_valid_ipfs_cid(&cid).is_ok());
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_cidv1_base58_prefix() {
+        let env = Env::default();
+        // CIDv1 with 'z' (base58btc) prefix
+        let cid = SorobanString::from_str(&env, "zdj7Wkkt7TxoHk4QyYaZhmjLYGHRPmCdLFwJiC6JD6EKB6Tb");
+        assert!(require_valid_ipfs_cid(&cid).is_ok());
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_single_char_rejected() {
+        let env = Env::default();
+        let cid = SorobanString::from_str(&env, "x");
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_garbage_rejected() {
+        let env = Env::default();
+        let cid = SorobanString::from_str(&env, "not-a-valid-cid-string");
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_cidv0_wrong_length_rejected() {
+        let env = Env::default();
+        // "Qm" prefix but only 10 chars (not 46)
+        let cid = SorobanString::from_str(&env, "QmShortXxx");
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_cidv0_invalid_chars_rejected() {
+        let env = Env::default();
+        // 46 chars, Qm prefix, but contains '0' (excluded from base58)
+        let cid = SorobanString::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnP000");
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+    }
+
+    #[test]
+    fn test_require_valid_ipfs_cid_cidv1_too_short_rejected() {
+        let env = Env::default();
+        // CIDv1 multibase prefix but too short (< 10 chars)
+        let cid = SorobanString::from_str(&env, "bafy");
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
     }
 
     #[test]
