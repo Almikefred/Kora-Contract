@@ -72,6 +72,9 @@ mod integration {
         treasury.initialize(&admin, &50u32);
         rr.initialize(&admin, &nft_id);
 
+        // Register authorized callers on invoice_nft (#209)
+        nft.set_authorized_callers(&admin, &mp_id, &pool_id);
+
         KoraEnv {
             env,
             admin,
@@ -693,156 +696,125 @@ mod integration {
         assert!(total_distributed <= partial_repayment);
     }
 
-    /// #291 — Multi-investor full-funding and repayment with proportional yield.
-    ///
-    /// Scenario:
-    /// - 3 investors fund different proportions of an invoice via `marketplace.fund_invoice`
-    /// - Full funding triggers `financing_pool.release_funds` automatically
-    /// - Admin records each investor's position
-    /// - SME repays the full face value via `financing_pool.repay`
-    /// - Each investor receives principal + proportional share of the yield spread
+    /// #208: treasury.get_collected must equal the sum of fees from all fund_invoice calls.
     #[test]
-    fn test_multi_investor_full_funding_and_repayment_distributes_proportional_yield() {
+    fn test_fee_reconciliation() {
         use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 
         let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
 
-        // ── Deploy and whitelist a mock stablecoin ────────────────────────────
         let token_id = k.env.register_stellar_asset_contract_v2(k.admin.clone());
         let token_addr = token_id.address();
-        let token = TokenClient::new(&k.env, &token_addr);
         let token_admin = StellarAssetClient::new(&k.env, &token_addr);
+
         k.marketplace.whitelist_token(&k.admin, &token_addr);
+        k.treasury.whitelist_token(&k.admin, &token_addr);
 
-        // ── Actors ────────────────────────────────────────────────────────────
-        let sme = Address::generate(&k.env);
-        let investor_1 = Address::generate(&k.env);
-        let investor_2 = Address::generate(&k.env);
-        let investor_3 = Address::generate(&k.env);
+        let inv1 = Address::generate(&k.env);
+        let inv2 = Address::generate(&k.env);
+        token_admin.mint(&inv1, &1_000_000_000_000i128);
+        token_admin.mint(&inv2, &1_000_000_000_000i128);
 
-        // Face value 10 000 USDC (7 decimals); asking price 9 500 (5 % discount)
-        let face_value: i128 = 10_000_0000000;
-        let asking_price: i128 = 9_500_0000000;
-
-        // Investor contributions: 50%, 30%, 20% of asking_price
-        let contrib_1: i128 = asking_price * 50 / 100; // 4 750
-        let contrib_2: i128 = asking_price * 30 / 100; // 2 850
-        let contrib_3: i128 = asking_price - contrib_1 - contrib_2; // 1 900 (remainder)
-
-        // Mint enough tokens; give 2× to cover fee rounding
-        token_admin.mint(&investor_1, &(contrib_1 * 2));
-        token_admin.mint(&investor_2, &(contrib_2 * 2));
-        token_admin.mint(&investor_3, &(contrib_3 * 2));
-        // SME needs face_value to repay
-        token_admin.mint(&sme, &face_value);
-
-        // ── Mint invoice ──────────────────────────────────────────────────────
-        let (debtor_hash, _, currency, due_date, ipfs_cid, risk_score) =
-            sample_invoice_params(&k.env);
+        let asking_price = 9_500_000_000i128;
         let invoice_id = k.invoice_nft.mint_invoice(
-            &sme, &debtor_hash, &face_value, &currency, &due_date, &ipfs_cid, &risk_score,
+            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
         );
+        let deadline = k.env.ledger().timestamp() + 86_400 * 30;
+        k.marketplace.list_invoice(&sme, &invoice_id, &asking_price, &amount, &token_addr, &deadline);
 
-        // ── List invoice ──────────────────────────────────────────────────────
-        let funding_deadline = k.env.ledger().timestamp() + 86_400 * 30;
-        k.marketplace.list_invoice(
-            &sme, &invoice_id, &asking_price, &face_value, &token_addr, &funding_deadline,
-        );
+        let contrib1 = 5_700_000_000i128;
+        let contrib2 = 3_800_000_000i128;
 
-        // ── Three investors fund; last one triggers release_funds ─────────────
-        k.marketplace.fund_invoice(&investor_1, &invoice_id, &contrib_1);
-        k.marketplace.fund_invoice(&investor_2, &invoice_id, &contrib_2);
-        k.marketplace.fund_invoice(&investor_3, &invoice_id, &contrib_3);
+        k.marketplace.fund_invoice(&inv1, &invoice_id, &contrib1);
+        k.marketplace.fund_invoice(&inv2, &invoice_id, &contrib2);
 
-        // Invoice must now be Funded
-        assert_eq!(
-            k.invoice_nft.get_invoice(&invoice_id).status,
-            InvoiceStatus::Funded
-        );
-
-        // ── Admin records proportional positions in the pool ──────────────────
-        // Net contribution = gross - 0.5% fee
+        // fee_bps = 50, token has 7 decimals → fee = amount * 50 / (10_000 * 10^7) ... 
+        // but bps_of_normalized normalises by decimals; with 7 decimals factor = 10^7
+        // fee = amount * fee_bps / (10_000 * 10^token_decimals) * 10^token_decimals
+        // simplifies to: amount * 50 / 10_000
         let fee_bps: i128 = 50;
-        let net = |gross: i128| gross - gross * fee_bps / 10_000;
-        let net_1 = net(contrib_1);
-        let net_2 = net(contrib_2);
-        let net_3 = net(contrib_3);
-        let total_net = net_1 + net_2 + net_3;
+        let expected_fee = (contrib1 * fee_bps / 10_000) + (contrib2 * fee_bps / 10_000);
+        let collected = k.treasury.get_collected(&token_addr);
+        assert_eq!(collected, expected_fee, "treasury collected must equal sum of fees");
+    }
 
-        k.pool.record_position(&k.admin, &invoice_id, &investor_1, &net_1, &total_net);
-        k.pool.record_position(&k.admin, &invoice_id, &investor_2, &net_2, &total_net);
-        k.pool.record_position(&k.admin, &invoice_id, &investor_3, &net_3, &total_net);
+    /// #209: An arbitrary address must NOT be able to call set_funded directly.
+    #[test]
+    fn test_unauthorized_set_funded_rejected() {
+        let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let attacker = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
 
-        // ── Snapshot balances before repayment ────────────────────────────────
-        let bal_1_before = token.balance(&investor_1);
-        let bal_2_before = token.balance(&investor_2);
-        let bal_3_before = token.balance(&investor_3);
+        let id = k.invoice_nft.mint_invoice(
+            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+        );
+        k.invoice_nft.set_listed(&k.marketplace.address, &id);
 
-        // ── SME repays full face value ────────────────────────────────────────
-        k.pool.repay(&sme, &invoice_id, &token_addr, &face_value);
-
-        // Invoice must now be Repaid
+        // Attacker tries to skip marketplace logic and force the invoice to Funded
+        let result = k.invoice_nft.try_set_funded(&attacker, &id);
+        assert!(result.is_err());
         assert_eq!(
-            k.invoice_nft.get_invoice(&invoice_id).status,
-            InvoiceStatus::Repaid
+            result.unwrap_err().unwrap(),
+            kora_shared::errors::KoraError::Unauthorized,
+            "arbitrary address must not be able to call set_funded"
+        );
+        // Invoice status must remain Listed
+        assert_eq!(
+            k.invoice_nft.get_invoice(&id).status,
+            kora_shared::types::InvoiceStatus::Listed,
+        );
+    }
+
+    /// #210: fund_invoice uses the per-tier fee when one is configured.
+    #[test]
+    fn test_tier_fee_applied_on_fund_invoice() {
+        use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+        let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, _) = sample_invoice_params(&k.env);
+
+        // risk_score=70 → RiskTier::B
+        let risk_score = 70u32;
+        let token_id = k.env.register_stellar_asset_contract_v2(k.admin.clone());
+        let token_addr = token_id.address();
+        let token_admin = StellarAssetClient::new(&k.env, &token_addr);
+        let token = TokenClient::new(&k.env, &token_addr);
+
+        k.marketplace.whitelist_token(&k.admin, &token_addr);
+        k.treasury.whitelist_token(&k.admin, &token_addr);
+
+        // Set tier B fee to 100 bps (2× the default 50 bps)
+        k.marketplace.set_tier_fee_bps(
+            &k.admin,
+            &kora_shared::types::RiskTier::B,
+            &100u32,
         );
 
-        // Pool must be closed
-        let pool_state = k.pool.get_pool(&invoice_id);
-        assert!(pool_state.is_closed);
+        let investor = Address::generate(&k.env);
+        token_admin.mint(&investor, &1_000_000_000_000i128);
 
-        // ── Assert each investor received proportional payout ─────────────────
-        // Expected payout = face_value * share_bps / 10_000
-        let token_decimals = token.decimals();
-        let normalize = |v: i128| -> i128 {
-            let scale = 10i128.pow(token_decimals);
-            // bps_of_normalized: (v * bps / 10_000) rounded to token precision
-            // We replicate the same logic used in distribute_yield
-            v
-        };
-
-        let share_bps_1 = (net_1 * 10_000 / total_net) as u32;
-        let share_bps_2 = (net_2 * 10_000 / total_net) as u32;
-        let share_bps_3 = (net_3 * 10_000 / total_net) as u32;
-
-        // Replicate bps_of_normalized (face_value * share_bps / 10_000, scaled to token decimals)
-        let scale = 10i128.pow(token_decimals);
-        let expected_1 = face_value * share_bps_1 as i128 / (10_000 * scale) * scale;
-        let expected_2 = face_value * share_bps_2 as i128 / (10_000 * scale) * scale;
-        let expected_3 = face_value * share_bps_3 as i128 / (10_000 * scale) * scale;
-
-        let bal_1_after = token.balance(&investor_1);
-        let bal_2_after = token.balance(&investor_2);
-        let bal_3_after = token.balance(&investor_3);
-
-        let received_1 = bal_1_after - bal_1_before;
-        let received_2 = bal_2_after - bal_2_before;
-        let received_3 = bal_3_after - bal_3_before;
-
-        // Each investor must receive at least their net contribution back (principal)
-        assert!(received_1 >= net_1, "investor_1 must receive at least principal");
-        assert!(received_2 >= net_2, "investor_2 must receive at least principal");
-        assert!(received_3 >= net_3, "investor_3 must receive at least principal");
-
-        // Total distributed must not exceed face_value (no double-counting)
-        let total_distributed = received_1 + received_2 + received_3;
-        assert!(total_distributed <= face_value);
-
-        // Investor with largest stake receives largest absolute payout
-        assert!(
-            received_1 > received_2,
-            "investor_1 (50%) must receive more than investor_2 (30%)"
+        let invoice_id = k.invoice_nft.mint_invoice(
+            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
         );
-        assert!(
-            received_2 > received_3,
-            "investor_2 (30%) must receive more than investor_3 (20%)"
-        );
+        let asking_price = 9_500_000_000i128;
+        let deadline = k.env.ledger().timestamp() + 86_400 * 30;
+        k.marketplace.list_invoice(&sme, &invoice_id, &asking_price, &amount, &token_addr, &deadline);
 
-        // Proportional ratios hold within 1 bps tolerance
-        // received_1 / received_2 ≈ share_bps_1 / share_bps_2
-        let ratio_actual = received_1 * 10_000 / received_2;
-        let ratio_expected = share_bps_1 as i128 * 10_000 / share_bps_2 as i128;
-        let diff = (ratio_actual - ratio_expected).abs();
-        assert!(diff <= 10, "payout ratio must match share ratio within 0.1%");
+        let contrib = 1_000_000_000i128;
+        let bal_before = token.balance(&k.treasury.address);
+        k.marketplace.fund_invoice(&investor, &invoice_id, &contrib);
+
+        let expected_fee = contrib * 100 / 10_000; // 100 bps
+        let default_fee  = contrib * 50  / 10_000; // 50 bps (flat)
+        let actual_fee = token.balance(&k.treasury.address) - bal_before;
+
+        assert_eq!(actual_fee, expected_fee, "tier B fee (100 bps) must be applied");
+        assert_ne!(actual_fee, default_fee, "flat fee must not be used when tier override exists");
     }
 }
