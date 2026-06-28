@@ -374,6 +374,10 @@ impl RiskRegistryContract {
     }
 
     /// Store a debtor risk score keyed by debtor hash. Verifier only.
+    ///
+    /// Enforces a per-(verifier, debtor_hash) cooldown of MIN_SCORE_UPDATE_INTERVAL seconds
+    /// between consecutive updates so that rapid score changes immediately before a
+    /// funding or default decision cannot be used to manipulate outcomes.
     pub fn set_debtor_score(
         env: Env,
         verifier: Address,
@@ -385,10 +389,29 @@ impl RiskRegistryContract {
         // Validate exact 32-byte SHA-256 length before score
         require_exact_length(&debtor_hash, 32)?;
         require_valid_risk_score(score)?;
+
+        // Enforce cooldown: same verifier cannot update the same debtor_hash within
+        // MIN_SCORE_UPDATE_INTERVAL seconds of the previous update.
+        let cooldown_key = DataKey::DebtorScoreLastUpdate(verifier.clone(), debtor_hash.clone());
+        if let Some(last_update) = env.storage().persistent().get::<_, u64>(&cooldown_key) {
+            let next_allowed = last_update
+                .checked_add(MIN_SCORE_UPDATE_INTERVAL)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+            if env.ledger().timestamp() < next_allowed {
+                return Err(KoraError::ScoreUpdateCooldownNotElapsed);
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::DebtorScore(debtor_hash.clone()), &score);
         Self::bump_persistent(&env, &DataKey::DebtorScore(debtor_hash.clone()));
+
+        // Record the update timestamp so the next call can check the cooldown.
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(&cooldown_key, &now);
+        Self::bump_persistent(&env, &cooldown_key);
+
         events::debtor_score_set(&env, &verifier, &debtor_hash, score);
         Ok(())
     }
@@ -625,7 +648,10 @@ impl RiskRegistryContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Bytes, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger, LedgerInfo},
+        Bytes, Env,
+    };
 
     /// Returns (env, admin, invoice_nft, staking_token, client)
     fn setup() -> (Env, Address, Address, Address, RiskRegistryContractClient<'static>) {
@@ -1213,19 +1239,23 @@ mod tests {
         assert_eq!(client.get_sme_profile(&sme).unwrap().risk_score, 0);
     }
 
-    // ── set_debtor_score update (overwrite) ───────────────────────────────────
+    // ── set_debtor_score update (overwrite after cooldown) ───────────────────
 
     #[test]
     fn test_set_debtor_score_update_existing() {
-        // set_debtor_score is idempotent / overwrites — calling it twice for the
-        // same hash with a different score must persist the latest value.
-        let (env, admin, _, client) = setup();
+        // set_debtor_score overwrites the score — calling it a second time after the
+        // cooldown elapses must persist the latest value.
+        let (env, admin, _, _, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xAAu8; 32]);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.set_debtor_score(&verifier, &debtor_hash, &30u32).unwrap();
         assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 30);
-        // Overwrite with a new score.
+        // Advance past the cooldown before the second update.
+        env.ledger().set(LedgerInfo {
+            timestamp: MIN_SCORE_UPDATE_INTERVAL,
+            ..env.ledger().get()
+        });
         client.set_debtor_score(&verifier, &debtor_hash, &75u32).unwrap();
         assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 75);
     }
