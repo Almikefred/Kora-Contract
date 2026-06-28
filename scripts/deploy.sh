@@ -11,6 +11,8 @@
 #   - DEPLOYER_SECRET env var set (or use --source flag)
 #   - Contracts built: make build
 #
+# Dependency order (must match constructor requirements):
+#   access_control → invoice_nft / risk_registry → financing_pool → treasury → marketplace
 # =============================================================================
 # Environment Variables (all optional — defaults shown)
 # =============================================================================
@@ -60,7 +62,7 @@ case "$NETWORK" in
     NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
     ;;
   *)
-    echo "Unknown network: $NETWORK. Use 'testnet' or 'mainnet'."
+    echo "ERROR: Unknown network '$NETWORK'. Use 'testnet' or 'mainnet'."
     exit 1
     ;;
 esac
@@ -75,17 +77,37 @@ mkdir -p "$ROOT_DIR/deployments"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# deploy_contract <display-name> <wasm-path>
+# Prints the contract ID to stdout. Aborts with a clear message on any failure.
 deploy_contract() {
   local name="$1"
   local wasm="$2"
-  echo "  Deploying $name..."
-  stellar contract deploy \
+
+  if [ ! -f "$wasm" ]; then
+    echo "ERROR: WASM not found for '$name': $wasm" >&2
+    echo "       Run 'make build' before deploying." >&2
+    exit 1
+  fi
+
+  echo "  Deploying $name..." >&2
+  local contract_id
+  contract_id=$(stellar contract deploy \
     --wasm "$wasm" \
     --source "$SOURCE" \
     --rpc-url "$RPC_URL" \
-    --network-passphrase "$NETWORK_PASSPHRASE"
+    --network-passphrase "$NETWORK_PASSPHRASE") \
+    || { echo "ERROR: 'stellar contract deploy' failed for '$name'." >&2; exit 1; }
+
+  if [ -z "$contract_id" ]; then
+    echo "ERROR: Deploy of '$name' returned an empty contract ID." >&2
+    exit 1
+  fi
+
+  echo "$contract_id"
 }
 
+# invoke <contract-id> <function> [args…]
+# Aborts with a clear message on failure, identifying the contract and function.
 invoke() {
   local contract_id="$1"
   local fn="$2"
@@ -95,10 +117,11 @@ invoke() {
     --source "$SOURCE" \
     --rpc-url "$RPC_URL" \
     --network-passphrase "$NETWORK_PASSPHRASE" \
-    -- "$fn" "$@"
+    -- "$fn" "$@" \
+    || { echo "ERROR: invoke '$fn' on contract '$contract_id' failed." >&2; exit 1; }
 }
 
-# ── Deploy ────────────────────────────────────────────────────────────────────
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
 
 echo "=== Kora Protocol Deployment ==="
 echo "Network : $NETWORK"
@@ -126,6 +149,9 @@ echo "  access_control : $ACCESS_CONTROL_ID"
 INVOICE_NFT_ID=$(deploy_contract "invoice_nft" "$WASM_DIR/kora_invoice_nft.wasm")
 echo "  invoice_nft    : $INVOICE_NFT_ID"
 
+RISK_REGISTRY_ID=$(deploy_contract "risk_registry" "$WASM_DIR/kora_risk_registry.wasm")
+echo "  risk_registry  : $RISK_REGISTRY_ID"
+
 TREASURY_ID=$(deploy_contract "treasury" "$WASM_DIR/kora_treasury.wasm")
 echo "  treasury       : $TREASURY_ID"
 
@@ -142,7 +168,7 @@ PRICE_ORACLE_ID=$(deploy_contract "price_oracle" "$WASM_DIR/kora_price_oracle.wa
 echo "  price_oracle   : $PRICE_ORACLE_ID"
 
 echo ""
-echo "--- Initializing contracts ---"
+echo "--- Initializing contracts (dependency order) ---"
 
 invoke "$ACCESS_CONTROL_ID" initialize --admin "$ADMIN"
 echo "  access_control initialized"
