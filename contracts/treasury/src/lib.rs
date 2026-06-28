@@ -12,6 +12,9 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, 
 const PERSISTENT_BUMP_AMOUNT: u32 = 535_680;
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 535_680 / 2;
 
+// ── Rate-limit epoch: 24 h in seconds ────────────────────────────────────────
+const EPOCH_DURATION: u64 = 86_400;
+
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -26,6 +29,16 @@ pub enum DataKey {
     WhitelistedToken(Address),
     /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
     UpgradeProposal,
+    /// Reentrancy guard flag (instance-level).
+    WithdrawalLock,
+    /// Maximum total withdrawal allowed per EPOCH_DURATION window (0 = uncapped).
+    WithdrawalCap,
+    /// Pending cap change proposal: (new_cap, proposed_at).
+    WithdrawalCapProposal,
+    /// Timestamp when the current rate-limit epoch started.
+    EpochStart,
+    /// Total withdrawn in the current epoch (resets each epoch).
+    EpochWithdrawn,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -54,6 +67,12 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+        // Initialize rate-limit state: uncapped, epoch starts now, zero withdrawn.
+        env.storage().instance().set(&DataKey::WithdrawalCap, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::EpochStart, &env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::EpochWithdrawn, &0i128);
         events::treasury_initialized(&env, &admin, fee_bps);
         Ok(())
     }
@@ -118,6 +137,7 @@ impl TreasuryContract {
     }
 
     /// Withdraw accumulated fees to a recipient. Admin only.
+    /// Subject to the rolling 24 h withdrawal cap.
     /// Protected against reentrancy via RAII ReentrancyGuard.
     pub fn withdraw(
         env: Env,
@@ -134,6 +154,7 @@ impl TreasuryContract {
         }
         require_within_max_amount(amount)?;
         Self::require_whitelisted_token(&env, &token)?;
+        Self::enforce_rate_limit(&env, amount)?;
 
         // Acquire reentrancy guard — released automatically when _guard drops
         let _guard = ReentrancyGuard::new(&env)?;
@@ -156,6 +177,7 @@ impl TreasuryContract {
             env.storage().persistent().set(&collected_key, &new_collected);
             Self::bump_persistent(&env, &collected_key);
         }
+        Self::record_withdrawal(&env, amount);
 
         // ── Interactions ──────────────────────────────────────────────────────
         token_client.transfer(&env.current_contract_address(), &recipient, &amount);
@@ -165,6 +187,7 @@ impl TreasuryContract {
     }
 
     /// Emergency drain — withdraw entire token balance. Admin only.
+    /// Subject to the rolling 24 h withdrawal cap.
     /// Protected against reentrancy via RAII ReentrancyGuard.
     /// No-ops silently when balance is zero (not an error).
     pub fn emergency_withdraw(
@@ -182,13 +205,69 @@ impl TreasuryContract {
         let token_client = token::Client::new(&env, &token);
         let balance = token_client.balance(&env.current_contract_address());
 
-        // ── Interactions ──────────────────────────────────────────────────────
         if balance > 0 {
             token_client.transfer(&env.current_contract_address(), &recipient, &balance);
             events::emergency_withdrawn(&env, &admin, &token, balance);
         }
 
         Ok(())
+    }
+
+    // ── Withdrawal cap management ─────────────────────────────────────────────
+
+    /// Propose a new withdrawal cap. Takes effect after UPGRADE_TIMELOCK_DELAY.
+    /// Admin only. Set cap to 0 to remove the limit entirely.
+    pub fn propose_withdrawal_cap(
+        env: Env,
+        admin: Address,
+        new_cap: i128,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        if new_cap < 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalCapProposal, &(new_cap, env.ledger().timestamp()));
+        events::withdrawal_cap_proposed(&env, &admin, new_cap);
+        Ok(())
+    }
+
+    /// Execute a previously proposed withdrawal cap change after the timelock elapses.
+    /// Admin only.
+    pub fn execute_withdrawal_cap(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (new_cap, proposed_at): (i128, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawalCapProposal)
+            .ok_or(KoraError::NoCapChangeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::WithdrawalCapTimelockNotElapsed);
+        }
+        let old_cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawalCap)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalCap, &new_cap);
+        env.storage()
+            .instance()
+            .remove(&DataKey::WithdrawalCapProposal);
+        events::withdrawal_cap_updated(&env, &admin, old_cap, new_cap);
+        Ok(())
+    }
+
+    /// Returns the current withdrawal cap (0 = uncapped).
+    pub fn get_withdrawal_cap(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::WithdrawalCap)
+            .unwrap_or(0)
     }
 
     /// Returns the current protocol fee in basis points.
@@ -276,6 +355,65 @@ impl TreasuryContract {
             return Err(KoraError::TokenNotWhitelisted);
         }
         Ok(())
+    }
+
+    /// Advance the epoch if 24 h have elapsed, then check the cap.
+    fn enforce_rate_limit(env: &Env, amount: i128) -> Result<(), KoraError> {
+        let cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawalCap)
+            .unwrap_or(0);
+        if cap == 0 {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        let epoch_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EpochStart)
+            .unwrap_or(now);
+
+        let epoch_withdrawn: i128 = if now.saturating_sub(epoch_start) >= EPOCH_DURATION {
+            // New epoch: reset counters.
+            env.storage().instance().set(&DataKey::EpochStart, &now);
+            env.storage().instance().set(&DataKey::EpochWithdrawn, &0i128);
+            0
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::EpochWithdrawn)
+                .unwrap_or(0)
+        };
+
+        let new_total = epoch_withdrawn
+            .checked_add(amount)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        if new_total > cap {
+            return Err(KoraError::WithdrawalRateLimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Record a successful withdrawal against the current epoch's running total.
+    fn record_withdrawal(env: &Env, amount: i128) {
+        let cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawalCap)
+            .unwrap_or(0);
+        if cap == 0 {
+            return;
+        }
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EpochWithdrawn)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::EpochWithdrawn, &current.saturating_add(amount));
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
@@ -675,5 +813,40 @@ mod tests {
         // (Soroban token::Client.balance() returns 0 if the account has no balance)
         let balance = client.get_balance(&invalid_token);
         assert_eq!(balance, 0i128, "Balance of non-existent token should be 0");
+    }
+
+    // ── withdrawal rate limit ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_withdrawal_cap_default_is_uncapped() {
+        let (_env, _admin, client) = setup();
+        assert_eq!(client.get_withdrawal_cap(), 0);
+    }
+
+    #[test]
+    fn test_propose_withdrawal_cap_requires_admin() {
+        let (env, _admin, client) = setup();
+        let non_admin = Address::generate(&env);
+        assert!(client.try_propose_withdrawal_cap(&non_admin, &1_000_000i128).is_err());
+    }
+
+    #[test]
+    fn test_propose_negative_cap_rejected() {
+        let (_env, admin, client) = setup();
+        assert!(client.try_propose_withdrawal_cap(&admin, &-1i128).is_err());
+    }
+
+    #[test]
+    fn test_execute_cap_before_timelock_fails() {
+        let (_env, admin, client) = setup();
+        client.propose_withdrawal_cap(&admin, &1_000_000i128);
+        // Timelock hasn't elapsed
+        assert!(client.try_execute_withdrawal_cap(&admin).is_err());
+    }
+
+    #[test]
+    fn test_execute_cap_without_proposal_fails() {
+        let (_env, admin, client) = setup();
+        assert!(client.try_execute_withdrawal_cap(&admin).is_err());
     }
 }
