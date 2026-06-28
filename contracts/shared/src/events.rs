@@ -79,6 +79,22 @@ pub fn invoice_defaulted(env: &Env, invoice_id: u64, actor: &Address) {
     );
 }
 
+pub fn invoice_amended(env: &Env, invoice_id: u64, sme: &Address) {
+    emit(
+        env,
+        symbol_short!("INV_AMD"),
+        (invoice_id, sme.clone(), env.ledger().timestamp()),
+    );
+}
+
+pub fn invoice_withdrawn(env: &Env, invoice_id: u64, sme: &Address) {
+    emit(
+        env,
+        symbol_short!("INV_WTH"),
+        (invoice_id, sme.clone(), env.ledger().timestamp()),
+    );
+}
+
 // ── Repayment Events ──────────────────────────────────────────────────────────
 
 /// Schema: (actor=payer, invoice_id, amount, timestamp)
