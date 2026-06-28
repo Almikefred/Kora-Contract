@@ -48,6 +48,7 @@ const PERSISTENT_TTL_BUMP: u32 = 518_400;
 /// - `AccessControl` — Stores the access control contract address (instance)
 /// - `InvoiceCount` — Stores total invoice count for metrics (instance)
 /// - `MigrationVersion` — Tracks current schema version for upgrade safety (instance)
+/// - `CurrencyAllowlist(Symbol)` — Marks a currency symbol as allowed (persistent)
 #[contracttype]
 pub enum DataKey {
     /// Versioned invoice storage: Invoice(id) stores Invoice struct
@@ -62,6 +63,8 @@ pub enum DataKey {
     MigrationVersion,
     /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
     UpgradeProposal,
+    /// Persistent: marks an allowed currency symbol for invoice minting.
+    CurrencyAllowlist(Symbol),
 }
 
 
@@ -140,6 +143,7 @@ impl InvoiceNftContract {
         require_valid_risk_score(risk_score)?;
         require_non_empty_bytes(&debtor_hash)?;
         require_non_empty_string(&ipfs_cid)?;
+        Self::require_allowed_currency(&env, &currency)?;
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
 
@@ -346,6 +350,41 @@ impl InvoiceNftContract {
         Ok(())
     }
 
+    // ── Currency Allowlist ────────────────────────────────────────────────────
+
+    /// Add a currency symbol to the allowlist. Admin only.
+    pub fn add_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CurrencyAllowlist(currency.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CurrencyAllowlist(currency),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_BUMP,
+        );
+        Ok(())
+    }
+
+    /// Remove a currency symbol from the allowlist. Admin only.
+    pub fn remove_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CurrencyAllowlist(currency));
+        Ok(())
+    }
+
+    /// Check whether a currency symbol is on the allowlist.
+    pub fn is_currency_allowed(env: Env, currency: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::CurrencyAllowlist(currency))
+            .unwrap_or(false)
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     fn load_invoice(env: &Env, id: u64) -> Result<Invoice, KoraError> {
@@ -363,6 +402,18 @@ impl InvoiceNftContract {
             .ok_or(KoraError::NotInitialized)?;
         if &admin != caller {
             return Err(KoraError::NotAdmin);
+        }
+        Ok(())
+    }
+
+    fn require_allowed_currency(env: &Env, currency: &Symbol) -> Result<(), KoraError> {
+        let allowed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrencyAllowlist(currency.clone()))
+            .unwrap_or(false);
+        if !allowed {
+            return Err(KoraError::CurrencyNotAllowed);
         }
         Ok(())
     }
