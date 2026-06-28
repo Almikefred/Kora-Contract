@@ -264,6 +264,12 @@ impl MarketplaceContract {
 
         let nft_client =
             kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+
+        let invoice = nft_client.get_invoice(&invoice_id);
+        if invoice.amount != face_value {
+            return Err(KoraError::InvalidAmount);
+        }
+
         nft_client.set_listed(&env.current_contract_address(), &invoice_id);
 
         let listing = Listing {
@@ -494,7 +500,6 @@ impl MarketplaceContract {
         if !ok {
             return Err(KoraError::TokenNotWhitelisted);
         }
-        Ok(())
     }
 
     pub fn is_token_whitelisted(env: Env, token: Address) -> bool {
