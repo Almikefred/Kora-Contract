@@ -47,11 +47,16 @@ impl FinancingPoolContract {
         access_control: Address,
         late_penalty_bps: u32,
         price_oracle: Address,
+        max_position_bps: u32,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
         kora_shared::validation::require_valid_fee_bps(late_penalty_bps)?;
+        // max_position_bps must be in [1, 10_000]: zero would block all funding
+        if max_position_bps == 0 || max_position_bps > 10_000 {
+            return Err(KoraError::InvalidFeeRate);
+        }
         kora_shared::validation::require_not_self(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &invoice_nft)?;
         kora_shared::validation::require_not_self(&env, &risk_registry)?;
@@ -68,6 +73,7 @@ impl FinancingPoolContract {
         env.storage().instance().set(&DataKey::AccessControl, &access_control);
         env.storage().instance().set(&DataKey::LatePenaltyBps, &late_penalty_bps);
         env.storage().instance().set(&DataKey::PriceOracle, &price_oracle);
+        env.storage().instance().set(&DataKey::MaxPositionBps, &max_position_bps);
         Ok(())
     }
 
@@ -130,6 +136,25 @@ impl FinancingPoolContract {
         Ok(())
     }
 
+    /// Update the per-investor concentration cap. Admin only.
+    pub fn set_max_position_bps(env: Env, admin: Address, max_position_bps: u32) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        if max_position_bps == 0 || max_position_bps > 10_000 {
+            return Err(KoraError::InvalidFeeRate);
+        }
+        env.storage().instance().set(&DataKey::MaxPositionBps, &max_position_bps);
+        Ok(())
+    }
+
+    /// Returns the current per-investor concentration cap in basis points.
+    pub fn get_max_position_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxPositionBps)
+            .unwrap_or(5_000)
+    }
+
     /// Register an investor position. Admin only.
     pub fn record_position(
         env: Env,
@@ -155,6 +180,16 @@ impl FinancingPoolContract {
             .checked_mul(10_000)
             .and_then(|v| v.checked_div(total_pool))
             .ok_or(KoraError::ArithmeticOverflow)? as u32;
+
+        // Enforce per-investor concentration cap
+        let max_position_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPositionBps)
+            .unwrap_or(5_000);
+        if share_bps > max_position_bps {
+            return Err(KoraError::ExceedsFundingTarget);
+        }
 
         let position = Position {
             investor: investor.clone(),
