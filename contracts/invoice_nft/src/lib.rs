@@ -23,7 +23,7 @@ use kora_shared::{
         require_valid_risk_score, MAX_DEBTOR_HASH_LEN, MAX_IPFS_CID_LEN, UPGRADE_TIMELOCK_DELAY,
     },
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
 // ── TTL constants (~30 days at ~5s/ledger) ───────────────────────────────────
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -68,6 +68,19 @@ pub enum DataKey {
     Marketplace,
     /// Instance key: authorized financing pool contract address
     FinancingPool,
+}
+
+/// Input type for a single invoice within a batch mint operation.
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchInvoiceInput {
+    pub debtor_hash: Bytes,
+    pub amount: i128,
+    pub currency: Symbol,
+    pub due_date: u64,
+    pub ipfs_cid: String,
+    pub risk_score: u32,
+    pub notes: Option<String>,
 }
 
 // ── Migration helpers ─────────────────────────────────────────────────────────
@@ -319,6 +332,72 @@ impl InvoiceNftContract {
 
         events::invoice_created(&env, id, &sme, invoice.amount);
         Ok(id)
+    }
+
+    /// Mint multiple invoice NFTs atomically for a single SME.
+    ///
+    /// All inputs are validated before any invoice is stored — if any entry
+    /// fails validation the entire batch is aborted (atomic-abort semantics).
+    /// A single `require_auth` covers the whole batch.
+    ///
+    /// Returns a `Vec<u64>` of the newly allocated invoice IDs in order.
+    pub fn mint_invoices_batch(
+        env: Env,
+        sme: Address,
+        invoices: Vec<BatchInvoiceInput>,
+    ) -> Result<Vec<u64>, KoraError> {
+        sme.require_auth();
+        Self::require_not_paused(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
+
+        // ── Phase 1: validate ALL inputs before touching storage ──────────────
+        for i in 0..invoices.len() {
+            let entry = invoices.get(i).unwrap();
+            require_non_zero_amount(entry.amount)?;
+            require_future_timestamp(&env, entry.due_date)?;
+            require_valid_risk_score(entry.risk_score)?;
+            require_non_empty_bytes(&entry.debtor_hash)?;
+            require_max_length_bytes(&entry.debtor_hash, MAX_DEBTOR_HASH_LEN)?;
+            require_non_empty_string(&entry.ipfs_cid)?;
+            require_max_length_string(&entry.ipfs_cid, MAX_IPFS_CID_LEN)?;
+        }
+
+        // ── Phase 2: mint each invoice ────────────────────────────────────────
+        let mut ids: Vec<u64> = Vec::new(&env);
+        let mut next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
+
+        for i in 0..invoices.len() {
+            let entry = invoices.get(i).unwrap();
+            let id = next_id;
+
+            let invoice = Invoice {
+                id,
+                sme: sme.clone(),
+                debtor_hash: entry.debtor_hash,
+                amount: entry.amount,
+                currency: entry.currency,
+                due_date: entry.due_date,
+                ipfs_cid: entry.ipfs_cid,
+                metadata_hash: Bytes::new(&env),
+                risk_score: entry.risk_score,
+                risk_tier: RiskTier::from_score(entry.risk_score),
+                status: InvoiceStatus::Created,
+                created_at: env.ledger().timestamp(),
+                funded_at: None,
+                repaid_at: None,
+                notes: entry.notes,
+            };
+
+            env.storage().persistent().set(&DataKey::Invoice(id), &invoice);
+            Self::bump_invoice_ttl(&env, id);
+            events::invoice_created(&env, id, &sme, invoice.amount);
+            ids.push_back(id);
+
+            next_id = next_id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?;
+        }
+
+        env.storage().instance().set(&DataKey::NextId, &next_id);
+        Ok(ids)
     }
 
     /// Amend a Created invoice. Only the original SME may call this, and only
