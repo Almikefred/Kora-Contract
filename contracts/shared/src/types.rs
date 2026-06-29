@@ -113,6 +113,49 @@ pub struct PositionSaleOffer {
     pub invoice_id: u64,
     pub token: Address,
     pub price: i128,
+}
+
+/// A single scheduled installment for a financed invoice.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Installment {
+    pub due_date: u64,  // Unix timestamp by which this installment must be paid
+    pub amount: i128,   // Amount due for this installment (in pool token stroops)
+    pub paid: bool,     // Whether this installment has been satisfied
+}
+
+/// An optional repayment schedule attached to a Pool.
+///
+/// When present, `repay()` validates each call against the current unpaid
+/// installment in order.  The final installment closing the pool triggers
+/// yield distribution exactly as in lump-sum repayment.
+///
+/// Invariant: `sum(installment.amount for all installments)` == `Pool.total_owed`
+/// at the time the schedule is set.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InstallmentSchedule {
+    pub installments: Vec<Installment>,
+    /// Index of the next installment that must be paid (0-based).
+    pub next_index: u32,
+}
+
+/// Protocol-wide running counters for analytics dashboards.
+///
+/// Incremented at the relevant mutation points:
+/// - `pools_opened`     — incremented in `release_funds`
+/// - `total_repaid`     — incremented in `repay` (by the effective_amount of each call)
+/// - `pools_defaulted`  — incremented in `mark_default`
+/// - `active_pools`     — +1 in `release_funds`, -1 when pool closes (repay or default)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolStats {
+    pub pools_opened: u64,
+    pub total_repaid: i128,
+    pub pools_defaulted: u64,
+    pub active_pools: u64,
+}
+
 /// An SME's early-termination buyout offer for a funded invoice.
 ///
 /// The SME escrows `amount` (a discount to `total_owed`) into the pool; investors then
