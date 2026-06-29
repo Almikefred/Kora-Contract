@@ -381,6 +381,24 @@ pub fn registry_initialized(env: &Env, admin: &Address, invoice_nft: &Address) {
     );
 }
 
+/// Schema: (primary_verifier, sub_account, timestamp)
+pub fn sub_account_added(env: &Env, primary: &Address, sub_account: &Address) {
+    emit(
+        env,
+        symbol_short!("VRF_SUB_ADD"),
+        (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (primary_verifier, sub_account, timestamp)
+pub fn sub_account_removed(env: &Env, primary: &Address, sub_account: &Address) {
+    emit(
+        env,
+        symbol_short!("VRF_SUB_RMV"),
+        (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
+    );
+}
+
 // ── Upgrade Events ───────────────────────────────────────────────────────────
 
 /// Schema: (actor=admin, wasm_hash, timestamp)

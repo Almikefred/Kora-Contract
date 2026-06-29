@@ -69,7 +69,7 @@ pub enum KoraError {
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
     // Field value exceeds the allowed maximum length
-    FieldTooLong = 95,
+    FieldTooLong = 102,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
