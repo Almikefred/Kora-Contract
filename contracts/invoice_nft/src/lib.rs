@@ -68,6 +68,12 @@ pub enum DataKey {
     Marketplace,
     /// Instance key: authorized financing pool contract address
     FinancingPool,
+    /// Instance key: authorized risk registry contract address
+    RiskRegistry,
+    /// Persistent key: outstanding exposure per SME address
+    OutstandingExposure(Address),
+    /// Persistent key: allowed currency symbols
+    CurrencyAllowlist(Symbol),
 }
 
 // ── Migration helpers ─────────────────────────────────────────────────────────
@@ -802,6 +808,7 @@ mod tests {
             &due_date,
             &ipfs_cid,
             &risk_score,
+            &None,
         )
     }
 
@@ -869,7 +876,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &25u32, &None,
         );
         assert_eq!(id, 1);
@@ -892,7 +899,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 2;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &0i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -906,7 +913,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 2;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &-1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -920,7 +927,7 @@ mod tests {
         let due_date = env.ledger().timestamp() - 1;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
@@ -934,7 +941,7 @@ mod tests {
         let due_date = env.ledger().timestamp(); // equal to now — not strictly future
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
@@ -948,7 +955,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 2;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &101u32, &None,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &101u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidRiskScore);
     }
@@ -962,7 +969,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 2;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyBytes);
     }
@@ -970,8 +977,7 @@ mod tests {
     #[test]
     fn test_mint_multiple_invoices_increments_id() {
         let (env, _admin, client) = setup();
-        let sme1 = Address::generate(&env);
-        let sme2 = Address::generate(&env);
+        let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let cid = ipfs_cid(&env);
         let due_date = env.ledger().timestamp() + 86_400 * 30;
@@ -981,7 +987,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &10u32, &None,
         );
         let id2 = client.mint_invoice(
@@ -990,7 +996,7 @@ mod tests {
             &2_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &20u32, &None,
         );
         assert_eq!(id1, 1);
@@ -1008,7 +1014,7 @@ mod tests {
         let large_amount = i128::MAX;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &large_amount,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &50u32, &None,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &50u32, &None,
         );
         assert_eq!(client.get_invoice(&id).amount, large_amount);
     }
@@ -1035,7 +1041,7 @@ mod tests {
         for (score, expected_tier) in &test_cases {
             let id = client.mint_invoice(
                 &sme, &debtor_hash, &1_000_000_000i128,
-                &Symbol::new(&env, "USDC"), &due_date, &cid, score,
+                &Symbol::new(&env, "USDC"), &due_date, &cid, score, &None,
             );
             assert_eq!(client.get_invoice(&id).risk_tier, *expected_tier);
         }
@@ -1109,16 +1115,6 @@ mod tests {
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
     }
 
-        let id = client.mint_invoice(
-            &sme,
-            &debtor_hash,
-            &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"),
-            &due_date,
-            &ipfs_cid,
-            &10u32, &None,
-        );
-
     #[test]
     fn test_set_funded_invalid_status_fails() {
         let (env, _admin, client) = setup();
@@ -1131,23 +1127,11 @@ mod tests {
     #[test]
     fn test_set_repaid_invalid_status_fails() {
         let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(
-            &env,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-        );
-        let due_date = env.ledger().timestamp() + 86_400 * 30;
-
-        let id = client.mint_invoice(
-            &sme,
-            &debtor_hash,
-            &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"),
-            &due_date,
-            &ipfs_cid,
-            &10u32, &None,
-        );
+        let id = mint_default(&env, &client, 10u32);
+        let pool = Address::generate(&env);
+        let result = client.try_set_repaid(&pool, &id); // Created → Repaid skips Listed/Funded
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+    }
 
     #[test]
     fn test_set_funded_idempotent_fails() {
@@ -1201,7 +1185,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
@@ -1226,7 +1210,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
@@ -1251,7 +1235,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
@@ -1278,7 +1262,7 @@ mod tests {
             &large_amount,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &50u32, &None,
         );
         assert_eq!(client.get_invoice(&id).amount, large_amount);
@@ -1297,7 +1281,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &10u32, &None,
         );
         let id2 = client.mint_invoice(
@@ -1306,7 +1290,7 @@ mod tests {
             &2_000_000_000i128,
             &Symbol::new(&env, "EURC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &20u32, &None,
         );
         assert_eq!(client.get_invoice(&id1).currency, Symbol::new(&env, "USDC"));
@@ -1355,7 +1339,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &10u32, &None,
         );
         let invoice = client.get_invoice(&id);
@@ -1391,7 +1375,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
@@ -1429,13 +1413,8 @@ mod tests {
             &ipfs_cid,
             &10u32, &None,
         );
-
-        let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
-
-        let pool = Address::generate(&env);
-        client.set_funded(&pool, &id);
-        client.set_repaid(&pool, &id);
+        assert_eq!(client.next_id(), 2);
+    }
 
     #[test]
     fn test_invoice_count_increments() {
@@ -1450,30 +1429,10 @@ mod tests {
     #[test]
     fn test_invalid_status_transition_created_to_funded_fails() {
         let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(
-            &env,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-        );
-        let due_date = env.ledger().timestamp() + 86_400;
-
-        let id = client.mint_invoice(
-            &sme,
-            &debtor_hash,
-            &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"),
-            &due_date,
-            &ipfs_cid,
-            &10u32, &None,
-        );
-        let id2 = client.mint_invoice(
-            &sme, &debtor_hash, &2_000_000_000i128,
-            &Symbol::new(&env, "EURC"), &due_date, &ipfs_cid, &20u32, &None,
-        );
-
-        assert_eq!(client.get_invoice(&id1).currency, Symbol::new(&env, "USDC"));
-        assert_eq!(client.get_invoice(&id2).currency, Symbol::new(&env, "EURC"));
+        let id = mint_default(&env, &client, 10u32);
+        let pool = Address::generate(&env);
+        let result = client.try_set_funded(&pool, &id); // Created → Funded skips Listed
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
     }
 
     #[test]
@@ -1500,7 +1459,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &20u32, &None,
         );
         assert_eq!(client.get_invoice(&id1).risk_tier, RiskTier::AAA);
@@ -1510,7 +1469,7 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &21u32, &None,
         );
         assert_eq!(client.get_invoice(&id2).risk_tier, RiskTier::AA);
@@ -1566,7 +1525,7 @@ mod tests {
 
         // Perform migration
         client.migrate(&admin);
-        let invoice_after = client.get_invoice(&id);
+        let invoice_after = client.get_invoice(&invoice_id);
         assert_eq!(invoice_before.id, invoice_after.id);
         assert_eq!(invoice_before.sme, invoice_after.sme);
         assert_eq!(invoice_before.amount, invoice_after.amount);
@@ -1634,6 +1593,11 @@ mod tests {
         let (env, admin, client) = setup();
         client.migrate(&admin);
 
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+
         // Verify we can still mint and transition invoices after migration
         let invoice_id = client.mint_invoice(
             &sme,
@@ -1641,17 +1605,16 @@ mod tests {
             &1_000_000_000i128,
             &Symbol::new(&env, "USDC"),
             &due_date,
-            &ipfs_cid,
+            &cid,
             &50u32, &None,
         );
 
         let invoice = client.get_invoice(&invoice_id);
         assert_eq!(invoice.status, InvoiceStatus::Created);
 
-        // Transition through state machine
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
-        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
+        client.set_listed(&marketplace, &invoice_id);
+        assert_eq!(client.get_invoice(&invoice_id).status, InvoiceStatus::Listed);
     }
 
     // ── credit limit (outstanding exposure) ───────────────────────────────────
@@ -1670,7 +1633,7 @@ mod tests {
 
         client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         assert_eq!(client.get_outstanding_exposure(&sme), 1_000_000_000i128);
     }
@@ -1687,7 +1650,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let mp = Address::generate(&env);
         let pool = Address::generate(&env);
@@ -1709,7 +1672,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         client.withdraw_invoice(&sme, &id);
         assert_eq!(client.get_outstanding_exposure(&sme), 0i128);
@@ -1729,7 +1692,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
 
         let new_debtor = Bytes::from_slice(&env, &[2u8; 32]);
@@ -1758,7 +1721,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let result = client.try_amend_invoice(
             &other, &id, &debtor_hash, &1_000_000_000i128, &due_date, &ipfs_cid, &10u32,
@@ -1778,7 +1741,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let marketplace = Address::generate(&env);
         client.set_listed(&marketplace, &id);
@@ -1802,7 +1765,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         client.withdraw_invoice(&sme, &id);
         let result = client.try_get_invoice(&id);
@@ -1822,7 +1785,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let result = client.try_withdraw_invoice(&other, &id);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::NotInvoiceOwner);
@@ -1840,7 +1803,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let marketplace = Address::generate(&env);
         client.set_listed(&marketplace, &id);
