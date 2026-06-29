@@ -3,7 +3,7 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    types::{Pool, Position},
+    types::{EarlySettlementOffer, Pool, Position, PositionSaleOffer, ProtocolStats},
     validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
@@ -29,6 +29,9 @@ pub enum DataKey {
     UpgradeProposal,
     SaleOffer(u64, Address),
     EarlySettlement(u64),
+    AggregateFunded(Address),
+    MaxPositionBps,
+    ProtocolStats,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -129,6 +132,13 @@ impl FinancingPoolContract {
 
         // Standardized financing pool event
         events::pool_opened(&env, &marketplace, invoice_id, &token, pool.face_value);
+
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.pools_opened = stats.pools_opened.saturating_add(1);
+        stats.active_pools = stats.active_pools.saturating_add(1);
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
 
         // Transition NFT status to Funded
         nft_client.set_funded(&env.current_contract_address(), &invoice_id);
@@ -323,6 +333,15 @@ impl FinancingPoolContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&payer, &env.current_contract_address(), &amount);
 
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.total_repaid = stats.total_repaid.saturating_add(effective_amount);
+        if should_close {
+            stats.active_pools = stats.active_pools.saturating_sub(1);
+        }
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
+
         // Standardized repayment event
         events::repayment_made(&env, invoice_id, &payer, amount);
 
@@ -426,6 +445,13 @@ impl FinancingPoolContract {
         nft_client.set_defaulted(&admin, &invoice_id);
 
         events::invoice_defaulted(&env, invoice_id, &admin);
+
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.pools_defaulted = stats.pools_defaulted.saturating_add(1);
+        stats.active_pools = stats.active_pools.saturating_sub(1);
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
 
         // Automatically record the default against the SME in the risk registry
         let invoice = nft_client.get_invoice(&invoice_id);
@@ -585,6 +611,13 @@ impl FinancingPoolContract {
                 kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
             nft_client.set_repaid(&env.current_contract_address(), &invoice_id);
 
+            // Update protocol stats
+            let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+                .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+            stats.total_repaid = stats.total_repaid.saturating_add(offer.amount);
+            stats.active_pools = stats.active_pools.saturating_sub(1);
+            env.storage().instance().set(&DataKey::ProtocolStats, &stats);
+
             env.storage()
                 .persistent()
                 .remove(&DataKey::EarlySettlement(invoice_id));
@@ -671,6 +704,19 @@ impl FinancingPoolContract {
             .get(&DataKey::Positions(invoice_id))
             .unwrap_or(Map::new(&env));
         positions.values()
+    }
+
+    /// Return protocol-wide aggregate statistics for analytics/dashboards.
+    pub fn get_protocol_stats(env: Env) -> ProtocolStats {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats {
+                pools_opened: 0,
+                total_repaid: 0,
+                pools_defaulted: 0,
+                active_pools: 0,
+            })
     }
 
     // ── Secondary market ───────────────────────────────────────────────────────

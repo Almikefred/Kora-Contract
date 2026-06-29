@@ -113,6 +113,24 @@ pub struct PositionSaleOffer {
     pub invoice_id: u64,
     pub token: Address,
     pub price: i128,
+}
+
+/// Protocol-wide running counters for analytics dashboards.
+///
+/// Incremented at the relevant mutation points:
+/// - `pools_opened`     — incremented in `release_funds`
+/// - `total_repaid`     — incremented in `repay` (by the effective_amount of each call)
+/// - `pools_defaulted`  — incremented in `mark_default`
+/// - `active_pools`     — +1 in `release_funds`, -1 when pool closes (repay or default)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolStats {
+    pub pools_opened: u64,
+    pub total_repaid: i128,
+    pub pools_defaulted: u64,
+    pub active_pools: u64,
+}
+
 /// An SME's early-termination buyout offer for a funded invoice.
 ///
 /// The SME escrows `amount` (a discount to `total_owed`) into the pool; investors then
