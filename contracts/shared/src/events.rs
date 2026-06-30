@@ -107,6 +107,15 @@ pub fn repayment_made(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
     );
 }
 
+/// Schema: (actor=payer, invoice_id, installment_index, amount, timestamp)
+pub fn installment_paid(env: &Env, invoice_id: u64, payer: &Address, index: u32, amount: i128) {
+    emit(
+        env,
+        symbol_short!("INSTLMT_PAID"),
+        (payer.clone(), invoice_id, index, amount, env.ledger().timestamp()),
+    );
+}
+
 /// Schema: (actor=investor, invoice_id, yield_amount, timestamp)
 pub fn yield_distributed(env: &Env, invoice_id: u64, investor: &Address, yield_amount: i128) {
     emit(
