@@ -853,6 +853,7 @@ mod tests {
             &due_date,
             &ipfs_cid,
             &risk_score,
+            &None,
         )
     }
 
@@ -1160,16 +1161,6 @@ mod tests {
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
     }
 
-        let id = client.mint_invoice(
-            &sme,
-            &debtor_hash,
-            &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"),
-            &due_date,
-            &ipfs_cid,
-            &10u32, &None,
-        );
-
     #[test]
     fn test_set_funded_invalid_status_fails() {
         let (env, _admin, client) = setup();
@@ -1182,23 +1173,11 @@ mod tests {
     #[test]
     fn test_set_repaid_invalid_status_fails() {
         let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(
-            &env,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-        );
-        let due_date = env.ledger().timestamp() + 86_400 * 30;
-
-        let id = client.mint_invoice(
-            &sme,
-            &debtor_hash,
-            &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"),
-            &due_date,
-            &ipfs_cid,
-            &10u32, &None,
-        );
+        let id = mint_default(&env, &client, 10u32);
+        let pool = Address::generate(&env);
+        let result = client.try_set_repaid(&pool, &id); // Created → Repaid skips Funded
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+    }
 
     #[test]
     fn test_set_funded_idempotent_fails() {
@@ -1223,6 +1202,42 @@ mod tests {
         client.set_repaid(&pool, &id);
         let result = client.try_set_repaid(&pool, &id);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_repaid_blocked_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_700_000_000,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        let admin = Address::generate(&env);
+        let ac_id = env.register_contract(None, kora_access_control::AccessControlContract);
+        let ac_client = kora_access_control::AccessControlContractClient::new(&env, &ac_id);
+        ac_client.initialize(&admin);
+
+        let contract_id = env.register_contract(None, InvoiceNftContract);
+        let client = InvoiceNftContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &ac_id);
+
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        client.set_listed(&marketplace, &id);
+        let pool = Address::generate(&env);
+        client.set_funded(&pool, &id);
+
+        ac_client.pause(&admin);
+
+        let result = client.try_set_repaid(&pool, &id);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::ProtocolPaused);
     }
 
     // ── set_defaulted ─────────────────────────────────────────────────────────
