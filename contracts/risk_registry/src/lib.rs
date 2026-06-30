@@ -31,6 +31,9 @@ pub enum DataKey {
     Verifier(Address),
     VerifierStake(Address), // amount of tokens staked by verifier
     VerifierReputation(Address), // reputation score of verifier
+    /// Maps a sub-account address → its primary verifier address.
+    /// Sub-accounts can act on behalf of the primary for all verifier operations.
+    SubAccount(Address),
     SmeProfile(Address),
     DebtorScore(Bytes), // keyed by debtor_hash (SHA-256 of PII)
     /// Ledger timestamp of the last set_debtor_score call per (verifier, debtor_hash).
@@ -182,6 +185,73 @@ impl RiskRegistryContract {
         Ok(())
     }
 
+    // ── Sub-account delegation ────────────────────────────────────────────────
+
+    /// Primary verifier delegates action rights to a sub-account.
+    /// The primary verifier must be registered. The sub-account must not already
+    /// be a primary verifier or an existing sub-account of another verifier.
+    /// All actions performed by sub-accounts are attributed to the primary verifier.
+    pub fn add_sub_account(
+        env: Env,
+        primary: Address,
+        sub_account: Address,
+    ) -> Result<(), KoraError> {
+        primary.require_auth();
+        Self::require_verifier_primary(&env, &primary)?;
+
+        // sub_account must not itself be a primary verifier
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Verifier(sub_account.clone()))
+            .unwrap_or(false)
+        {
+            return Err(KoraError::InvalidAddress);
+        }
+
+        // sub_account must not already be registered under another primary
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SubAccount(sub_account.clone()))
+        {
+            return Err(KoraError::AlreadyInitialized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubAccount(sub_account.clone()), &primary);
+        Self::bump_persistent(&env, &DataKey::SubAccount(sub_account.clone()));
+        events::sub_account_added(&env, &primary, &sub_account);
+        Ok(())
+    }
+
+    /// Remove a previously delegated sub-account. Primary verifier only.
+    pub fn remove_sub_account(
+        env: Env,
+        primary: Address,
+        sub_account: Address,
+    ) -> Result<(), KoraError> {
+        primary.require_auth();
+        Self::require_verifier_primary(&env, &primary)?;
+
+        let stored_primary: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubAccount(sub_account.clone()))
+            .ok_or(KoraError::NotVerifier)?;
+
+        if stored_primary != primary {
+            return Err(KoraError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SubAccount(sub_account.clone()));
+        events::sub_account_removed(&env, &primary, &sub_account);
+        Ok(())
+    }
+
     // ── SME management ────────────────────────────────────────────────────────
 
     /// Verifier registers and scores an SME. Fails if SME is already registered.
@@ -193,7 +263,8 @@ impl RiskRegistryContract {
         compliance_attested: bool,
     ) -> Result<(), KoraError> {
         verifier.require_auth();
-        Self::require_verifier(&env, &verifier)?;
+        // Resolve to primary verifier so sub-accounts attribute registration correctly.
+        let primary = Self::resolve_verifier(&env, &verifier)?;
         require_valid_risk_score(risk_score)?;
 
         // Guard against silent re-registration that would reset defaults/invoice counts
@@ -208,7 +279,7 @@ impl RiskRegistryContract {
         let profile = SmeProfile {
             address: sme.clone(),
             verified: true,
-            verifier: verifier.clone(),
+            verifier: primary.clone(),
             risk_score,
             total_invoices: 0,
             defaults: 0,
@@ -221,7 +292,7 @@ impl RiskRegistryContract {
             .persistent()
             .set(&DataKey::SmeProfile(sme.clone()), &profile);
         Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
-        events::sme_registered(&env, &verifier, &sme, risk_score);
+        events::sme_registered(&env, &primary, &sme, risk_score);
         Ok(())
     }
 
@@ -466,6 +537,21 @@ impl RiskRegistryContract {
             .unwrap_or(false)
     }
 
+    /// Returns the primary verifier for a sub-account address, or `None` if the address
+    /// is not registered as a sub-account.
+    pub fn get_primary_verifier(env: Env, sub_account: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SubAccount(sub_account))
+    }
+
+    /// Returns `true` if `addr` is an active sub-account of any primary verifier.
+    pub fn is_sub_account(env: Env, addr: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::SubAccount(addr))
+    }
+
     /// Returns the debtor score or `KoraError::DebtorNotRegistered` if not found.
     pub fn get_debtor_score(env: Env, debtor_hash: Bytes) -> Result<u32, KoraError> {
         let key = DataKey::DebtorScore(debtor_hash);
@@ -575,7 +661,45 @@ impl RiskRegistryContract {
         Ok(())
     }
 
+    /// Returns `Ok(primary)` when `caller` is an active verifier (primary or sub-account).
+    /// Sub-accounts resolve to their primary verifier so that reputation and staking
+    /// are always attributed to the primary.
+    fn resolve_verifier(env: &Env, caller: &Address) -> Result<Address, KoraError> {
+        // Direct primary check first (fast path).
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Verifier(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(caller.clone());
+        }
+        // Sub-account resolution.
+        if let Some(primary) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::SubAccount(caller.clone()))
+        {
+            // Ensure the primary is still an active verifier.
+            if env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::Verifier(primary.clone()))
+                .unwrap_or(false)
+            {
+                return Ok(primary);
+            }
+        }
+        Err(KoraError::NotVerifier)
+    }
+
     fn require_verifier(env: &Env, caller: &Address) -> Result<(), KoraError> {
+        Self::resolve_verifier(env, caller).map(|_| ())
+    }
+
+    /// Require `caller` to be a **primary** verifier (not a sub-account).
+    /// Used for delegation management so only the primary can add/remove sub-accounts.
+    fn require_verifier_primary(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let ok: bool = env
             .storage()
             .persistent()
