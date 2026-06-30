@@ -1395,6 +1395,42 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_set_repaid_blocked_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_700_000_000,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        let admin = Address::generate(&env);
+        let ac_id = env.register_contract(None, kora_access_control::AccessControlContract);
+        let ac_client = kora_access_control::AccessControlContractClient::new(&env, &ac_id);
+        ac_client.initialize(&admin);
+
+        let contract_id = env.register_contract(None, InvoiceNftContract);
+        let client = InvoiceNftContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &ac_id);
+
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        client.set_listed(&marketplace, &id);
+        let pool = Address::generate(&env);
+        client.set_funded(&pool, &id);
+
+        ac_client.pause(&admin);
+
+        let result = client.try_set_repaid(&pool, &id);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+    }
+
     // ── set_defaulted ─────────────────────────────────────────────────────────
 
     #[test]
