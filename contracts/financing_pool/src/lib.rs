@@ -3,7 +3,7 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    types::{Pool, Position},
+    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer},
     validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
@@ -42,6 +42,24 @@ pub struct FinancingPoolContract;
 
 #[contractimpl]
 impl FinancingPoolContract {
+    /// One-time initialization. Wires up all cross-contract dependencies and configures pool parameters.
+    ///
+    /// **Parameters:**
+    /// - `admin` — The address that will administer this contract.
+    /// - `invoice_nft` — The deployed `invoice_nft` contract address.
+    /// - `risk_registry` — The deployed `risk_registry` contract address.
+    /// - `treasury` — The deployed `treasury` contract address for fee forwarding.
+    /// - `access_control` — The deployed `access_control` contract address for pause checks.
+    /// - `late_penalty_bps` — Late-repayment penalty in basis points (0–10 000).
+    /// - `price_oracle` — The deployed price oracle contract address for currency conversion.
+    /// - `max_position_bps` — Maximum per-investor share of a pool in basis points (1–10 000).
+    ///
+    /// **Errors:**
+    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `KoraError::InvalidFeeRate` — `late_penalty_bps` > 10 000 or `max_position_bps` is 0 or > 10 000.
+    /// - `KoraError::InvalidAddress` — Any address parameter is the contract's own address.
+    ///
+    /// **Security:** No auth required on first call. Subsequent calls revert immediately.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -81,7 +99,24 @@ impl FinancingPoolContract {
         Ok(())
     }
 
-    /// Called by Marketplace when an invoice is fully funded.
+    /// Called by Marketplace when an invoice is fully funded. Opens a new pool,
+    /// records the face value, and transitions the invoice NFT to `Funded` status.
+    ///
+    /// **Parameters:**
+    /// - `marketplace` — Must be the authorized marketplace contract address (signs).
+    /// - `invoice_id` — The ID of the fully-funded invoice.
+    /// - `token` — The whitelisted stablecoin token address used for this pool.
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::PoolAlreadyClosed` — A pool for this invoice ID already exists.
+    /// - `KoraError::InvalidAddress` — `token` is the contract's own address.
+    /// - `KoraError::NotInitialized` — Contract cross-references are missing.
+    /// - `KoraError::InvalidAmount` — Invoice amount is out of the safe range.
+    /// - `KoraError::Unauthorized` — Caller is not the authorized marketplace.
+    ///
+    /// **Security:** Requires `marketplace.require_auth()`. Only the marketplace contract
+    /// (stored at initialization) may call this. Emits `pool_opened` event.
     pub fn release_funds(
         env: Env,
         marketplace: Address,
@@ -134,6 +169,13 @@ impl FinancingPoolContract {
         // Standardized financing pool event
         events::pool_opened(&env, &marketplace, invoice_id, &token, pool.face_value);
 
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.pools_opened = stats.pools_opened.saturating_add(1);
+        stats.active_pools = stats.active_pools.saturating_add(1);
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
+
         // Transition NFT status to Funded
         nft_client.set_funded(&env.current_contract_address(), &invoice_id);
 
@@ -141,6 +183,18 @@ impl FinancingPoolContract {
     }
 
     /// Update the per-investor concentration cap. Admin only.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `max_position_bps` — New cap in basis points (1–10 000). Zero is rejected since it
+    ///   would block all funding.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidFeeRate` — `max_position_bps` is 0 or > 10 000.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Applies to new positions only;
+    /// existing positions are not retroactively affected.
     pub fn set_max_position_bps(env: Env, admin: Address, max_position_bps: u32) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -152,6 +206,10 @@ impl FinancingPoolContract {
     }
 
     /// Returns the current per-investor concentration cap in basis points.
+    ///
+    /// **Returns:** The cap in bps (default 5 000 = 50% if not explicitly set).
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_max_position_bps(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -159,7 +217,28 @@ impl FinancingPoolContract {
             .unwrap_or(5_000)
     }
 
-    /// Register an investor position. Admin only.
+    /// Register an investor position for a funded invoice. Admin only.
+    ///
+    /// Called by the marketplace (via admin) after each investor contribution to record
+    /// the investor's share of the pool. The share in basis points is computed as
+    /// `contributed * 10_000 / total_pool`.
+    ///
+    /// **Parameters:**
+    /// - `caller` — Must be the current admin address.
+    /// - `invoice_id` — The ID of the funded invoice.
+    /// - `investor` — The investor address receiving the position.
+    /// - `contributed` — The investor's contribution amount in the pool token.
+    /// - `total_pool` — The total funded amount of the pool at this point.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::InvalidAmount` — `contributed` or `total_pool` is ≤ 0, or exceeds safe bounds.
+    /// - `KoraError::ExceedsFundingTarget` — Investor's computed share exceeds `max_position_bps`.
+    /// - `KoraError::ArithmeticOverflow` — Share calculation overflowed.
+    /// - `KoraError::PoolNotFound` — No pool exists for `invoice_id`.
+    ///
+    /// **Security:** Requires `caller.require_auth()`. Enforces per-investor concentration cap.
     pub fn record_position(
         env: Env,
         caller: Address,
@@ -248,11 +327,19 @@ impl FinancingPoolContract {
     }
 
     /// SME repays the invoice.
-    /// If the current ledger timestamp is past the invoice's due_date and no
-    /// penalty has been applied yet, a one-time late penalty of
-    /// `bps_of(face_value, late_penalty_bps)` is added to `total_owed`.
-    /// Partial repayments are tracked against `total_owed` so the penalty is
-    /// never double-counted.
+    ///
+    /// If the pool has an installment schedule, `amount` must match the current
+    /// installment's expected amount (or be the remaining balance for the final
+    /// installment).  The current installment is marked paid and the next index
+    /// is advanced.  When the final installment is paid the pool closes and yield
+    /// is distributed exactly as in lump-sum repayment.
+    ///
+    /// Without a schedule, the existing lump-sum-toward-face-value behaviour is
+    /// preserved: any positive amount is accepted and the pool closes once
+    /// `repaid_amount >= total_owed`.
+    ///
+    /// A one-time late penalty is applied when repaying past the invoice due_date
+    /// (or past the current installment due_date when a schedule is present).
     pub fn repay(
         env: Env,
         payer: Address,
@@ -314,16 +401,69 @@ impl FinancingPoolContract {
         // Convert repayment amount if invoice currency differs from pool token
         let effective_amount = Self::convert_if_needed(&env, amount, &invoice.currency, &pool.token)?;
 
-        // Apply late penalty once if repayment is past due_date
-        if !pool.penalty_applied && pool.late_penalty_bps > 0 {
-            if env.ledger().timestamp() > invoice.due_date {
-                let penalty = bps_of(pool.face_value, pool.late_penalty_bps)?;
-                pool.total_owed = pool
-                    .total_owed
-                    .checked_add(penalty)
-                    .ok_or(KoraError::ArithmeticOverflow)?;
-                pool.penalty_applied = true;
-                events::late_penalty_applied(&env, invoice_id, penalty, pool.total_owed);
+        // ── Installment validation ────────────────────────────────────────────
+        let mut maybe_schedule: Option<InstallmentSchedule> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InstallmentSchedule(invoice_id));
+
+        if let Some(ref mut schedule) = maybe_schedule {
+            let idx = schedule.next_index;
+            let len = schedule.installments.len();
+            if idx >= len {
+                // All installments already satisfied — pool should have been closed.
+                env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::RepaymentAlreadyMade);
+            }
+            let installment = schedule.installments.get(idx).unwrap();
+
+            // Determine expected amount: for the final installment accept any
+            // amount >= expected (handles rounding from a penalty added to total_owed).
+            let is_final = idx == len - 1;
+            let expected = installment.amount;
+            if is_final {
+                if effective_amount < expected {
+                    env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                    return Err(KoraError::InvalidAmount);
+                }
+            } else if effective_amount != expected {
+                env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::InvalidAmount);
+            }
+
+            // Apply late penalty if this installment is past its due_date.
+            if !pool.penalty_applied && pool.late_penalty_bps > 0 {
+                if env.ledger().timestamp() > installment.due_date {
+                    let penalty = bps_of(pool.face_value, pool.late_penalty_bps)?;
+                    pool.total_owed = pool
+                        .total_owed
+                        .checked_add(penalty)
+                        .ok_or(KoraError::ArithmeticOverflow)?;
+                    pool.penalty_applied = true;
+                    events::late_penalty_applied(&env, invoice_id, penalty, pool.total_owed);
+                }
+            }
+
+            // Mark this installment as paid and advance the cursor.
+            let mut updated_installments = schedule.installments.clone();
+            let mut paid_installment = installment.clone();
+            paid_installment.paid = true;
+            updated_installments.set(idx, paid_installment);
+            schedule.installments = updated_installments;
+            schedule.next_index = schedule.next_index.saturating_add(1);
+            events::installment_paid(&env, invoice_id, &payer, idx, effective_amount);
+        } else {
+            // No schedule — original lump-sum late penalty logic.
+            if !pool.penalty_applied && pool.late_penalty_bps > 0 {
+                if env.ledger().timestamp() > invoice.due_date {
+                    let penalty = bps_of(pool.face_value, pool.late_penalty_bps)?;
+                    pool.total_owed = pool
+                        .total_owed
+                        .checked_add(penalty)
+                        .ok_or(KoraError::ArithmeticOverflow)?;
+                    pool.penalty_applied = true;
+                    events::late_penalty_applied(&env, invoice_id, penalty, pool.total_owed);
+                }
             }
         }
 
@@ -339,9 +479,25 @@ impl FinancingPoolContract {
         }
         env.storage().persistent().set(&DataKey::Pool(invoice_id), &pool);
 
+        // Persist the updated schedule (if any).
+        if let Some(ref schedule) = maybe_schedule {
+            env.storage()
+                .persistent()
+                .set(&DataKey::InstallmentSchedule(invoice_id), schedule);
+        }
+
         // Interactions
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&payer, &env.current_contract_address(), &amount);
+
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.total_repaid = stats.total_repaid.saturating_add(effective_amount);
+        if should_close {
+            stats.active_pools = stats.active_pools.saturating_sub(1);
+        }
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
 
         // Standardized repayment event
         events::repayment_made(&env, invoice_id, &payer, amount);
@@ -408,7 +564,26 @@ impl FinancingPoolContract {
         Ok(())
     }
 
-    /// Mark invoice as defaulted. Admin only.
+    /// Mark an invoice pool as defaulted. Admin only.
+    ///
+    /// Distributes any partial repayment already received to investors pro-rata,
+    /// marks the invoice NFT as `Defaulted`, and records the default against the
+    /// SME in the risk registry (best-effort; registry errors are ignored).
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `invoice_id` — The ID of the invoice to default.
+    /// - `token` — The pool token address (needed for partial yield distribution).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::Unauthorized` — Repayment lock is held (concurrent operation).
+    /// - `KoraError::PoolNotFound` — No pool exists for `invoice_id`.
+    /// - `KoraError::PoolAlreadyClosed` — Pool is already closed (repaid or defaulted).
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Should only be called after the
+    /// invoice's `due_date` has passed without full repayment.
     pub fn mark_default(
         env: Env,
         admin: Address,
@@ -447,6 +622,13 @@ impl FinancingPoolContract {
 
         events::invoice_defaulted(&env, invoice_id, &admin);
 
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.pools_defaulted = stats.pools_defaulted.saturating_add(1);
+        stats.active_pools = stats.active_pools.saturating_sub(1);
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
+
         // Automatically record the default against the SME in the risk registry
         let invoice = nft_client.get_invoice(&invoice_id);
         if let Some(rr_contract) = env
@@ -473,6 +655,25 @@ impl FinancingPoolContract {
     ///
     /// `amount` must satisfy `total_funded <= amount < total_owed` — investors recover at least
     /// their principal, while the SME pays strictly less than the full obligation.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME that originated the invoice (must sign).
+    /// - `invoice_id` — The ID of the funded invoice to settle early.
+    /// - `amount` — The buyout amount in the pool token. Must satisfy
+    ///   `total_funded <= amount < total_owed` and be > 0.
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::InvalidAmount` — `amount` is ≤ 0, > `MAX_AMOUNT`, < `total_funded`,
+    ///   or ≥ `total_owed`.
+    /// - `KoraError::PoolNotFound` — No open pool exists for `invoice_id`.
+    /// - `KoraError::PoolAlreadyClosed` — Pool is already closed.
+    /// - `KoraError::AlreadyInitialized` — An early-settlement offer already exists.
+    /// - `KoraError::Unauthorized` — Caller is not the invoice's SME.
+    ///
+    /// **Security:** Requires `sme.require_auth()`. The buyout amount is escrowed
+    /// immediately into this contract so that settlement upon acceptance is atomic
+    /// and cannot be frontrun.
     pub fn propose_early_settlement(
         env: Env,
         sme: Address,
@@ -528,10 +729,23 @@ impl FinancingPoolContract {
         Ok(())
     }
 
-    /// Accept a pending early-settlement offer as an investor in the pool.
+    /// Accept a pending early-termination buyout offer as an investor.
     ///
     /// When investors representing 100% of pool shares have accepted, the escrowed amount is
     /// distributed pro-rata to all investors, the pool is closed, and the invoice is marked repaid.
+    ///
+    /// **Parameters:**
+    /// - `investor` — The investor address accepting the offer (must hold a position).
+    /// - `invoice_id` — The ID of the invoice with the pending offer.
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::PoolNotFound` — No early-settlement offer or pool exists for `invoice_id`.
+    /// - `KoraError::PositionNotFound` — Caller does not hold a position in this pool.
+    /// - `KoraError::AlreadyInitialized` — Investor has already accepted this offer.
+    ///
+    /// **Security:** Requires `investor.require_auth()`. Each investor may only accept once.
+    /// Settlement is executed atomically once the last required investor accepts.
     pub fn accept_early_settlement(
         env: Env,
         investor: Address,
@@ -605,6 +819,13 @@ impl FinancingPoolContract {
                 kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
             nft_client.set_repaid(&env.current_contract_address(), &invoice_id);
 
+            // Update protocol stats
+            let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+                .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+            stats.total_repaid = stats.total_repaid.saturating_add(offer.amount);
+            stats.active_pools = stats.active_pools.saturating_sub(1);
+            env.storage().instance().set(&DataKey::ProtocolStats, &stats);
+
             env.storage()
                 .persistent()
                 .remove(&DataKey::EarlySettlement(invoice_id));
@@ -629,7 +850,20 @@ impl FinancingPoolContract {
 
     /// Cancel a pending early-settlement offer and refund the escrowed amount to the SME.
     ///
+    /// Cancel a pending early-settlement offer and return the escrowed amount to the SME.
+    ///
     /// Callable only by the invoice's SME while the offer has not yet been fully accepted.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME that originally proposed the buyout.
+    /// - `invoice_id` — The ID of the invoice whose offer is being cancelled.
+    ///
+    /// **Errors:**
+    /// - `KoraError::PoolNotFound` — No early-settlement offer exists for `invoice_id`.
+    /// - `KoraError::Unauthorized` — Caller is not the SME that proposed the offer.
+    ///
+    /// **Security:** Requires `sme.require_auth()`. The escrowed amount is returned to the
+    /// SME via a token transfer before the offer record is removed.
     pub fn cancel_early_settlement(
         env: Env,
         sme: Address,
@@ -664,7 +898,14 @@ impl FinancingPoolContract {
         Ok(())
     }
 
-    /// Read a pending early-settlement offer, if any.
+    /// Read a pending early-settlement offer for an invoice.
+    ///
+    /// **Parameters:**
+    /// - `invoice_id` — The invoice ID to query.
+    ///
+    /// **Returns:** The `EarlySettlementOffer`, or `KoraError::PoolNotFound` if none exists.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_early_settlement(
         env: Env,
         invoice_id: u64,
@@ -677,6 +918,14 @@ impl FinancingPoolContract {
 
     // ── Views ─────────────────────────────────────────────────────────────────
 
+    /// Retrieve the pool state for a funded invoice.
+    ///
+    /// **Parameters:**
+    /// - `invoice_id` — The invoice ID to query.
+    ///
+    /// **Returns:** The `Pool` struct, or `KoraError::PoolNotFound` if none exists.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_pool(env: Env, invoice_id: u64) -> Result<Pool, KoraError> {
         env.storage()
             .persistent()
@@ -684,6 +933,15 @@ impl FinancingPoolContract {
             .ok_or(KoraError::PoolNotFound)
     }
 
+    /// Retrieve all investor positions for an invoice as a flat list.
+    ///
+    /// **Parameters:**
+    /// - `invoice_id` — The invoice ID to query.
+    ///
+    /// **Returns:** A `Vec<Position>` (empty if no positions exist). For large pools
+    /// use `get_positions_page` to paginate and bound CPU cost.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_positions(env: Env, invoice_id: u64) -> Vec<Position> {
         let positions: Map<Address, Position> = env
             .storage()
@@ -693,10 +951,100 @@ impl FinancingPoolContract {
         positions.values()
     }
 
+    // ── Installment schedule ──────────────────────────────────────────────────
+
+    /// Attach an installment repayment schedule to an open pool.
+    ///
+    /// Admin-only.  Must be called before the first repayment.  The sum of all
+    /// installment amounts must equal `pool.total_owed`.  Due-dates must be
+    /// monotonically increasing.
+    pub fn set_installment_schedule(
+        env: Env,
+        admin: Address,
+        invoice_id: u64,
+        schedule: InstallmentSchedule,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+
+        if pool.is_closed {
+            return Err(KoraError::PoolAlreadyClosed);
+        }
+        if pool.repaid_amount > 0 {
+            // Refuse to attach a schedule once repayment has started.
+            return Err(KoraError::InvalidAmount);
+        }
+        if schedule.installments.is_empty() {
+            return Err(KoraError::InvalidAmount);
+        }
+        if schedule.next_index != 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        // Validate: sum of installments == total_owed, due_dates non-decreasing.
+        let mut total: i128 = 0;
+        let mut prev_due: u64 = 0;
+        for installment in schedule.installments.iter() {
+            if installment.amount <= 0 {
+                return Err(KoraError::InvalidAmount);
+            }
+            if installment.due_date < prev_due {
+                return Err(KoraError::InvalidDueDate);
+            }
+            prev_due = installment.due_date;
+            total = total
+                .checked_add(installment.amount)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+        }
+        if total != pool.total_owed {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InstallmentSchedule(invoice_id), &schedule);
+        Ok(())
+    }
+
+    /// Return the installment schedule for a pool, if set.
+    pub fn get_installment_schedule(
+        env: Env,
+        invoice_id: u64,
+    ) -> Option<InstallmentSchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InstallmentSchedule(invoice_id))
+    }
+
     // ── Secondary market ───────────────────────────────────────────────────────
 
     /// List a position for sale on the secondary market.
-    /// Seller must hold a position on an open (not yet closed) pool.
+    ///
+    /// Seller must hold a position on an open (not yet closed) pool. The offer is stored
+    /// on-chain and can be purchased by any buyer via `buy_position`.
+    ///
+    /// **Parameters:**
+    /// - `seller` — The investor who holds the position to sell.
+    /// - `invoice_id` — The invoice ID of the pool.
+    /// - `token` — The token the seller wants to receive as payment.
+    /// - `price` — The asking price (must be > 0).
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::InvalidAmount` — `price` is ≤ 0.
+    /// - `KoraError::PoolNotFound` — No pool exists for `invoice_id`.
+    /// - `KoraError::PoolAlreadyClosed` — Pool is already closed.
+    /// - `KoraError::PositionNotFound` — Seller does not hold a position in this pool.
+    /// - `KoraError::SaleAlreadyListed` — Seller already has an active listing.
+    ///
+    /// **Security:** Requires `seller.require_auth()`.
     pub fn list_position_for_sale(
         env: Env,
         seller: Address,
@@ -765,8 +1113,24 @@ impl FinancingPoolContract {
     }
 
     /// Purchase an investor position from the secondary market.
+    ///
     /// Transfers ownership of the position (and its proportional yield claim)
-    /// from seller to buyer in exchange for a token payment.
+    /// from seller to buyer in exchange for a token payment at the listed price.
+    ///
+    /// **Parameters:**
+    /// - `buyer` — The address purchasing the position.
+    /// - `invoice_id` — The invoice ID of the pool.
+    /// - `seller` — The address that listed the position for sale.
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::SaleNotFound` — No active sale listing from `seller` for this invoice.
+    /// - `KoraError::PoolNotFound` — Pool does not exist.
+    /// - `KoraError::PoolAlreadyClosed` — Pool is already closed.
+    /// - `KoraError::PositionNotFound` — Seller no longer holds the position.
+    ///
+    /// **Security:** Requires `buyer.require_auth()`. State is updated (CEI pattern) before
+    /// the token transfer to prevent reentrancy.
     pub fn buy_position(
         env: Env,
         buyer: Address,
@@ -839,6 +1203,13 @@ impl FinancingPoolContract {
     }
 
     /// Returns the total number of investor positions recorded for an invoice.
+    ///
+    /// **Parameters:**
+    /// - `invoice_id` — The invoice ID to query.
+    ///
+    /// **Returns:** The number of distinct investor positions (0 if none).
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_positions_count(env: Env, invoice_id: u64) -> u32 {
         let positions: Map<Address, Position> = env
             .storage()
@@ -850,6 +1221,17 @@ impl FinancingPoolContract {
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
 
+    /// Propose a WASM upgrade. Admin only. Begins a 24-hour timelock.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_wasm_hash` — SHA-256 hash of the new WASM binary (32 bytes).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Apply with `execute_upgrade` after
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed.
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
@@ -864,6 +1246,17 @@ impl FinancingPoolContract {
         Ok(())
     }
 
+    /// Execute a previously proposed WASM upgrade after the 24-hour timelock has elapsed.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Clears the proposal atomically before executing.
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;

@@ -52,6 +52,35 @@ This document describes the technical architecture of the Kora Protocol: how the
 
 ---
 
+## Contract Dependency Graph
+
+The Kora workspace is an acyclic directed graph of crate dependencies. The arrows below
+show **compile-time** (Cargo) dependencies — a contract that calls another at runtime
+also declares it as a `[dependency]` in its `Cargo.toml`.
+
+```
+shared          (library — no runtime deps)
+  ↑
+access_control  (depends on: shared)
+treasury        (depends on: shared)
+risk_registry   (depends on: shared)
+invoice_nft     (depends on: shared, risk_registry)
+financing_pool  (depends on: shared, invoice_nft, risk_registry, treasury)
+marketplace     (depends on: shared, invoice_nft, financing_pool, treasury, risk_registry, access_control)
+```
+
+**Acyclicity guarantee:** No circular dependencies exist. The topological order is:
+1. `shared`
+2. `access_control`, `treasury`, `risk_registry` (all leaf consumers of shared)
+3. `invoice_nft` (depends on shared + risk_registry)
+4. `financing_pool` (depends on shared + invoice_nft + risk_registry + treasury)
+5. `marketplace` (depends on all of the above)
+
+A CI step (see `.github/workflows/ci.yml`) runs `cargo tree` on every PR and fails the
+build if a cycle is ever introduced.
+
+---
+
 ## Contract Responsibilities
 
 ### `shared`

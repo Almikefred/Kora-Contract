@@ -107,6 +107,15 @@ pub fn repayment_made(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
     );
 }
 
+/// Schema: (actor=payer, invoice_id, installment_index, amount, timestamp)
+pub fn installment_paid(env: &Env, invoice_id: u64, payer: &Address, index: u32, amount: i128) {
+    emit(
+        env,
+        symbol_short!("INSTLMT_PAID"),
+        (payer.clone(), invoice_id, index, amount, env.ledger().timestamp()),
+    );
+}
+
 /// Schema: (actor=investor, invoice_id, yield_amount, timestamp)
 pub fn yield_distributed(env: &Env, invoice_id: u64, investor: &Address, yield_amount: i128) {
     emit(
@@ -379,6 +388,24 @@ pub fn registry_initialized(env: &Env, admin: &Address, invoice_nft: &Address) {
         env,
         symbol_short!("REG_INI"),
         (admin.clone(), invoice_nft.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (primary_verifier, sub_account, timestamp)
+pub fn sub_account_added(env: &Env, primary: &Address, sub_account: &Address) {
+    emit(
+        env,
+        symbol_short!("VRF_SUB_ADD"),
+        (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (primary_verifier, sub_account, timestamp)
+pub fn sub_account_removed(env: &Env, primary: &Address, sub_account: &Address) {
+    emit(
+        env,
+        symbol_short!("VRF_SUB_RMV"),
+        (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
     );
 }
 

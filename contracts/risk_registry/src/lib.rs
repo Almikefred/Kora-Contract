@@ -31,6 +31,9 @@ pub enum DataKey {
     Verifier(Address),
     VerifierStake(Address), // amount of tokens staked by verifier
     VerifierReputation(Address), // reputation score of verifier
+    /// Maps a sub-account address → its primary verifier address.
+    /// Sub-accounts can act on behalf of the primary for all verifier operations.
+    SubAccount(Address),
     SmeProfile(Address),
     DebtorScore(Bytes), // keyed by debtor_hash (SHA-256 of PII)
     /// Ledger timestamp of the last set_debtor_score call per (verifier, debtor_hash).
@@ -53,6 +56,19 @@ pub struct RiskRegistryContract;
 #[contractimpl]
 impl RiskRegistryContract {
     /// One-time initialization. Sets admin, authorized invoice_nft, and staking parameters.
+    ///
+    /// **Parameters:**
+    /// - `admin` — The address that will administer this contract.
+    /// - `invoice_nft` — The authorized `invoice_nft` contract for `increment_invoice_count` calls.
+    /// - `staking_token` — The token verifiers must stake to be registered.
+    /// - `minimum_stake` — Minimum token amount a verifier must deposit (in token's smallest unit).
+    /// - `slash_percentage_bps` — Basis points of stake to slash on each SME default (0–10 000).
+    ///
+    /// **Errors:**
+    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `KoraError::InvalidAddress` — `admin` is the contract's own address.
+    ///
+    /// **Security:** No auth required on first call. Subsequent calls revert immediately.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -84,6 +100,15 @@ impl RiskRegistryContract {
     }
 
     /// Transfer admin role to a new address. Current admin only.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_admin` — The address to transfer admin rights to.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `admin_transferred` event.
     pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -97,6 +122,23 @@ impl RiskRegistryContract {
     // ── Verifier management ───────────────────────────────────────────────────
 
     /// Admin adds a trusted verifier with required staking deposit.
+    ///
+    /// The verifier must have approved the staking token transfer before calling this.
+    /// Initial reputation is set to 100; stake is transferred from verifier to this contract.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `verifier` — The verifier address to register.
+    /// - `stake_amount` — Amount of staking token to deposit (must be ≥ `minimum_stake`).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAddress` — `verifier` is the contract's own address.
+    /// - `KoraError::InsufficientFunds` — `stake_amount` < `minimum_stake`.
+    /// - `KoraError::NotInitialized` — Staking token or minimum stake not configured.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Transfers stake from `verifier` to
+    /// this contract via the staking token. Emits `verifier_added` event.
     pub fn add_verifier(env: Env, admin: Address, verifier: Address, stake_amount: i128) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -138,7 +180,19 @@ impl RiskRegistryContract {
         Ok(())
     }
 
-    /// Admin removes a verifier and returns their stake.
+    /// Admin removes a verifier and returns their remaining stake.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `verifier` — The verifier address to remove.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NotVerifier` — Address is not a registered verifier.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Returns any remaining (unslashed) stake to
+    /// the verifier. Removes all three verifier records (flag, stake, reputation). Emits
+    /// `verifier_removed` event.
     pub fn remove_verifier(env: Env, admin: Address, verifier: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -182,9 +236,90 @@ impl RiskRegistryContract {
         Ok(())
     }
 
+    // ── Sub-account delegation ────────────────────────────────────────────────
+
+    /// Primary verifier delegates action rights to a sub-account.
+    /// The primary verifier must be registered. The sub-account must not already
+    /// be a primary verifier or an existing sub-account of another verifier.
+    /// All actions performed by sub-accounts are attributed to the primary verifier.
+    pub fn add_sub_account(
+        env: Env,
+        primary: Address,
+        sub_account: Address,
+    ) -> Result<(), KoraError> {
+        primary.require_auth();
+        Self::require_verifier_primary(&env, &primary)?;
+
+        // sub_account must not itself be a primary verifier
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Verifier(sub_account.clone()))
+            .unwrap_or(false)
+        {
+            return Err(KoraError::InvalidAddress);
+        }
+
+        // sub_account must not already be registered under another primary
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SubAccount(sub_account.clone()))
+        {
+            return Err(KoraError::AlreadyInitialized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubAccount(sub_account.clone()), &primary);
+        Self::bump_persistent(&env, &DataKey::SubAccount(sub_account.clone()));
+        events::sub_account_added(&env, &primary, &sub_account);
+        Ok(())
+    }
+
+    /// Remove a previously delegated sub-account. Primary verifier only.
+    pub fn remove_sub_account(
+        env: Env,
+        primary: Address,
+        sub_account: Address,
+    ) -> Result<(), KoraError> {
+        primary.require_auth();
+        Self::require_verifier_primary(&env, &primary)?;
+
+        let stored_primary: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubAccount(sub_account.clone()))
+            .ok_or(KoraError::NotVerifier)?;
+
+        if stored_primary != primary {
+            return Err(KoraError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SubAccount(sub_account.clone()));
+        events::sub_account_removed(&env, &primary, &sub_account);
+        Ok(())
+    }
+
     // ── SME management ────────────────────────────────────────────────────────
 
     /// Verifier registers and scores an SME. Fails if SME is already registered.
+    ///
+    /// **Parameters:**
+    /// - `verifier` — A registered verifier address (must sign).
+    /// - `sme` — The SME address to register.
+    /// - `risk_score` — Credit score 0–100. Maps to a `RiskTier` in `invoice_nft`.
+    /// - `compliance_attested` — Whether the verifier attests the SME is KYC/AML compliant.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotVerifier` — Caller is not a registered verifier.
+    /// - `KoraError::InvalidRiskScore` — `risk_score` > 100.
+    /// - `KoraError::AlreadyInitialized` — SME is already registered (prevents silent re-registration
+    ///   that would reset `defaults` and `total_invoices` counters).
+    ///
+    /// **Security:** Requires `verifier.require_auth()`. Emits `sme_registered` event.
     pub fn register_sme(
         env: Env,
         verifier: Address,
@@ -193,7 +328,8 @@ impl RiskRegistryContract {
         compliance_attested: bool,
     ) -> Result<(), KoraError> {
         verifier.require_auth();
-        Self::require_verifier(&env, &verifier)?;
+        // Resolve to primary verifier so sub-accounts attribute registration correctly.
+        let primary = Self::resolve_verifier(&env, &verifier)?;
         require_valid_risk_score(risk_score)?;
 
         // Guard against silent re-registration that would reset defaults/invoice counts
@@ -208,7 +344,7 @@ impl RiskRegistryContract {
         let profile = SmeProfile {
             address: sme.clone(),
             verified: true,
-            verifier: verifier.clone(),
+            verifier: primary.clone(),
             risk_score,
             total_invoices: 0,
             defaults: 0,
@@ -221,11 +357,24 @@ impl RiskRegistryContract {
             .persistent()
             .set(&DataKey::SmeProfile(sme.clone()), &profile);
         Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
-        events::sme_registered(&env, &verifier, &sme, risk_score);
+        events::sme_registered(&env, &primary, &sme, risk_score);
         Ok(())
     }
 
     /// Update SME risk score. Verifier only.
+    ///
+    /// **Parameters:**
+    /// - `verifier` — A registered verifier address (must sign).
+    /// - `sme` — The SME whose score is being updated.
+    /// - `new_score` — The new risk score (0–100).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotVerifier` — Caller is not a registered verifier.
+    /// - `KoraError::InvalidRiskScore` — `new_score` > 100.
+    /// - `KoraError::SMENotRegistered` — SME has not been registered.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    ///
+    /// **Security:** Requires `verifier.require_auth()`. Emits `sme_score_updated` event.
     pub fn update_sme_score(
         env: Env,
         verifier: Address,
@@ -254,7 +403,21 @@ impl RiskRegistryContract {
     }
 
     /// Set (or update) an SME's aggregate credit limit. Verifier only.
-    /// A limit of 0 means no limit is enforced.
+    ///
+    /// The credit limit is the maximum outstanding face value the SME may have across all
+    /// non-Repaid, non-Defaulted invoices. Set to 0 to remove the limit.
+    ///
+    /// **Parameters:**
+    /// - `verifier` — A registered verifier address (must sign).
+    /// - `sme` — The SME to update.
+    /// - `credit_limit` — The new limit in stroops (≥ 0). 0 means uncapped.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotVerifier` — Caller is not a registered verifier.
+    /// - `KoraError::InvalidAmount` — `credit_limit` is negative.
+    /// - `KoraError::SMENotRegistered` — SME has not been registered.
+    ///
+    /// **Security:** Requires `verifier.require_auth()`. Emits `sme_credit_limit_set` event.
     pub fn set_credit_limit(
         env: Env,
         verifier: Address,
@@ -283,7 +446,20 @@ impl RiskRegistryContract {
     }
 
     /// Increment invoice count for an SME.
-    /// Restricted to the invoice_nft contract address set at initialization.
+    ///
+    /// Called automatically by `invoice_nft` when a new invoice is minted. Restricted to
+    /// the invoice_nft contract address set at initialization.
+    ///
+    /// **Parameters:**
+    /// - `caller` — Must be the authorized `invoice_nft` contract address.
+    /// - `sme` — The SME whose invoice count is being incremented.
+    ///
+    /// **Errors:**
+    /// - `KoraError::Unauthorized` — Caller is not the authorized `invoice_nft` contract.
+    /// - `KoraError::SMENotRegistered` — SME has not been registered.
+    /// - `KoraError::ArithmeticOverflow` — Invoice count overflowed (extremely unlikely).
+    ///
+    /// **Security:** Requires `caller.require_auth()`. Only `invoice_nft` may call this.
     pub fn increment_invoice_count(
         env: Env,
         caller: Address,
@@ -311,7 +487,24 @@ impl RiskRegistryContract {
         Ok(())
     }
 
-    /// Record a default against an SME. Admin only. Slashes verifier's stake and reputation.
+    /// Record a default against an SME. Admin only. Slashes the responsible verifier's
+    /// stake and decrements their reputation score by 10.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `sme` — The SME address that defaulted on an invoice.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::SMENotRegistered` — SME has not been registered.
+    /// - `KoraError::NotInitialized` — `SlashPercentage` was not set during initialization.
+    /// - `KoraError::ArithmeticOverflow` — Default counter overflow (extremely unlikely).
+    /// - `KoraError::ArithmeticUnderflow` — Slash computation underflowed.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Verifier's stake is reduced by
+    /// `current_stake * slash_percentage_bps / 10_000`. Reputation floors at 0.
+    /// Emits `sme_default_recorded` event.
     pub fn record_default(env: Env, admin: Address, sme: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -418,6 +611,17 @@ impl RiskRegistryContract {
 
     // ── Views ─────────────────────────────────────────────────────────────────
 
+    /// Retrieve the full SME profile for a registered SME.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME address to query.
+    ///
+    /// **Returns:** The `SmeProfile` struct.
+    ///
+    /// **Errors:**
+    /// - `KoraError::SMENotRegistered` — SME has not been registered.
+    ///
+    /// **Security:** Read-only view. No authorization required. Bumps the profile's TTL.
     pub fn get_sme_profile(env: Env, sme: Address) -> Result<SmeProfile, KoraError> {
         let key = DataKey::SmeProfile(sme);
         let profile: SmeProfile = env
@@ -429,6 +633,14 @@ impl RiskRegistryContract {
         Ok(profile)
     }
 
+    /// Returns `true` if the SME has been registered and verified by a verifier.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME address to query.
+    ///
+    /// **Returns:** `true` if registered and `verified == true`, `false` otherwise.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn is_verified_sme(env: Env, sme: Address) -> bool {
         env.storage()
             .persistent()
@@ -437,6 +649,15 @@ impl RiskRegistryContract {
             .unwrap_or(false)
     }
 
+    /// Returns `true` if the verifier attested that the SME passed KYC/AML compliance checks.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME address to query.
+    ///
+    /// **Returns:** `true` if `compliance_attested == true` in the SME's profile, `false` otherwise
+    /// (including when the SME is not registered at all).
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn is_compliance_attested(env: Env, sme: Address) -> bool {
         env.storage()
             .persistent()
@@ -445,6 +666,15 @@ impl RiskRegistryContract {
             .unwrap_or(false)
     }
 
+    /// Returns the current staked token amount for a verifier.
+    ///
+    /// **Parameters:**
+    /// - `verifier` — The verifier address to query.
+    ///
+    /// **Returns:** The staked amount in the staking token's smallest unit. Returns `0` if the
+    /// verifier is not registered or their stake has been fully slashed.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_verifier_stake(env: Env, verifier: Address) -> i128 {
         env.storage()
             .persistent()
@@ -452,6 +682,17 @@ impl RiskRegistryContract {
             .unwrap_or(0)
     }
 
+    /// Returns the current reputation score for a verifier (scale: 0–100).
+    ///
+    /// Starts at 100 when a verifier is added. Decremented by 10 on each recorded SME default.
+    /// Floors at 0. Returns `0` for unregistered verifiers.
+    ///
+    /// **Parameters:**
+    /// - `verifier` — The verifier address to query.
+    ///
+    /// **Returns:** Reputation score in range `[0, 100]`.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_verifier_reputation(env: Env, verifier: Address) -> u32 {
         env.storage()
             .persistent()
@@ -459,11 +700,34 @@ impl RiskRegistryContract {
             .unwrap_or(0)
     }
 
+    /// Returns `true` if the address is a currently registered verifier.
+    ///
+    /// **Parameters:**
+    /// - `verifier` — The address to query.
+    ///
+    /// **Returns:** `true` if the address is an active verifier, `false` otherwise.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn is_verifier(env: Env, verifier: Address) -> bool {
         env.storage()
             .persistent()
             .get(&DataKey::Verifier(verifier))
             .unwrap_or(false)
+    }
+
+    /// Returns the primary verifier for a sub-account address, or `None` if the address
+    /// is not registered as a sub-account.
+    pub fn get_primary_verifier(env: Env, sub_account: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SubAccount(sub_account))
+    }
+
+    /// Returns `true` if `addr` is an active sub-account of any primary verifier.
+    pub fn is_sub_account(env: Env, addr: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::SubAccount(addr))
     }
 
     /// Returns the debtor score or `KoraError::DebtorNotRegistered` if not found.
@@ -478,6 +742,14 @@ impl RiskRegistryContract {
         Ok(score)
     }
 
+    /// Returns the current admin address.
+    ///
+    /// **Returns:** The admin `Address`.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotInitialized` — Contract has not been initialized.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_admin(env: Env) -> Result<Address, KoraError> {
         env.storage()
             .persistent()
@@ -487,6 +759,17 @@ impl RiskRegistryContract {
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
 
+    /// Propose a WASM upgrade. Admin only. Begins a 24-hour timelock.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_wasm_hash` — SHA-256 hash of the new WASM binary (32 bytes).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Apply with `execute_upgrade` after
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed. Emits `upgrade_proposed` event.
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
@@ -502,6 +785,18 @@ impl RiskRegistryContract {
         Ok(())
     }
 
+    /// Execute a previously proposed WASM upgrade after the 24-hour timelock has elapsed.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Clears the proposal atomically before
+    /// executing. Emits `upgrade_executed` event.
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -575,7 +870,45 @@ impl RiskRegistryContract {
         Ok(())
     }
 
+    /// Returns `Ok(primary)` when `caller` is an active verifier (primary or sub-account).
+    /// Sub-accounts resolve to their primary verifier so that reputation and staking
+    /// are always attributed to the primary.
+    fn resolve_verifier(env: &Env, caller: &Address) -> Result<Address, KoraError> {
+        // Direct primary check first (fast path).
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Verifier(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(caller.clone());
+        }
+        // Sub-account resolution.
+        if let Some(primary) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::SubAccount(caller.clone()))
+        {
+            // Ensure the primary is still an active verifier.
+            if env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::Verifier(primary.clone()))
+                .unwrap_or(false)
+            {
+                return Ok(primary);
+            }
+        }
+        Err(KoraError::NotVerifier)
+    }
+
     fn require_verifier(env: &Env, caller: &Address) -> Result<(), KoraError> {
+        Self::resolve_verifier(env, caller).map(|_| ())
+    }
+
+    /// Require `caller` to be a **primary** verifier (not a sub-account).
+    /// Used for delegation management so only the primary can add/remove sub-accounts.
+    fn require_verifier_primary(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let ok: bool = env
             .storage()
             .persistent()

@@ -57,6 +57,18 @@ pub struct TreasuryContract;
 #[contractimpl]
 impl TreasuryContract {
     /// One-time initialization. Sets admin and protocol fee.
+    ///
+    /// **Parameters:**
+    /// - `admin` — The address that will administer this contract.
+    /// - `fee_bps` — Protocol fee in basis points (0–10 000).
+    ///
+    /// **Errors:**
+    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `KoraError::InvalidFeeRate` — `fee_bps` > 10 000.
+    /// - `KoraError::InvalidAddress` — `admin` is the contract's own address.
+    ///
+    /// **Security:** No auth required on first call. Subsequent calls revert immediately.
+    /// Initializes rate-limit state (epoch start, epoch withdrawn, cap = 0 = uncapped).
     pub fn initialize(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
@@ -86,6 +98,16 @@ impl TreasuryContract {
     }
 
     /// Update protocol fee. Admin only.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `fee_bps` — New fee in basis points (0–10 000).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidFeeRate` — `fee_bps` > 10 000.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `fee_rate_updated` event.
     pub fn set_fee_bps(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -105,8 +127,18 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Whitelist a token so it can be used in withdraw / emergency_withdraw.
+    /// Whitelist a token so it can be used in `withdraw` / `emergency_withdraw`.
+    ///
     /// Admin only. Idempotent — calling it twice for the same token is safe.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `token` — The token contract address to whitelist.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `token_whitelisted` event.
     pub fn whitelist_token(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -125,7 +157,16 @@ impl TreasuryContract {
     /// transferring the fee amount to this contract. Updates the informational
     /// accounting ledger.
     ///
-    /// No auth required — the token transfer itself is the proof of payment.
+    /// **Parameters:**
+    /// - `token` — The token address the fee was paid in (must be whitelisted).
+    /// - `amount` — The fee amount (must be > 0).
+    ///
+    /// **Errors:**
+    /// - `KoraError::InvalidAmount` — `amount` is ≤ 0.
+    /// - `KoraError::TokenNotWhitelisted` — Token has not been whitelisted.
+    /// - `KoraError::ArithmeticOverflow` — Running total would overflow.
+    ///
+    /// **Security:** No auth required — the token transfer itself is the proof of payment.
     /// The amount is validated to be > 0 to prevent no-op accounting entries.
     pub fn collect_fee(env: Env, token: Address, amount: i128) -> Result<(), KoraError> {
         if amount <= 0 {
@@ -147,8 +188,23 @@ impl TreasuryContract {
     }
 
     /// Withdraw accumulated fees to a recipient. Admin only.
-    /// Subject to the rolling 24 h withdrawal cap.
-    /// Protected against reentrancy via RAII ReentrancyGuard.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `token` — The whitelisted token to withdraw.
+    /// - `recipient` — The address to send funds to.
+    /// - `amount` — The amount to withdraw (must be > 0 and ≤ `MAX_AMOUNT`).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAmount` — `amount` is ≤ 0 or exceeds `MAX_AMOUNT`.
+    /// - `KoraError::TokenNotWhitelisted` — Token is not whitelisted.
+    /// - `KoraError::WithdrawalRateLimitExceeded` — Would exceed the rolling 24 h cap.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    /// - `KoraError::InsufficientPoolBalance` — Contract balance is less than `amount`.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Subject to the rolling 24 h withdrawal cap.
+    /// Protected against reentrancy via RAII `ReentrancyGuard`.
     pub fn withdraw(
         env: Env,
         admin: Address,
@@ -198,9 +254,19 @@ impl TreasuryContract {
     }
 
     /// Emergency drain — withdraw entire token balance. Admin only.
-    /// Subject to the rolling 24 h withdrawal cap.
-    /// Protected against reentrancy via RAII ReentrancyGuard.
-    /// No-ops silently when balance is zero (not an error).
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `token` — The whitelisted token to drain.
+    /// - `recipient` — The address to send the full balance to.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::TokenNotWhitelisted` — Token is not whitelisted.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Protected against reentrancy via RAII
+    /// `ReentrancyGuard`. No-ops silently when balance is zero (not an error).
     pub fn emergency_withdraw(
         env: Env,
         admin: Address,
@@ -226,8 +292,18 @@ impl TreasuryContract {
 
     // ── Withdrawal cap management ─────────────────────────────────────────────
 
-    /// Propose a new withdrawal cap. Takes effect after UPGRADE_TIMELOCK_DELAY.
-    /// Admin only. Set cap to 0 to remove the limit entirely.
+    /// Propose a new withdrawal cap. Takes effect after `UPGRADE_TIMELOCK_DELAY` (24 h).
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_cap` — The new rolling 24 h withdrawal limit in stroops. Set to 0 to remove the limit.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAmount` — `new_cap` is negative.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. The proposal must be executed via
+    /// `execute_withdrawal_cap` after the timelock elapses.
     pub fn propose_withdrawal_cap(
         env: Env,
         admin: Address,
@@ -247,7 +323,20 @@ impl TreasuryContract {
     }
 
     /// Execute a previously proposed withdrawal cap change after the timelock elapses.
-    /// Admin only.
+    ///
+    /// Admin only. Applies the new rolling 24-hour withdrawal limit that was previously
+    /// queued via `propose_withdrawal_cap`, atomically clearing the pending proposal.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoCapChangeProposed` — No withdrawal cap proposal is pending.
+    /// - `KoraError::WithdrawalCapTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Clears the proposal atomically before
+    /// applying the new cap. Emits `withdrawal_cap_updated` event.
     pub fn execute_withdrawal_cap(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -275,7 +364,12 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Returns the current withdrawal cap (0 = uncapped).
+    /// Returns the current rolling 24-hour withdrawal cap in stroops.
+    ///
+    /// A value of `0` means the cap is disabled (uncapped). A positive value is the
+    /// maximum total amount that can be withdrawn within any 24-hour epoch.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_withdrawal_cap(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -283,7 +377,12 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
-    /// Returns the current protocol fee in basis points.
+    /// Returns the current protocol fee in basis points (e.g., 50 = 0.5%).
+    ///
+    /// Defaults to 50 bps if the contract has not yet been initialized or if the
+    /// fee has never been explicitly set.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_fee_bps(env: Env) -> u32 {
         env.storage()
             .persistent()
@@ -291,12 +390,32 @@ impl TreasuryContract {
             .unwrap_or(50)
     }
 
-    /// Returns the live token balance held by this contract.
+    /// Returns the live token balance held by this contract for the given token.
+    ///
+    /// **Parameters:**
+    /// - `token` — The token contract address to query.
+    ///
+    /// **Returns:** The current balance in the token's smallest unit (stroops for XLM-based tokens).
+    /// Returns `0` if the contract holds none of the requested token.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_balance(env: Env, token: Address) -> i128 {
         token::Client::new(&env, &token).balance(&env.current_contract_address())
     }
 
-    /// Returns the total fees collected for a given token (informational ledger).
+    /// Returns the running total of fees collected for a given token (informational ledger).
+    ///
+    /// This counter is maintained by `collect_fee` and decremented by `withdraw`. It is
+    /// informational and does not gate any operation — actual spendable funds are determined
+    /// by `get_balance`.
+    ///
+    /// **Parameters:**
+    /// - `token` — The token contract address to query.
+    ///
+    /// **Returns:** Total fees collected in the token's smallest unit. Returns `0` if no
+    /// fees have been collected for this token yet.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_collected(env: Env, token: Address) -> i128 {
         env.storage()
             .persistent()
@@ -304,6 +423,12 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
+    /// Returns the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotInitialized` — Contract has not been initialized.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_admin(env: Env) -> Result<Address, KoraError> {
         env.storage()
             .persistent()
@@ -313,6 +438,17 @@ impl TreasuryContract {
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
 
+    /// Propose a WASM upgrade. Admin only. Begins a 24-hour timelock.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_wasm_hash` — SHA-256 hash of the new WASM binary (32 bytes).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Apply with `execute_upgrade` after
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed.
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
@@ -328,6 +464,17 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Execute a previously proposed WASM upgrade after the 24-hour timelock has elapsed.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Clears the proposal atomically before executing.
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
