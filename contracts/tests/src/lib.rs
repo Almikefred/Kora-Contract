@@ -16,6 +16,7 @@ mod integration {
     use kora_risk_registry::{RiskRegistryContract, RiskRegistryContractClient};
     use kora_shared::types::InvoiceStatus;
     use kora_treasury::{TreasuryContract, TreasuryContractClient};
+    use kora_invoice_nft::BatchInvoiceInput;
 
     // ── Test Environment ──────────────────────────────────────────────────────
 
@@ -816,5 +817,110 @@ mod integration {
 
         assert_eq!(actual_fee, expected_fee, "tier B fee (100 bps) must be applied");
         assert_ne!(actual_fee, default_fee, "flat fee must not be used when tier override exists");
+    }
+
+    /// Batch minting: three valid invoices are minted in one call.
+    /// IDs must be sequential and all statuses must be Created.
+    #[test]
+    fn test_batch_mint_success() {
+        use soroban_sdk::Vec;
+
+        let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
+
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&k.env);
+        for _ in 0..3u32 {
+            batch.push_back(BatchInvoiceInput {
+                debtor_hash: debtor_hash.clone(),
+                amount,
+                currency: currency.clone(),
+                due_date,
+                ipfs_cid: ipfs_cid.clone(),
+                risk_score,
+                notes: None,
+            });
+        }
+
+        let ids = k.invoice_nft.mint_invoices_batch(&sme, &batch);
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.get(0).unwrap(), 1u64);
+        assert_eq!(ids.get(1).unwrap(), 2u64);
+        assert_eq!(ids.get(2).unwrap(), 3u64);
+
+        for i in 0..3u32 {
+            let invoice = k.invoice_nft.get_invoice(&ids.get(i).unwrap());
+            assert_eq!(invoice.status, InvoiceStatus::Created);
+            assert_eq!(invoice.sme, sme);
+        }
+        // next_id advanced by 3
+        assert_eq!(k.invoice_nft.next_id(), 4);
+    }
+
+    /// Batch minting is atomic: one invalid entry aborts the entire batch.
+    /// No invoices must be stored when any entry fails validation.
+    #[test]
+    fn test_batch_mint_atomic_abort_on_invalid_input() {
+        use soroban_sdk::Vec;
+
+        let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
+
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&k.env);
+        // valid entry
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash: debtor_hash.clone(),
+            amount,
+            currency: currency.clone(),
+            due_date,
+            ipfs_cid: ipfs_cid.clone(),
+            risk_score,
+            notes: None,
+        });
+        // invalid entry: zero amount
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash: debtor_hash.clone(),
+            amount: 0,
+            currency: currency.clone(),
+            due_date,
+            ipfs_cid: ipfs_cid.clone(),
+            risk_score,
+            notes: None,
+        });
+
+        let result = k.invoice_nft.try_mint_invoices_batch(&sme, &batch);
+        assert!(result.is_err(), "batch with invalid entry must fail");
+        // No invoices committed — next_id stays at 1
+        assert_eq!(k.invoice_nft.next_id(), 1, "next_id must not advance on abort");
+    }
+
+    /// Batch minting with risk_score > 100 is rejected atomically.
+    #[test]
+    fn test_batch_mint_invalid_risk_score_aborts() {
+        use soroban_sdk::Vec;
+
+        let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, _) =
+            sample_invoice_params(&k.env);
+
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&k.env);
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash,
+            amount,
+            currency,
+            due_date,
+            ipfs_cid,
+            risk_score: 101, // invalid
+            notes: None,
+        });
+
+        let result = k.invoice_nft.try_mint_invoices_batch(&sme, &batch);
+        assert!(result.is_err());
+        assert_eq!(k.invoice_nft.next_id(), 1);
     }
 }
