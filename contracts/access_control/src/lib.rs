@@ -60,6 +60,16 @@ pub struct AccessControlContract;
 #[contractimpl]
 impl AccessControlContract {
     /// One-time initialization. Sets the admin and initializes the paused flag.
+    ///
+    /// **Parameters:**
+    /// - `admin` — The address that will become the protocol administrator.
+    ///
+    /// **Errors:**
+    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `KoraError::InvalidAddress` — `admin` is the contract's own address.
+    ///
+    /// **Security:** No auth required on first call (contract is uninitialized). Subsequent
+    /// calls revert immediately, preventing privilege escalation.
     pub fn initialize(env: Env, admin: Address) -> Result<(), KoraError> {
         // Guard: prevent re-initialization
         if env.storage().persistent().has(&DataKey::Admin) {
@@ -78,6 +88,16 @@ impl AccessControlContract {
     // ── Pause / Unpause ───────────────────────────────────────────────────────
 
     /// Pause the entire protocol. Admin only. Fails if already paused.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::Unauthorized` / `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::AlreadyPaused` — Protocol is already in the paused state.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered (should never happen in normal flow).
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `protocol_paused` event.
     pub fn pause(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -96,6 +116,16 @@ impl AccessControlContract {
     }
 
     /// Unpause the protocol. Admin only. Fails if not currently paused.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::Unauthorized` / `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NotPaused` — Protocol is not currently paused.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `protocol_unpaused` event.
     pub fn unpause(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -116,6 +146,19 @@ impl AccessControlContract {
     // ── Role management ───────────────────────────────────────────────────────
 
     /// Assign a role to an address. Admin only.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `target` — The address to assign the role to.
+    /// - `role` — The `Role` to assign (`Operator` or `Verifier`).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::Unauthorized` — Attempt to grant `Role::Admin` (use `transfer_admin`),
+    ///   grant `Role::None` (use `revoke_role`), or grant a role to the current admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Cannot grant `Role::Admin` directly —
+    /// use `transfer_admin` instead. Cannot grant `Role::None` — use `revoke_role` instead.
     /// - Cannot grant `Role::Admin` (use `transfer_admin`).
     /// - Cannot grant `Role::None` (use `revoke_role`).
     /// - Cannot grant a role to the current admin address.
@@ -147,6 +190,18 @@ impl AccessControlContract {
     }
 
     /// Revoke a role from an address. Admin only.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `target` — The address whose role should be removed.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::Unauthorized` — Attempt to revoke the admin's own role.
+    /// - `KoraError::RoleNotAssigned` — Target has no role assigned.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Uses `remove()` to reclaim storage
+    /// rather than writing `Role::None`.
     /// - Cannot revoke the admin's own role.
     /// - Fails if the target has no role assigned.
     pub fn revoke_role(env: Env, admin: Address, target: Address) -> Result<(), KoraError> {
@@ -175,6 +230,19 @@ impl AccessControlContract {
     // ── Admin transfer ────────────────────────────────────────────────────────
 
     /// Transfer admin to a new address. Current admin must sign.
+    ///
+    /// **Parameters:**
+    /// - `current_admin` — The current admin address.
+    /// - `new_admin` — The address to transfer admin rights to.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the current admin.
+    /// - `KoraError::InvalidAddress` — `new_admin` equals `current_admin` or is the contract itself.
+    /// - `KoraError::Unauthorized` — `new_admin` already holds an `Operator` or `Verifier` role.
+    ///   The caller must revoke that role first.
+    ///
+    /// **Security:** Requires `current_admin.require_auth()`. Prevents silent role overwrites
+    /// by rejecting addresses that already hold a non-None, non-Admin role.
     /// - Cannot transfer to self.
     /// - Cannot transfer to an address that already holds a non-None role
     ///   (would silently overwrite it). The caller must revoke first.
@@ -224,6 +292,18 @@ impl AccessControlContract {
 
     /// Configure the N-of-M multisig. Admin only. Once configured, admin
     /// actions must go through propose → approve → execute.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `signers` — The set of authorized signer addresses (M).
+    /// - `threshold` — The minimum number of approvals required to execute (N).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidThreshold` — `threshold` is 0 or greater than the number of signers.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Once this is called, sensitive admin actions
+    /// (pause, role management, admin transfer) must go through the multisig proposal flow.
     pub fn configure_multisig(
         env: Env,
         admin: Address,
@@ -255,6 +335,19 @@ impl AccessControlContract {
     }
 
     /// Propose a new admin action. Caller must be a signer.
+    ///
+    /// **Parameters:**
+    /// - `proposer` — A configured multisig signer address.
+    /// - `action` — The `AdminAction` to propose (Pause, Unpause, GrantRole, RevokeRole, TransferAdmin).
+    ///
+    /// **Returns:** The ID of the new proposal.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ArithmeticOverflow` — Proposal ID counter overflowed (extremely unlikely).
+    ///
+    /// **Security:** Requires `proposer.require_auth()`. Proposer's vote is recorded automatically.
+    /// Proposals expire after ~7 days (`PROPOSAL_TTL_LEDGERS`).
     pub fn propose_action(
         env: Env,
         proposer: Address,
@@ -301,6 +394,19 @@ impl AccessControlContract {
 
     /// Approve an existing proposal. Caller must be a signer who hasn't
     /// already approved this proposal.
+    ///
+    /// **Parameters:**
+    /// - `approver` — A configured multisig signer address.
+    /// - `proposal_id` — The ID of the proposal to approve.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ProposalAlreadyExecuted` — Proposal has already been executed.
+    /// - `KoraError::ProposalExpired` — Proposal's TTL has elapsed.
+    /// - `KoraError::AlreadyApproved` — Caller has already voted on this proposal.
+    ///
+    /// **Security:** Requires `approver.require_auth()`. Each signer may only vote once per proposal.
     pub fn approve_action(env: Env, approver: Address, proposal_id: u64) -> Result<(), KoraError> {
         approver.require_auth();
         let config = Self::load_multisig_config(&env)?;
@@ -338,6 +444,20 @@ impl AccessControlContract {
 
     /// Execute a proposal once the approval threshold is met.
     /// Any signer can call execute.
+    ///
+    /// **Parameters:**
+    /// - `executor` — A configured multisig signer address.
+    /// - `proposal_id` — The ID of the proposal to execute.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ProposalAlreadyExecuted` — Proposal has already been executed.
+    /// - `KoraError::ProposalExpired` — Proposal's TTL has elapsed.
+    /// - `KoraError::ThresholdNotMet` — Not enough approvals have been collected yet.
+    ///
+    /// **Security:** Requires `executor.require_auth()`. Once executed, the proposal is marked
+    /// as executed and cannot be re-executed. The proposal's action is applied atomically.
     pub fn execute_action(env: Env, executor: Address, proposal_id: u64) -> Result<(), KoraError> {
         executor.require_auth();
         let config = Self::load_multisig_config(&env)?;
@@ -406,6 +526,13 @@ impl AccessControlContract {
     }
 
     /// Get a proposal by ID.
+    ///
+    /// **Parameters:**
+    /// - `proposal_id` — The ID of the proposal to retrieve.
+    ///
+    /// **Returns:** The full `Proposal` struct, or `KoraError::ProposalNotFound`.
+    ///
+    /// **Security:** Read-only view with no authorization check.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, KoraError> {
         env.storage()
             .persistent()
@@ -414,6 +541,11 @@ impl AccessControlContract {
     }
 
     /// Get the current multisig configuration.
+    ///
+    /// **Returns:** The `MultisigConfig` (threshold + signer set), or
+    /// `KoraError::MultisigNotConfigured` if multisig has not been set up.
+    ///
+    /// **Security:** Read-only view with no authorization check.
     pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, KoraError> {
         Self::load_multisig_config(&env)
     }
@@ -472,6 +604,18 @@ impl AccessControlContract {
     }
 
     /// Vote in favour of a pending parameter-change proposal. Multisig signers only.
+    ///
+    /// **Parameters:**
+    /// - `signer` — A configured multisig signer address.
+    /// - `proposal_id` — The ID of the parameter-change proposal.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ParameterProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ParameterProposalAlreadyExecuted` — Proposal already executed.
+    /// - `KoraError::AlreadyVoted` — Caller has already cast their vote.
+    ///
+    /// **Security:** Requires `signer.require_auth()`. Each signer may only vote once.
     pub fn vote_parameter_change(
         env: Env,
         signer: Address,
@@ -553,11 +697,26 @@ impl AccessControlContract {
     }
 
     /// Read the current governed value of a parameter, if one has been executed.
+    ///
+    /// **Parameters:**
+    /// - `key` — The `ParameterKey` to look up (`FeeBps`, `LatePenaltyBps`, or `MaxRiskScore`).
+    ///
+    /// **Returns:** `Some(value)` if a governance proposal for this key has been executed,
+    /// `None` otherwise (callers should fall back to the contract's own initialized default).
+    ///
+    /// **Security:** Read-only view with no authorization check.
     pub fn get_parameter(env: Env, key: ParameterKey) -> Option<u32> {
         env.storage().persistent().get(&DataKey::Parameter(key))
     }
 
     /// Read a parameter-change proposal by id.
+    ///
+    /// **Parameters:**
+    /// - `proposal_id` — The ID of the parameter-change proposal.
+    ///
+    /// **Returns:** The full `ParameterProposal` struct, or `KoraError::ParameterProposalNotFound`.
+    ///
+    /// **Security:** Read-only view with no authorization check.
     pub fn get_parameter_proposal(
         env: Env,
         proposal_id: u64,
@@ -571,6 +730,9 @@ impl AccessControlContract {
     // ── Views ─────────────────────────────────────────────────────────────────
 
     /// Returns `true` if the protocol is currently paused.
+    ///
+    /// **Security:** Read-only view. No authorization required. Other contracts should call
+    /// this before performing any state-mutating operation.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -579,6 +741,11 @@ impl AccessControlContract {
     }
 
     /// Returns the role assigned to `address`, or `Role::None` if unassigned.
+    ///
+    /// **Parameters:**
+    /// - `address` — The address to query.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_role(env: Env, address: Address) -> Role {
         env.storage()
             .persistent()
@@ -587,6 +754,12 @@ impl AccessControlContract {
     }
 
     /// Returns `true` if `address` holds the given `role`.
+    ///
+    /// **Parameters:**
+    /// - `address` — The address to check.
+    /// - `role` — The `Role` to test for.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn has_role(env: Env, address: Address, role: Role) -> bool {
         let assigned: Role = env
             .storage()
@@ -597,6 +770,11 @@ impl AccessControlContract {
     }
 
     /// Returns the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotInitialized` — Contract has not been initialized yet.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_admin(env: Env) -> Result<Address, KoraError> {
         env.storage()
             .persistent()
@@ -606,6 +784,17 @@ impl AccessControlContract {
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
 
+    /// Propose a WASM upgrade. Admin only. Begins a 24-hour timelock.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_wasm_hash` — The SHA-256 hash of the new WASM binary (32 bytes).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. The upgrade cannot be applied until
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed via `execute_upgrade`.
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
@@ -621,6 +810,18 @@ impl AccessControlContract {
         Ok(())
     }
 
+    /// Execute a previously proposed WASM upgrade after the 24-hour timelock has elapsed.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Clears the proposal before calling
+    /// `update_current_contract_wasm` to prevent re-execution.
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;

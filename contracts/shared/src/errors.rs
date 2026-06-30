@@ -61,6 +61,7 @@ pub enum KoraError {
 
     // General
     ArithmeticOverflow = 90,
+    /// Returned by `safe_sub` when the result would underflow (a < b).
     ArithmeticUnderflow = 91,
     InvalidAddress = 92,
     EmptyString = 93,
@@ -68,8 +69,6 @@ pub enum KoraError {
     NotInitialized = 96,
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
-    // Field value exceeds the allowed maximum length
-    FieldTooLong = 95,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
@@ -77,6 +76,8 @@ pub enum KoraError {
     // Upgrade
     NoUpgradeProposed = 100,
     UpgradeTimelockNotElapsed = 101,
+    // Field value exceeds the allowed maximum length (was mistakenly = 95; fixed to 103)
+    FieldTooLong = 103,
     // Parameter governance
     ParameterProposalNotFound = 110,
     ParameterProposalAlreadyExecuted = 111,
