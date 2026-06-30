@@ -29,12 +29,10 @@ pub enum DataKey {
     UpgradeProposal,
     SaleOffer(u64, Address),
     EarlySettlement(u64),
-    // Per-token aggregate of outstanding investor obligations (used by record_position)
-    AggregateFunded(Address),
-    // Per-investor concentration cap in basis points
+    /// Maximum share (in bps) any single investor may hold in a pool.
     MaxPositionBps,
-    // Optional installment repayment schedule attached to a Pool
-    InstallmentSchedule(u64),
+    /// Aggregate funded amount for a given token across all active pools.
+    AggregateFunded(Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -274,6 +272,22 @@ impl FinancingPoolContract {
 
         if amount <= 0 || amount > MAX_AMOUNT {
             return Err(KoraError::InvalidAmount);
+        }
+
+        // Check per-invoice freeze before acquiring the RepaymentLock so the
+        // lock is never set (and never needs to be cleaned up) on frozen invoices.
+        // This is in addition to the protocol-wide pause in AccessControl.
+        {
+            let nft_contract: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvoiceNft)
+                .ok_or(KoraError::NotInitialized)?;
+            let nft_client =
+                kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
+            if nft_client.is_invoice_frozen(&invoice_id) {
+                return Err(KoraError::InvoiceFrozen);
+            }
         }
 
         if env.storage().persistent().has(&DataKey::RepaymentLock(invoice_id)) {
