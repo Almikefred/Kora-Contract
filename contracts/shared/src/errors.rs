@@ -62,6 +62,7 @@ pub enum KoraError {
 
     // General
     ArithmeticOverflow = 90,
+    /// Returned by `safe_sub` when the result would underflow (a < b).
     ArithmeticUnderflow = 91,
     InvalidAddress = 92,
     EmptyString = 93,
@@ -78,6 +79,8 @@ pub enum KoraError {
     // Upgrade
     NoUpgradeProposed = 100,
     UpgradeTimelockNotElapsed = 101,
+    // Field value exceeds the allowed maximum length (was mistakenly = 95; fixed to 103)
+    FieldTooLong = 103,
     // Parameter governance
     ParameterProposalNotFound = 110,
     ParameterProposalAlreadyExecuted = 111,

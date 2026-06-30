@@ -135,6 +135,16 @@ pub struct InvoiceNftContract;
 #[contractimpl]
 impl InvoiceNftContract {
     /// One-time initializer. Sets admin and access-control contract address.
+    ///
+    /// **Parameters:**
+    /// - `admin` — The address that will administer this contract.
+    /// - `access_control` — The deployed `access_control` contract address used for pause checks.
+    ///
+    /// **Errors:**
+    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `KoraError::InvalidAddress` — `admin` or `access_control` is the contract's own address.
+    ///
+    /// **Security:** No auth required on first call. Subsequent calls revert immediately.
     pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
@@ -156,6 +166,17 @@ impl InvoiceNftContract {
 
     /// Set the risk_registry contract address. Admin only. Called after deployment
     /// to wire up credit-limit enforcement.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `risk_registry` — The deployed `risk_registry` contract address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAddress` — `risk_registry` is the contract's own address.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Idempotent — safe to call again if
+    /// the risk registry is redeployed.
     pub fn set_risk_registry(env: Env, admin: Address, risk_registry: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -261,6 +282,33 @@ impl InvoiceNftContract {
     }
 
     /// Mint a new invoice NFT. Caller must be a verified SME.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME address minting the invoice (must sign).
+    /// - `debtor_hash` — SHA-256 hash of debtor PII (max `MAX_DEBTOR_HASH_LEN` bytes). PII stays off-chain.
+    /// - `amount` — Face value in stroops (7 decimals). Must be > 0.
+    /// - `currency` — Token symbol (e.g. `USDC`, `EURC`).
+    /// - `due_date` — Unix timestamp; must be strictly in the future.
+    /// - `ipfs_cid` — CIDv0 or CIDv1 of the full invoice document on IPFS (max 128 bytes).
+    /// - `risk_score` — Credit score 0–100 assigned by the verifier. Maps to a `RiskTier`.
+    /// - `notes` — Optional free-text memo (schema v2; `None` is fine).
+    ///
+    /// **Returns:** The allocated invoice ID (monotonically increasing from 1).
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::InvalidAmount` — `amount` is zero, negative, or exceeds `credit_limit`.
+    /// - `KoraError::InvalidDueDate` — `due_date` is not in the future.
+    /// - `KoraError::InvalidRiskScore` — `risk_score` > 100.
+    /// - `KoraError::EmptyBytes` — `debtor_hash` is empty.
+    /// - `KoraError::EmptyString` — `ipfs_cid` is empty.
+    /// - `KoraError::FieldTooLong` — `debtor_hash` or `ipfs_cid` exceed their max lengths.
+    /// - `KoraError::CreditLimitExceeded` — Adding this invoice would exceed the SME's credit limit.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    ///
+    /// **Security:** Requires `sme.require_auth()`. The protocol must not be paused.
+    /// If a `risk_registry` is wired up, the SME's outstanding exposure is checked against
+    /// their pre-approved credit limit before minting.
     pub fn mint_invoice(
         env: Env,
         sme: Address,
@@ -415,6 +463,25 @@ impl InvoiceNftContract {
     ///
     /// Any subset of fields may be corrected: pass the existing value to leave
     /// a field unchanged.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The original invoice owner.
+    /// - `invoice_id` — The ID of the invoice to amend.
+    /// - `debtor_hash` — Updated debtor hash (must be non-empty).
+    /// - `amount` — Updated face value (must be > 0).
+    /// - `due_date` — Updated due date (must be in the future).
+    /// - `ipfs_cid` — Updated IPFS CID of the document.
+    /// - `risk_score` — Updated risk score (0–100); also recalculates `risk_tier`.
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
+    /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
+    /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    /// - `KoraError::InvalidAmount` / `KoraError::InvalidDueDate` / `KoraError::InvalidRiskScore` — Validation failures.
+    ///
+    /// **Security:** Requires `sme.require_auth()`. Rejected once the invoice is listed
+    /// or further along in the lifecycle.
     pub fn amend_invoice(
         env: Env,
         sme: Address,
@@ -461,6 +528,19 @@ impl InvoiceNftContract {
     /// and only while `status == Created`.
     ///
     /// The invoice record is removed from storage, permanently burning the NFT.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The original invoice owner.
+    /// - `invoice_id` — The ID of the invoice to void.
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
+    /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
+    /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    ///
+    /// **Security:** Requires `sme.require_auth()`. Irreversible — the invoice is deleted
+    /// from on-chain storage and cannot be recovered. Outstanding exposure is decremented.
     pub fn withdraw_invoice(
         env: Env,
         sme: Address,
@@ -688,6 +768,8 @@ impl InvoiceNftContract {
     }
 
     /// Returns the number of invoices minted (next_id - 1).
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn invoice_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -698,6 +780,13 @@ impl InvoiceNftContract {
 
     /// Returns the aggregate outstanding face value for an SME across all
     /// non-Repaid, non-Defaulted invoices. Used for credit-limit enforcement.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME address to query.
+    ///
+    /// **Returns:** Total outstanding exposure in stroops (0 if none recorded).
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_outstanding_exposure(env: Env, sme: Address) -> i128 {
         env.storage()
             .persistent()
@@ -748,6 +837,17 @@ impl InvoiceNftContract {
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
 
+    /// Propose a WASM upgrade. Admin only. Begins a 24-hour timelock.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_wasm_hash` — SHA-256 hash of the new WASM binary (32 bytes).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. The upgrade cannot be applied until
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed via `execute_upgrade`.
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
@@ -762,6 +862,19 @@ impl InvoiceNftContract {
         Ok(())
     }
 
+    /// Execute a previously proposed WASM upgrade after the 24-hour timelock has elapsed.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Clears the proposal before executing
+    /// to prevent re-entry. Note: `migrate()` must be called by admin immediately after
+    /// any upgrade that changes a `#[contracttype]` struct schema.
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
