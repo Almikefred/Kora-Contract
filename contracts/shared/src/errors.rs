@@ -22,6 +22,7 @@ pub enum KoraError {
     InvalidDueDate = 15,
     InvalidRiskScore = 16,
     InvalidCid = 17,
+    InvoiceFrozen = 18,
 
     // Marketplace
     ListingNotFound = 20,
@@ -69,7 +70,7 @@ pub enum KoraError {
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
     // Field value exceeds the allowed maximum length
-    FieldTooLong = 95,
+    FieldTooLong = 102,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
@@ -85,4 +86,9 @@ pub enum KoraError {
     GovernanceThresholdNotMet = 114,
     GovernanceTimelockNotElapsed = 115,
     InvalidParameterValue = 116,
+    // Cooldown between debtor risk score updates per (verifier, debtor_hash) pair
+    ScoreUpdateCooldownNotElapsed = 117,
+    // Marketplace two-phase cancellation
+    CancellationPending = 118,
+    NoCancellationPending = 119,
 }

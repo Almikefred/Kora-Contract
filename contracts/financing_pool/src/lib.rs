@@ -3,7 +3,7 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    types::{Pool, Position},
+    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer},
     validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
@@ -29,6 +29,10 @@ pub enum DataKey {
     UpgradeProposal,
     SaleOffer(u64, Address),
     EarlySettlement(u64),
+    /// Maximum share (in bps) any single investor may hold in a pool.
+    MaxPositionBps,
+    /// Aggregate funded amount for a given token across all active pools.
+    AggregateFunded(Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -129,6 +133,13 @@ impl FinancingPoolContract {
 
         // Standardized financing pool event
         events::pool_opened(&env, &marketplace, invoice_id, &token, pool.face_value);
+
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.pools_opened = stats.pools_opened.saturating_add(1);
+        stats.active_pools = stats.active_pools.saturating_add(1);
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
 
         // Transition NFT status to Funded
         nft_client.set_funded(&env.current_contract_address(), &invoice_id);
@@ -244,11 +255,19 @@ impl FinancingPoolContract {
     }
 
     /// SME repays the invoice.
-    /// If the current ledger timestamp is past the invoice's due_date and no
-    /// penalty has been applied yet, a one-time late penalty of
-    /// `bps_of(face_value, late_penalty_bps)` is added to `total_owed`.
-    /// Partial repayments are tracked against `total_owed` so the penalty is
-    /// never double-counted.
+    ///
+    /// If the pool has an installment schedule, `amount` must match the current
+    /// installment's expected amount (or be the remaining balance for the final
+    /// installment).  The current installment is marked paid and the next index
+    /// is advanced.  When the final installment is paid the pool closes and yield
+    /// is distributed exactly as in lump-sum repayment.
+    ///
+    /// Without a schedule, the existing lump-sum-toward-face-value behaviour is
+    /// preserved: any positive amount is accepted and the pool closes once
+    /// `repaid_amount >= total_owed`.
+    ///
+    /// A one-time late penalty is applied when repaying past the invoice due_date
+    /// (or past the current installment due_date when a schedule is present).
     pub fn repay(
         env: Env,
         payer: Address,
@@ -260,6 +279,22 @@ impl FinancingPoolContract {
 
         if amount <= 0 || amount > MAX_AMOUNT {
             return Err(KoraError::InvalidAmount);
+        }
+
+        // Check per-invoice freeze before acquiring the RepaymentLock so the
+        // lock is never set (and never needs to be cleaned up) on frozen invoices.
+        // This is in addition to the protocol-wide pause in AccessControl.
+        {
+            let nft_contract: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvoiceNft)
+                .ok_or(KoraError::NotInitialized)?;
+            let nft_client =
+                kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
+            if nft_client.is_invoice_frozen(&invoice_id) {
+                return Err(KoraError::InvoiceFrozen);
+            }
         }
 
         if env.storage().persistent().has(&DataKey::RepaymentLock(invoice_id)) {
@@ -294,16 +329,69 @@ impl FinancingPoolContract {
         // Convert repayment amount if invoice currency differs from pool token
         let effective_amount = Self::convert_if_needed(&env, amount, &invoice.currency, &pool.token)?;
 
-        // Apply late penalty once if repayment is past due_date
-        if !pool.penalty_applied && pool.late_penalty_bps > 0 {
-            if env.ledger().timestamp() > invoice.due_date {
-                let penalty = bps_of(pool.face_value, pool.late_penalty_bps)?;
-                pool.total_owed = pool
-                    .total_owed
-                    .checked_add(penalty)
-                    .ok_or(KoraError::ArithmeticOverflow)?;
-                pool.penalty_applied = true;
-                events::late_penalty_applied(&env, invoice_id, penalty, pool.total_owed);
+        // ── Installment validation ────────────────────────────────────────────
+        let mut maybe_schedule: Option<InstallmentSchedule> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InstallmentSchedule(invoice_id));
+
+        if let Some(ref mut schedule) = maybe_schedule {
+            let idx = schedule.next_index;
+            let len = schedule.installments.len();
+            if idx >= len {
+                // All installments already satisfied — pool should have been closed.
+                env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::RepaymentAlreadyMade);
+            }
+            let installment = schedule.installments.get(idx).unwrap();
+
+            // Determine expected amount: for the final installment accept any
+            // amount >= expected (handles rounding from a penalty added to total_owed).
+            let is_final = idx == len - 1;
+            let expected = installment.amount;
+            if is_final {
+                if effective_amount < expected {
+                    env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                    return Err(KoraError::InvalidAmount);
+                }
+            } else if effective_amount != expected {
+                env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::InvalidAmount);
+            }
+
+            // Apply late penalty if this installment is past its due_date.
+            if !pool.penalty_applied && pool.late_penalty_bps > 0 {
+                if env.ledger().timestamp() > installment.due_date {
+                    let penalty = bps_of(pool.face_value, pool.late_penalty_bps)?;
+                    pool.total_owed = pool
+                        .total_owed
+                        .checked_add(penalty)
+                        .ok_or(KoraError::ArithmeticOverflow)?;
+                    pool.penalty_applied = true;
+                    events::late_penalty_applied(&env, invoice_id, penalty, pool.total_owed);
+                }
+            }
+
+            // Mark this installment as paid and advance the cursor.
+            let mut updated_installments = schedule.installments.clone();
+            let mut paid_installment = installment.clone();
+            paid_installment.paid = true;
+            updated_installments.set(idx, paid_installment);
+            schedule.installments = updated_installments;
+            schedule.next_index = schedule.next_index.saturating_add(1);
+            events::installment_paid(&env, invoice_id, &payer, idx, effective_amount);
+        } else {
+            // No schedule — original lump-sum late penalty logic.
+            if !pool.penalty_applied && pool.late_penalty_bps > 0 {
+                if env.ledger().timestamp() > invoice.due_date {
+                    let penalty = bps_of(pool.face_value, pool.late_penalty_bps)?;
+                    pool.total_owed = pool
+                        .total_owed
+                        .checked_add(penalty)
+                        .ok_or(KoraError::ArithmeticOverflow)?;
+                    pool.penalty_applied = true;
+                    events::late_penalty_applied(&env, invoice_id, penalty, pool.total_owed);
+                }
             }
         }
 
@@ -319,9 +407,25 @@ impl FinancingPoolContract {
         }
         env.storage().persistent().set(&DataKey::Pool(invoice_id), &pool);
 
+        // Persist the updated schedule (if any).
+        if let Some(ref schedule) = maybe_schedule {
+            env.storage()
+                .persistent()
+                .set(&DataKey::InstallmentSchedule(invoice_id), schedule);
+        }
+
         // Interactions
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&payer, &env.current_contract_address(), &amount);
+
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.total_repaid = stats.total_repaid.saturating_add(effective_amount);
+        if should_close {
+            stats.active_pools = stats.active_pools.saturating_sub(1);
+        }
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
 
         // Standardized repayment event
         events::repayment_made(&env, invoice_id, &payer, amount);
@@ -426,6 +530,13 @@ impl FinancingPoolContract {
         nft_client.set_defaulted(&admin, &invoice_id);
 
         events::invoice_defaulted(&env, invoice_id, &admin);
+
+        // Update protocol stats
+        let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+            .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+        stats.pools_defaulted = stats.pools_defaulted.saturating_add(1);
+        stats.active_pools = stats.active_pools.saturating_sub(1);
+        env.storage().instance().set(&DataKey::ProtocolStats, &stats);
 
         // Automatically record the default against the SME in the risk registry
         let invoice = nft_client.get_invoice(&invoice_id);
@@ -585,6 +696,13 @@ impl FinancingPoolContract {
                 kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
             nft_client.set_repaid(&env.current_contract_address(), &invoice_id);
 
+            // Update protocol stats
+            let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
+                .unwrap_or(ProtocolStats { pools_opened: 0, total_repaid: 0, pools_defaulted: 0, active_pools: 0 });
+            stats.total_repaid = stats.total_repaid.saturating_add(offer.amount);
+            stats.active_pools = stats.active_pools.saturating_sub(1);
+            env.storage().instance().set(&DataKey::ProtocolStats, &stats);
+
             env.storage()
                 .persistent()
                 .remove(&DataKey::EarlySettlement(invoice_id));
@@ -671,6 +789,78 @@ impl FinancingPoolContract {
             .get(&DataKey::Positions(invoice_id))
             .unwrap_or(Map::new(&env));
         positions.values()
+    }
+
+    // ── Installment schedule ──────────────────────────────────────────────────
+
+    /// Attach an installment repayment schedule to an open pool.
+    ///
+    /// Admin-only.  Must be called before the first repayment.  The sum of all
+    /// installment amounts must equal `pool.total_owed`.  Due-dates must be
+    /// monotonically increasing.
+    pub fn set_installment_schedule(
+        env: Env,
+        admin: Address,
+        invoice_id: u64,
+        schedule: InstallmentSchedule,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+
+        if pool.is_closed {
+            return Err(KoraError::PoolAlreadyClosed);
+        }
+        if pool.repaid_amount > 0 {
+            // Refuse to attach a schedule once repayment has started.
+            return Err(KoraError::InvalidAmount);
+        }
+        if schedule.installments.is_empty() {
+            return Err(KoraError::InvalidAmount);
+        }
+        if schedule.next_index != 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        // Validate: sum of installments == total_owed, due_dates non-decreasing.
+        let mut total: i128 = 0;
+        let mut prev_due: u64 = 0;
+        for installment in schedule.installments.iter() {
+            if installment.amount <= 0 {
+                return Err(KoraError::InvalidAmount);
+            }
+            if installment.due_date < prev_due {
+                return Err(KoraError::InvalidDueDate);
+            }
+            prev_due = installment.due_date;
+            total = total
+                .checked_add(installment.amount)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+        }
+        if total != pool.total_owed {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InstallmentSchedule(invoice_id), &schedule);
+        Ok(())
+    }
+
+    /// Return the installment schedule for a pool, if set.
+    pub fn get_installment_schedule(
+        env: Env,
+        invoice_id: u64,
+    ) -> Option<InstallmentSchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InstallmentSchedule(invoice_id))
     }
 
     // ── Secondary market ───────────────────────────────────────────────────────
