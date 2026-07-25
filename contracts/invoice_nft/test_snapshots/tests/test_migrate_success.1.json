@@ -1,11 +1,33 @@
 {
   "generators": {
-    "address": 4,
+    "address": 3,
     "nonce": 0
   },
   "auth": [
     [],
+<<<<<<< HEAD:contracts/invoice_nft/test_snapshots/tests/test_initialize_success.1.json
     []
+=======
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "migrate",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ]
+>>>>>>> origin/Kora-Contract46:contracts/invoice_nft/test_snapshots/tests/test_migrate_success.1.json
   ],
   "ledger": {
     "protocol_version": 21,
@@ -68,6 +90,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "MigrationVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "NextId"
                             }
                           ]
@@ -84,6 +118,39 @@
             "ext": "v0"
           },
           1000
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "ledger_key_nonce": {
+                "nonce": 801925984706572462
+              }
+            },
+            "durability": "temporary"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "ledger_key_nonce": {
+                    "nonce": 801925984706572462
+                  }
+                },
+                "durability": "temporary",
+                "val": "void"
+              }
+            },
+            "ext": "v0"
+          },
+          100000
         ]
       ],
       [
@@ -179,37 +246,19 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "mint_invoice"
+<<<<<<< HEAD:contracts/invoice_nft/test_snapshots/tests/test_initialize_success.1.json
+                "symbol": "next_id"
+              }
+            ],
+            "data": "void"
+=======
+                "symbol": "migrate"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "bytes": ""
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000000000
-                  }
-                },
-                {
-                  "symbol": "USDC"
-                },
-                {
-                  "u64": 1700086400
-                },
-                {
-                  "string": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
-                },
-                {
-                  "u32": 10
-                }
-              ]
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
             }
+>>>>>>> origin/Kora-Contract46:contracts/invoice_nft/test_snapshots/tests/test_migrate_success.1.json
           }
         }
       },
@@ -227,99 +276,19 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "mint_invoice"
+<<<<<<< HEAD:contracts/invoice_nft/test_snapshots/tests/test_initialize_success.1.json
+                "symbol": "next_id"
               }
             ],
             "data": {
-              "error": {
-                "contract": 92
-              }
+              "u64": 1
             }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "contract": 92
-                }
+=======
+                "symbol": "migrate"
               }
             ],
-            "data": {
-              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "contract": 92
-                }
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "string": "contract try_call failed"
-                },
-                {
-                  "symbol": "mint_invoice"
-                },
-                {
-                  "vec": [
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                    },
-                    {
-                      "bytes": ""
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 1000000000
-                      }
-                    },
-                    {
-                      "symbol": "USDC"
-                    },
-                    {
-                      "u64": 1700086400
-                    },
-                    {
-                      "string": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
-                    },
-                    {
-                      "u32": 10
-                    }
-                  ]
-                }
-              ]
-            }
+            "data": "void"
+>>>>>>> origin/Kora-Contract46:contracts/invoice_nft/test_snapshots/tests/test_migrate_success.1.json
           }
         }
       },

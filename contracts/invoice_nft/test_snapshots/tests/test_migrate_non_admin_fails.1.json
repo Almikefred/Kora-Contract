@@ -68,6 +68,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "MigrationVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "NextId"
                             }
                           ]
@@ -179,36 +191,11 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "mint_invoice"
+                "symbol": "migrate"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000000000
-                  }
-                },
-                {
-                  "symbol": "USDC"
-                },
-                {
-                  "u64": 1700086400
-                },
-                {
-                  "string": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
-                },
-                {
-                  "u32": 101
-                }
-              ]
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
             }
           }
         }
@@ -227,12 +214,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "mint_invoice"
+                "symbol": "migrate"
               }
             ],
             "data": {
               "error": {
-                "contract": 16
+                "contract": 2
               }
             }
           }
@@ -253,7 +240,7 @@
               },
               {
                 "error": {
-                  "contract": 16
+                  "contract": 2
                 }
               }
             ],
@@ -278,7 +265,7 @@
               },
               {
                 "error": {
-                  "contract": 16
+                  "contract": 2
                 }
               }
             ],
@@ -288,33 +275,12 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "mint_invoice"
+                  "symbol": "migrate"
                 },
                 {
                   "vec": [
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                    },
-                    {
-                      "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 1000000000
-                      }
-                    },
-                    {
-                      "symbol": "USDC"
-                    },
-                    {
-                      "u64": 1700086400
-                    },
-                    {
-                      "string": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
-                    },
-                    {
-                      "u32": 101
                     }
                   ]
                 }

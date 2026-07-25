@@ -337,6 +337,33 @@
                         "key": {
                           "vec": [
                             {
+<<<<<<< HEAD
+=======
+                              "symbol": "InvoiceCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "MigrationVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+>>>>>>> origin/Kora-Contract46
                               "symbol": "NextId"
                             }
                           ]
@@ -641,6 +668,12 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+<<<<<<< HEAD
+=======
+                },
+                {
+                  "u64": 1700000000
+>>>>>>> origin/Kora-Contract46
                 }
               ]
             }
@@ -881,16 +914,29 @@
             "data": {
               "vec": [
                 {
+<<<<<<< HEAD
                   "u64": 1
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+=======
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": 1
+>>>>>>> origin/Kora-Contract46
                 },
                 {
                   "i128": {
                     "hi": 0,
                     "lo": 1000000000
                   }
+<<<<<<< HEAD
+=======
+                },
+                {
+                  "u64": 1700000000
+>>>>>>> origin/Kora-Contract46
                 }
               ]
             }
@@ -1195,6 +1241,15 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+<<<<<<< HEAD
+=======
+<<<<<<<< HEAD:contracts/invoice_nft/test_snapshots/tests/test_status_transitions.1.json
+========
+                },
+                {
+                  "u64": 1700000000
+>>>>>>>> origin/Kora-Contract46:contracts/invoice_nft/test_snapshots/tests/test_invoice_timestamps_recorded.1.json
+>>>>>>> origin/Kora-Contract46
                 }
               ]
             }

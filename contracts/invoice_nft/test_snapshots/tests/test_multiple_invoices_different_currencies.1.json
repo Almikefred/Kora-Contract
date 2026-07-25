@@ -463,6 +463,33 @@
                         "key": {
                           "vec": [
                             {
+<<<<<<< HEAD
+=======
+                              "symbol": "InvoiceCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 2
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "MigrationVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+>>>>>>> origin/Kora-Contract46
                               "symbol": "NextId"
                             }
                           ]
@@ -701,6 +728,12 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+<<<<<<< HEAD
+=======
+                },
+                {
+                  "u64": 1700000000
+>>>>>>> origin/Kora-Contract46
                 }
               ]
             }
@@ -808,6 +841,12 @@
                     "hi": 0,
                     "lo": 2000000000
                   }
+<<<<<<< HEAD
+=======
+                },
+                {
+                  "u64": 1700000000
+>>>>>>> origin/Kora-Contract46
                 }
               ]
             }

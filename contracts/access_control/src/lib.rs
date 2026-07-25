@@ -9,6 +9,11 @@ const PERSISTENT_TTL_BUMP: u32 = 518_400;
 
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
+/// Storage key variants for the access control contract.
+///
+/// - `Admin` — stores the current admin address (instance storage)
+/// - `Paused` — stores the protocol pause flag (instance storage)
+/// - `Role(Address)` — maps addresses to their assigned roles (persistent storage)
 #[contracttype]
 pub enum DataKey {
     /// Admin address — persistent so it survives ledger archival.
@@ -176,9 +181,7 @@ impl AccessControlContract {
         if existing != Role::None && existing != Role::Admin {
             return Err(KoraError::Unauthorized);
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage()
             .persistent()
             .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
@@ -383,7 +386,9 @@ mod tests {
         // Cannot grant Role::Admin — must use transfer_admin
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
-        assert!(client.try_grant_role(&admin, &target, &Role::Admin).is_err());
+        assert!(client
+            .try_grant_role(&admin, &target, &Role::Admin)
+            .is_err());
     }
 
     #[test]
@@ -398,7 +403,9 @@ mod tests {
     fn test_grant_role_to_admin_self_forbidden() {
         // Admin cannot grant a role to their own address
         let (_, admin, client) = setup();
-        assert!(client.try_grant_role(&admin, &admin, &Role::Operator).is_err());
+        assert!(client
+            .try_grant_role(&admin, &admin, &Role::Operator)
+            .is_err());
     }
 
     #[test]
@@ -406,7 +413,9 @@ mod tests {
         let (env, _, client) = setup();
         let stranger = Address::generate(&env);
         let target = Address::generate(&env);
-        assert!(client.try_grant_role(&stranger, &target, &Role::Verifier).is_err());
+        assert!(client
+            .try_grant_role(&stranger, &target, &Role::Verifier)
+            .is_err());
     }
 
     #[test]
@@ -580,7 +589,6 @@ mod tests {
         assert_eq!(client.get_role(&unknown), Role::None);
     }
 }
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests_extended {
@@ -632,10 +640,7 @@ mod tests_extended {
     fn test_initialize_already_initialized_returns_correct_error() {
         let (_, admin, client) = setup();
         let result = client.try_initialize(&admin);
-        assert_eq!(
-            result.unwrap_err().unwrap(),
-            KoraError::AlreadyInitialized
-        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::AlreadyInitialized);
     }
 
     #[test]
@@ -790,7 +795,9 @@ mod tests_extended {
                 sub_invokes: &[],
             },
         }]);
-        assert!(client.try_grant_role(&admin, &target, &Role::Verifier).is_ok());
+        assert!(client
+            .try_grant_role(&admin, &target, &Role::Verifier)
+            .is_ok());
     }
 
     #[test]
@@ -1042,7 +1049,9 @@ mod tests_extended {
         assert!(client.try_pause(&admin).is_err());
         // Old admin cannot grant roles
         let target = Address::generate(&env);
-        assert!(client.try_grant_role(&admin, &target, &Role::Verifier).is_err());
+        assert!(client
+            .try_grant_role(&admin, &target, &Role::Verifier)
+            .is_err());
         // Old admin cannot transfer admin again
         assert!(client.try_transfer_admin(&admin, &target).is_err());
     }
