@@ -70,8 +70,6 @@ pub enum KoraError {
     NotInitialized = 96,
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
-    // Field value exceeds the allowed maximum length
-    FieldTooLong = 102,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
@@ -94,4 +92,10 @@ pub enum KoraError {
     // Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+    // invoice_nft: caller is not the invoice's original SME
+    NotInvoiceOwner = 120,
+    // invoice_nft: minting this invoice would exceed the SME's pre-approved credit limit
+    CreditLimitExceeded = 121,
+    // invoice_nft: currency symbol is not on the allowlist
+    CurrencyNotAllowed = 122,
 }

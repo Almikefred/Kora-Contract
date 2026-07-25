@@ -36,6 +36,12 @@ pub struct ReentrancyGuard {
     env: Env,
 }
 
+impl core::fmt::Debug for ReentrancyGuard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReentrancyGuard").finish()
+    }
+}
+
 impl ReentrancyGuard {
     pub fn new(env: &Env) -> Result<Self, KoraError> {
         acquire_guard(env)?;
