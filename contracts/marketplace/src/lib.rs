@@ -6,13 +6,18 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::{Listing, RiskTier},
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of, bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
 // ~30 days in ledgers at ~5 s/ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
 const PERSISTENT_TTL_BUMP: u32 = 518_400;
+
+/// Default minimum discount (face_value - asking_price) required to list an
+/// invoice, in basis points of face_value. Admin-configurable via
+/// `set_min_discount_bps`. See docs/marketplace.md.
+const DEFAULT_MIN_DISCOUNT_BPS: u32 = 10;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -43,6 +48,8 @@ pub enum DataKey {
     CancellationRequest(u64),
     /// Marks a listing's cancellation as admin-confirmed, unblocking refunds.
     CancellationConfirmed(u64),
+    /// Minimum discount (bps of face_value) required to list an invoice.
+    MinDiscountBps,
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -143,6 +150,31 @@ impl MarketplaceContract {
     /// Returns the current fee in basis points.
     pub fn get_fee_bps(env: Env) -> Result<u32, KoraError> {
         Ok(Self::load_config(&env)?.fee_bps)
+    }
+
+    /// Update the minimum required discount (face_value - asking_price), in
+    /// basis points of face_value, that a listing must offer. Admin only.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidFeeRate` — `min_discount_bps` > 10 000.
+    pub fn set_min_discount_bps(env: Env, admin: Address, min_discount_bps: u32) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        require_valid_fee_bps(min_discount_bps)?;
+        env.storage().instance().set(&DataKey::MinDiscountBps, &min_discount_bps);
+        Ok(())
+    }
+
+    /// Returns the current minimum discount requirement in basis points.
+    pub fn get_min_discount_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinDiscountBps)
+            .unwrap_or(DEFAULT_MIN_DISCOUNT_BPS)
     }
 
     /// Set a per-risk-tier fee override. Admin only. (#210)
@@ -252,6 +284,16 @@ impl MarketplaceContract {
 
         // asking_price must be strictly less than face_value (discount must exist)
         if asking_price >= face_value {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        // Enforce a minimum discount so listings offer investors meaningful yield.
+        let min_discount_bps = Self::get_min_discount_bps(env.clone());
+        let min_discount = bps_of(face_value, min_discount_bps)?;
+        let discount = face_value
+            .checked_sub(asking_price)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        if discount < min_discount {
             return Err(KoraError::InvalidAmount);
         }
 
@@ -1189,6 +1231,100 @@ mod tests {
             &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    // ── minimum discount enforcement ──────────────────────────────────────────
+
+    #[test]
+    fn test_list_invoice_discount_below_minimum_rejected() {
+        let t = deploy();
+        // mint_invoice() always mints a face value of 10_000_000_000.
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        // face_value = 10_000_000_000, default min_discount_bps = 10 →
+        // min_discount = 10_000_000. A discount of 9_999_999 (asking_price =
+        // 9_990_000_001) is one below the minimum.
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_990_000_001i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_list_invoice_discount_exact_minimum_accepted() {
+        let t = deploy();
+        // mint_invoice() always mints a face value of 10_000_000_000.
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        // face_value = 10_000_000_000, default min_discount_bps = 10 →
+        // min_discount = 10_000_000. A discount of exactly 10_000_000
+        // (asking_price = 9_990_000_000) must be accepted.
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_990_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_list_invoice_valid_discount_accepted() {
+        let t = deploy();
+        let id = list_one(&t);
+        let listing = t.mp.get_listing(&id);
+        assert!(listing.is_active);
+        assert_eq!(listing.asking_price, 9_500_000_000i128);
+    }
+
+    #[test]
+    fn test_set_min_discount_bps_enforced_on_next_listing() {
+        let t = deploy();
+        // Raise the minimum discount to 10% (1_000 bps); a 5% discount must
+        // now be rejected even though it passed under the default 10 bps.
+        t.mp.set_min_discount_bps(&t.admin, &1_000u32);
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_set_min_discount_bps_non_admin_rejected() {
+        let t = deploy();
+        let stranger = Address::generate(&t.env);
+        let result = t.mp.try_set_min_discount_bps(&stranger, &1_000u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_min_discount_bps_over_10000_rejected() {
+        let t = deploy();
+        let result = t.mp.try_set_min_discount_bps(&t.admin, &10_001u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_min_discount_bps_defaults_to_ten() {
+        let t = deploy();
+        assert_eq!(t.mp.get_min_discount_bps(), 10u32);
     }
 
     #[test]
