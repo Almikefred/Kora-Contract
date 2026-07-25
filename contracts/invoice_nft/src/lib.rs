@@ -13,7 +13,7 @@
 //! See [Invoice NFT Model](../../../docs/invoice-nft.md) for detailed architecture.
 
 use kora_shared::{
-    errors::KoraError,
+    errors::CommonError,
     events,
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, RiskTier},
@@ -23,7 +23,59 @@ use kora_shared::{
         require_valid_risk_score, MAX_DEBTOR_HASH_LEN, MAX_IPFS_CID_LEN, UPGRADE_TIMELOCK_DELAY,
     },
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+
+/// Local error enum for the invoice_nft contract.
+///
+/// `kora_shared::errors::KoraError` was split apart because Soroban's
+/// `#[contracterror]` macro caps an error enum at 50 variants — each contract
+/// now owns its own local error type, with `From<CommonError>` bridging the
+/// small set of shared validation/reentrancy errors.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum InvoiceNftError {
+    AlreadyInitialized = 1,
+    ArithmeticOverflow = 2,
+    CreditLimitExceeded = 3,
+    CurrencyNotAllowed = 4,
+    EmptyBytes = 5,
+    EmptyString = 6,
+    FieldTooLong = 7,
+    InvalidAddress = 8,
+    InvalidAmount = 9,
+    InvalidDueDate = 10,
+    InvalidInvoiceStatus = 11,
+    InvalidRiskScore = 12,
+    InvoiceNotFound = 13,
+    NoUpgradeProposed = 14,
+    NotAdmin = 15,
+    NotInitialized = 16,
+    NotInvoiceOwner = 17,
+    ProtocolPaused = 18,
+    Reentrancy = 19,
+    Unauthorized = 20,
+    UpgradeTimelockNotElapsed = 21,
+}
+
+impl From<CommonError> for InvoiceNftError {
+    fn from(e: CommonError) -> Self {
+        match e {
+            CommonError::InvalidAmount => InvoiceNftError::InvalidAmount,
+            CommonError::InvalidDueDate => InvoiceNftError::InvalidDueDate,
+            CommonError::InvalidRiskScore => InvoiceNftError::InvalidRiskScore,
+            CommonError::InvalidAddress => InvoiceNftError::InvalidAddress,
+            CommonError::EmptyString => InvoiceNftError::EmptyString,
+            CommonError::EmptyBytes => InvoiceNftError::EmptyBytes,
+            CommonError::FieldTooLong => InvoiceNftError::FieldTooLong,
+            CommonError::ArithmeticOverflow => InvoiceNftError::ArithmeticOverflow,
+            CommonError::Reentrancy => InvoiceNftError::Reentrancy,
+            // InvalidCid / ArithmeticUnderflow / InvalidFeeRate aren't raised by any call
+            // this crate makes into kora_shared::validation.
+            _ => InvoiceNftError::InvalidAmount,
+        }
+    }
+}
 
 // ── TTL constants (~30 days at ~5s/ledger) ───────────────────────────────────
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -32,7 +84,7 @@ const PERSISTENT_TTL_BUMP: u32 = 518_400;
 // ── Storage Keys ────────────────────────────────────────────────────────────
 //
 // Storage versioning: The contract uses a MigrationVersion key to track schema changes.
-// Current version: 1
+// Current version: 2 (Invoice includes `metadata_hash` and `notes`)
 //
 // Variants:
 // - Invoice(u64): Stores individual Invoice structs by ID (persistent)
@@ -141,13 +193,13 @@ impl InvoiceNftContract {
     /// - `access_control` — The deployed `access_control` contract address used for pause checks.
     ///
     /// **Errors:**
-    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
-    /// - `KoraError::InvalidAddress` — `admin` or `access_control` is the contract's own address.
+    /// - `InvoiceNftError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `InvoiceNftError::InvalidAddress` — `admin` or `access_control` is the contract's own address.
     ///
     /// **Security:** No auth required on first call. Subsequent calls revert immediately.
-    pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), KoraError> {
+    pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), InvoiceNftError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(InvoiceNftError::AlreadyInitialized);
         }
         kora_shared::validation::require_not_self(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &access_control)?;
@@ -157,10 +209,14 @@ impl InvoiceNftContract {
             .instance()
             .set(&DataKey::AccessControl, &access_control);
         env.storage().instance().set(&DataKey::NextId, &1u64);
-        // Initialize migration version to 1 (current schema version)
+        // A freshly initialized contract already stores every field of the
+        // current Invoice schema (v2 — includes `metadata_hash` and `notes`).
+        // Start at the current version so migrate()'s v1 -> v2 backfill pass
+        // (which decodes records as the legacy InvoiceV1 shape) is never run
+        // against records that were never written in the old format.
         env.storage()
             .instance()
-            .set(&DataKey::MigrationVersion, &1u32);
+            .set(&DataKey::MigrationVersion, &2u32);
         Ok(())
     }
 
@@ -172,12 +228,12 @@ impl InvoiceNftContract {
     /// - `risk_registry` — The deployed `risk_registry` contract address.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::InvalidAddress` — `risk_registry` is the contract's own address.
+    /// - `InvoiceNftError::NotAdmin` — Caller is not the admin.
+    /// - `InvoiceNftError::InvalidAddress` — `risk_registry` is the contract's own address.
     ///
     /// **Security:** Requires `admin.require_auth()`. Idempotent — safe to call again if
     /// the risk registry is redeployed.
-    pub fn set_risk_registry(env: Env, admin: Address, risk_registry: Address) -> Result<(), KoraError> {
+    pub fn set_risk_registry(env: Env, admin: Address, risk_registry: Address) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &risk_registry)?;
@@ -194,7 +250,7 @@ impl InvoiceNftContract {
     ///
     /// See docs/MIGRATIONS.md for the full runbook and a description of each
     /// version's changes.
-    pub fn migrate(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn migrate(env: Env, admin: Address) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
@@ -245,6 +301,7 @@ impl InvoiceNftContract {
                         currency: old.currency,
                         due_date: old.due_date,
                         ipfs_cid: old.ipfs_cid,
+                        metadata_hash: Bytes::new(&env),
                         risk_score: old.risk_score,
                         risk_tier: old.risk_tier,
                         status: old.status,
@@ -273,7 +330,7 @@ impl InvoiceNftContract {
         admin: Address,
         marketplace: Address,
         financing_pool: Address,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Marketplace, &marketplace);
@@ -296,15 +353,15 @@ impl InvoiceNftContract {
     /// **Returns:** The allocated invoice ID (monotonically increasing from 1).
     ///
     /// **Errors:**
-    /// - `KoraError::ProtocolPaused` — Protocol is paused.
-    /// - `KoraError::InvalidAmount` — `amount` is zero, negative, or exceeds `credit_limit`.
-    /// - `KoraError::InvalidDueDate` — `due_date` is not in the future.
-    /// - `KoraError::InvalidRiskScore` — `risk_score` > 100.
-    /// - `KoraError::EmptyBytes` — `debtor_hash` is empty.
-    /// - `KoraError::EmptyString` — `ipfs_cid` is empty.
-    /// - `KoraError::FieldTooLong` — `debtor_hash` or `ipfs_cid` exceed their max lengths.
-    /// - `KoraError::CreditLimitExceeded` — Adding this invoice would exceed the SME's credit limit.
-    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvalidAmount` — `amount` is zero, negative, or exceeds `credit_limit`.
+    /// - `InvoiceNftError::InvalidDueDate` — `due_date` is not in the future.
+    /// - `InvoiceNftError::InvalidRiskScore` — `risk_score` > 100.
+    /// - `InvoiceNftError::EmptyBytes` — `debtor_hash` is empty.
+    /// - `InvoiceNftError::EmptyString` — `ipfs_cid` is empty.
+    /// - `InvoiceNftError::FieldTooLong` — `debtor_hash` or `ipfs_cid` exceed their max lengths.
+    /// - `InvoiceNftError::CreditLimitExceeded` — Adding this invoice would exceed the SME's credit limit.
+    /// - `InvoiceNftError::Reentrancy` — Reentrancy guard triggered.
     ///
     /// **Security:** Requires `sme.require_auth()`. The protocol must not be paused.
     /// If a `risk_registry` is wired up, the SME's outstanding exposure is checked against
@@ -319,7 +376,7 @@ impl InvoiceNftContract {
         ipfs_cid: String,
         risk_score: u32,
         notes: Option<String>,
-    ) -> Result<u64, KoraError> {
+    ) -> Result<u64, InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
@@ -350,9 +407,9 @@ impl InvoiceNftContract {
                             .unwrap_or(0i128);
                         let new_exposure = outstanding
                             .checked_add(amount)
-                            .ok_or(KoraError::ArithmeticOverflow)?;
+                            .ok_or(InvoiceNftError::ArithmeticOverflow)?;
                         if new_exposure > profile.credit_limit {
-                            return Err(KoraError::CreditLimitExceeded);
+                            return Err(InvoiceNftError::CreditLimitExceeded);
                         }
                     }
                 }
@@ -385,7 +442,21 @@ impl InvoiceNftContract {
         Self::bump_invoice_ttl(&env, id);
         env.storage().instance().set(
             &DataKey::NextId,
-            &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
+            &(id.checked_add(1).ok_or(InvoiceNftError::ArithmeticOverflow)?),
+        );
+
+        // Track outstanding exposure so credit-limit checks and get_outstanding_exposure
+        // stay accurate; released again on withdraw/repaid/defaulted.
+        let outstanding: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutstandingExposure(sme.clone()))
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &DataKey::OutstandingExposure(sme.clone()),
+            &outstanding
+                .checked_add(amount)
+                .ok_or(InvoiceNftError::ArithmeticOverflow)?,
         );
 
         events::invoice_created(&env, id, &sme, invoice.amount);
@@ -403,7 +474,7 @@ impl InvoiceNftContract {
         env: Env,
         sme: Address,
         invoices: Vec<BatchInvoiceInput>,
-    ) -> Result<Vec<u64>, KoraError> {
+    ) -> Result<Vec<u64>, InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
@@ -448,10 +519,23 @@ impl InvoiceNftContract {
 
             env.storage().persistent().set(&DataKey::Invoice(id), &invoice);
             Self::bump_invoice_ttl(&env, id);
+
+            let outstanding: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OutstandingExposure(sme.clone()))
+                .unwrap_or(0i128);
+            env.storage().persistent().set(
+                &DataKey::OutstandingExposure(sme.clone()),
+                &outstanding
+                    .checked_add(invoice.amount)
+                    .ok_or(InvoiceNftError::ArithmeticOverflow)?,
+            );
+
             events::invoice_created(&env, id, &sme, invoice.amount);
             ids.push_back(id);
 
-            next_id = next_id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?;
+            next_id = next_id.checked_add(1).ok_or(InvoiceNftError::ArithmeticOverflow)?;
         }
 
         env.storage().instance().set(&DataKey::NextId, &next_id);
@@ -474,11 +558,11 @@ impl InvoiceNftContract {
     /// - `risk_score` — Updated risk score (0–100); also recalculates `risk_tier`.
     ///
     /// **Errors:**
-    /// - `KoraError::ProtocolPaused` — Protocol is paused.
-    /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
-    /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
-    /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
-    /// - `KoraError::InvalidAmount` / `KoraError::InvalidDueDate` / `KoraError::InvalidRiskScore` — Validation failures.
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvoiceNotFound` — Invoice does not exist.
+    /// - `InvoiceNftError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
+    /// - `InvoiceNftError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    /// - `InvoiceNftError::InvalidAmount` / `InvoiceNftError::InvalidDueDate` / `InvoiceNftError::InvalidRiskScore` — Validation failures.
     ///
     /// **Security:** Requires `sme.require_auth()`. Rejected once the invoice is listed
     /// or further along in the lifecycle.
@@ -491,7 +575,7 @@ impl InvoiceNftContract {
         due_date: u64,
         ipfs_cid: String,
         risk_score: u32,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -503,10 +587,10 @@ impl InvoiceNftContract {
 
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         if invoice.sme != sme {
-            return Err(KoraError::NotInvoiceOwner);
+            return Err(InvoiceNftError::NotInvoiceOwner);
         }
 
         invoice.debtor_hash = debtor_hash;
@@ -534,10 +618,10 @@ impl InvoiceNftContract {
     /// - `invoice_id` — The ID of the invoice to void.
     ///
     /// **Errors:**
-    /// - `KoraError::ProtocolPaused` — Protocol is paused.
-    /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
-    /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
-    /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvoiceNotFound` — Invoice does not exist.
+    /// - `InvoiceNftError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
+    /// - `InvoiceNftError::NotInvoiceOwner` — Caller is not the invoice's SME.
     ///
     /// **Security:** Requires `sme.require_auth()`. Irreversible — the invoice is deleted
     /// from on-chain storage and cannot be recovered. Outstanding exposure is decremented.
@@ -545,16 +629,16 @@ impl InvoiceNftContract {
         env: Env,
         sme: Address,
         invoice_id: u64,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
 
         let invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         if invoice.sme != sme {
-            return Err(KoraError::NotInvoiceOwner);
+            return Err(InvoiceNftError::NotInvoiceOwner);
         }
 
         env.storage().persistent().remove(&DataKey::Invoice(invoice_id));
@@ -576,17 +660,17 @@ impl InvoiceNftContract {
     /// - `caller` — The marketplace contract address.
     /// - `invoice_id` — The ID of the invoice to list.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Created` status.
-    pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_authorized_caller(&env, &caller, &[DataKey::Marketplace])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Listed;
         env.storage()
@@ -597,23 +681,59 @@ impl InvoiceNftContract {
         Ok(())
     }
 
+    /// Revert a Listed invoice back to Created status. Called by the Marketplace
+    /// contract when a listing is cancelled before any funding has been released.
+    ///
+    /// This allows the SME to re-list the same invoice after cancellation.
+    ///
+    /// **Parameters:**
+    /// - `caller` — The marketplace contract address (must be the authorised marketplace).
+    /// - `invoice_id` — The ID of the invoice to revert.
+    ///
+    /// **Errors:**
+    /// - `InvoiceNftError::Unauthorized` — Caller is not the authorised marketplace.
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvalidInvoiceStatus` — Invoice is not in `Listed` status
+    ///   (already `Funded`, `Repaid`, or `Defaulted`).
+    /// - `InvoiceNftError::InvoiceNotFound` — Invoice does not exist.
+    ///
+    /// **Security:** Requires auth from the caller. Only the authorised marketplace
+    /// address may call this function — unauthorised callers cannot revert status.
+    pub fn set_created(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
+        caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::Marketplace])?;
+        Self::require_not_paused(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
+        let mut invoice = Self::load_invoice(&env, invoice_id)?;
+        if invoice.status != InvoiceStatus::Listed {
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
+        }
+        invoice.status = InvoiceStatus::Created;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id), &invoice);
+        Self::bump_invoice_ttl(&env, invoice_id);
+        events::invoice_created(&env, invoice_id, &invoice.sme, invoice.amount);
+        Ok(())
+    }
+
     /// Transition invoice to Funded. Called by Financing Pool contract.
     ///
     /// **Parameters:**
     /// - `caller` — The investor or financing pool contract address.
     /// - `invoice_id` — The ID of the invoice to fund.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Listed` status.
-    pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Listed {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Funded;
         invoice.funded_at = Some(env.ledger().timestamp());
@@ -631,16 +751,16 @@ impl InvoiceNftContract {
     /// - `caller` — The financing pool contract address.
     /// - `invoice_id` — The ID of the invoice to repay.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Funded` status.
-    pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Repaid;
         invoice.repaid_at = Some(env.ledger().timestamp());
@@ -665,20 +785,20 @@ impl InvoiceNftContract {
     /// - `caller` — The admin address.
     /// - `invoice_id` — The ID of the invoice to mark as defaulted.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires admin auth. Validates that the invoice is `Funded` and the due date has passed.
-    pub fn set_defaulted(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_defaulted(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         let current_time = env.ledger().timestamp();
         if current_time <= invoice.due_date {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Defaulted;
         env.storage()
@@ -704,10 +824,10 @@ impl InvoiceNftContract {
     /// **Parameters:**
     /// - `invoice_id` — The ID of the invoice to retrieve.
     ///
-    /// **Returns:** The complete `Invoice` struct, or `KoraError::InvoiceNotFound` if not found.
+    /// **Returns:** The complete `Invoice` struct, or `InvoiceNftError::InvoiceNotFound` if not found.
     ///
     /// **Security:** This is a read-only view with no authorization check.
-    pub fn get_invoice(env: Env, invoice_id: u64) -> Result<Invoice, KoraError> {
+    pub fn get_invoice(env: Env, invoice_id: u64) -> Result<Invoice, InvoiceNftError> {
         Self::load_invoice(&env, invoice_id)
     }
 
@@ -730,7 +850,7 @@ impl InvoiceNftContract {
         sme: Address,
         invoice_id: u64,
         metadata_hash: Bytes,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
@@ -739,13 +859,13 @@ impl InvoiceNftContract {
 
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.sme != sme {
-            return Err(KoraError::Unauthorized);
+            return Err(InvoiceNftError::Unauthorized);
         }
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         if invoice.metadata_hash.len() != 0 {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(InvoiceNftError::AlreadyInitialized);
         }
 
         invoice.metadata_hash = metadata_hash;
@@ -803,7 +923,7 @@ impl InvoiceNftContract {
     // is_invoice_frozen before executing any state-changing logic.
 
     /// Freeze a specific invoice, blocking fund_invoice and repay for it.
-    pub fn freeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn freeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         // Verify the invoice exists before freezing.
@@ -816,7 +936,7 @@ impl InvoiceNftContract {
     }
 
     /// Unfreeze a previously frozen invoice, restoring normal fund/repay access.
-    pub fn unfreeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn unfreeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         // Verify the invoice exists before unfreezing.
@@ -844,7 +964,7 @@ impl InvoiceNftContract {
     /// - `new_wasm_hash` — SHA-256 hash of the new WASM binary (32 bytes).
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `InvoiceNftError::NotAdmin` — Caller is not the admin.
     ///
     /// **Security:** Requires `admin.require_auth()`. The upgrade cannot be applied until
     /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed via `execute_upgrade`.
@@ -852,7 +972,7 @@ impl InvoiceNftContract {
         env: Env,
         admin: Address,
         new_wasm_hash: BytesN<32>,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -868,23 +988,23 @@ impl InvoiceNftContract {
     /// - `admin` — Must be the current admin address.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
-    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    /// - `InvoiceNftError::NotAdmin` — Caller is not the admin.
+    /// - `InvoiceNftError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `InvoiceNftError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
     ///
     /// **Security:** Requires `admin.require_auth()`. Clears the proposal before executing
     /// to prevent re-entry. Note: `migrate()` must be called by admin immediately after
     /// any upgrade that changes a `#[contracttype]` struct schema.
-    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
             .storage()
             .instance()
             .get(&DataKey::UpgradeProposal)
-            .ok_or(KoraError::NoUpgradeProposed)?;
+            .ok_or(InvoiceNftError::NoUpgradeProposed)?;
         if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
-            return Err(KoraError::UpgradeTimelockNotElapsed);
+            return Err(InvoiceNftError::UpgradeTimelockNotElapsed);
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         events::upgrade_executed(&env, &admin, &wasm_hash);
@@ -895,7 +1015,7 @@ impl InvoiceNftContract {
     // ── Currency Allowlist ────────────────────────────────────────────────────
 
     /// Add a currency symbol to the allowlist. Admin only.
-    pub fn add_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), KoraError> {
+    pub fn add_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -910,7 +1030,7 @@ impl InvoiceNftContract {
     }
 
     /// Remove a currency symbol from the allowlist. Admin only.
-    pub fn remove_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), KoraError> {
+    pub fn remove_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -929,7 +1049,7 @@ impl InvoiceNftContract {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), KoraError> {
+    fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), InvoiceNftError> {
         for key in allowed {
             if let Some(addr) = env.storage().instance().get::<DataKey, Address>(key) {
                 if &addr == caller {
@@ -937,51 +1057,58 @@ impl InvoiceNftContract {
                 }
             }
         }
-        Err(KoraError::Unauthorized)
+        Err(InvoiceNftError::Unauthorized)
     }
 
-    fn load_invoice(env: &Env, id: u64) -> Result<Invoice, KoraError> {
+    fn load_invoice(env: &Env, id: u64) -> Result<Invoice, InvoiceNftError> {
         env.storage()
             .persistent()
             .get(&DataKey::Invoice(id))
-            .ok_or(KoraError::InvoiceNotFound)
+            .ok_or(InvoiceNftError::InvoiceNotFound)
     }
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), InvoiceNftError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(InvoiceNftError::NotInitialized)?;
         if &admin != caller {
-            return Err(KoraError::NotAdmin);
+            return Err(InvoiceNftError::NotAdmin);
         }
         Ok(())
     }
 
-    fn require_allowed_currency(env: &Env, currency: &Symbol) -> Result<(), KoraError> {
+    fn require_allowed_currency(env: &Env, currency: &Symbol) -> Result<(), InvoiceNftError> {
         let allowed: bool = env
             .storage()
             .persistent()
             .get(&DataKey::CurrencyAllowlist(currency.clone()))
             .unwrap_or(false);
         if !allowed {
-            return Err(KoraError::CurrencyNotAllowed);
+            return Err(InvoiceNftError::CurrencyNotAllowed);
         }
         Ok(())
     }
 
-    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+    fn require_not_paused(env: &Env) -> Result<(), InvoiceNftError> {
         let ac: Address = env
             .storage()
             .instance()
             .get(&DataKey::AccessControl)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(InvoiceNftError::NotInitialized)?;
         let client = kora_access_control::AccessControlContractClient::new(env, &ac);
         if client.is_paused() {
-            return Err(KoraError::ProtocolPaused);
+            return Err(InvoiceNftError::ProtocolPaused);
         }
         Ok(())
+    }
+
+    /// Extend the TTL of an arbitrary persistent storage entry to prevent expiry.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
     }
 
     /// Extend the TTL of a persistent invoice entry to prevent expiry.
@@ -999,7 +1126,6 @@ impl InvoiceNftContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kora_shared::errors::KoraError;
     use soroban_sdk::{
         testutils::{Address as _, Ledger, LedgerInfo},
         Bytes, Env, String, Symbol,
@@ -1073,7 +1199,7 @@ mod tests {
         let (env, admin, client) = setup();
         let access_control = Address::generate(&env);
         let result = client.try_initialize(&admin, &access_control);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::AlreadyInitialized);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::AlreadyInitialized);
     }
 
     #[test]
@@ -1138,7 +1264,7 @@ mod tests {
             &sme, &debtor_hash, &0i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidAmount);
     }
 
     #[test]
@@ -1152,7 +1278,7 @@ mod tests {
             &sme, &debtor_hash, &-1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidAmount);
     }
 
     #[test]
@@ -1166,7 +1292,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidDueDate);
     }
 
     #[test]
@@ -1180,7 +1306,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidDueDate);
     }
 
     #[test]
@@ -1194,7 +1320,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &101u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidRiskScore);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidRiskScore);
     }
 
     #[test]
@@ -1208,7 +1334,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyBytes);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::EmptyBytes);
     }
 
     #[test]
@@ -1324,15 +1450,17 @@ mod tests {
 
     #[test]
     fn test_status_transitions_full_lifecycle() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Created);
 
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
         client.set_listed(&marketplace, &id);
         assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
 
-        let pool = Address::generate(&env);
         client.set_funded(&pool, &id);
         assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Funded);
         assert!(client.get_invoice(&id).funded_at.is_some());
@@ -1344,39 +1472,123 @@ mod tests {
 
     #[test]
     fn test_set_listed_invalid_status_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id); // succeeds: Created → Listed
         let result = client.try_set_listed(&marketplace, &id); // fails: already Listed
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
+    }
+
+    // ── set_created ───────────────────────────────────────────────────────────
+
+    /// Marketplace can revert a Listed invoice back to Created.
+    #[test]
+    fn test_set_created_reverts_listed_to_created() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        client.set_listed(&marketplace, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
+
+        client.set_created(&marketplace, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Created);
+    }
+
+    /// set_created on a Created invoice must fail (wrong source status).
+    #[test]
+    fn test_set_created_on_created_invoice_fails() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        let result = client.try_set_created(&marketplace, &id);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
+    }
+
+    /// set_created on a Funded invoice must fail.
+    #[test]
+    fn test_set_created_on_funded_invoice_fails() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
+        client.set_funded(&pool, &id);
+
+        let result = client.try_set_created(&marketplace, &id);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
+    }
+
+    /// Unauthorized address cannot call set_created.
+    #[test]
+    fn test_set_created_unauthorized_rejected() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
+
+        let stranger = Address::generate(&env);
+        let result = client.try_set_created(&stranger, &id);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::Unauthorized);
+    }
+
+    /// After set_created the invoice can be re-listed via set_listed.
+    #[test]
+    fn test_set_created_then_relist_succeeds() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        // List → revert → re-list
+        client.set_listed(&marketplace, &id);
+        client.set_created(&marketplace, &id);
+        assert!(client.try_set_listed(&marketplace, &id).is_ok());
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
     }
 
     #[test]
     fn test_set_funded_invalid_status_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         let result = client.try_set_funded(&pool, &id); // Created → Funded skips Listed
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
     fn test_set_repaid_invalid_status_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         let result = client.try_set_repaid(&pool, &id); // Created → Repaid skips Listed/Funded
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
     fn test_set_funded_idempotent_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         let result = client.try_set_funded(&pool, &id);
         assert!(result.is_err());
@@ -1384,11 +1596,12 @@ mod tests {
 
     #[test]
     fn test_set_repaid_idempotent_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         client.set_repaid(&pool, &id);
         let result = client.try_set_repaid(&pool, &id);
@@ -1421,14 +1634,15 @@ mod tests {
 
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
 
         ac_client.pause(&admin);
 
         let result = client.try_set_repaid(&pool, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::ProtocolPaused);
     }
 
     // ── set_defaulted ─────────────────────────────────────────────────────────
@@ -1438,11 +1652,12 @@ mod tests {
         let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         let result = client.try_set_defaulted(&admin, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
@@ -1462,12 +1677,13 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         env.ledger().set(LedgerInfo { timestamp: due_date, ..env.ledger().get() });
         let result = client.try_set_defaulted(&admin, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
@@ -1487,8 +1703,9 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         env.ledger().set(LedgerInfo { timestamp: due_date + 1, ..env.ledger().get() });
         client.set_defaulted(&admin, &id);
@@ -1497,7 +1714,7 @@ mod tests {
 
     #[test]
     fn test_set_defaulted_requires_admin() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let cid = ipfs_cid(&env);
@@ -1512,13 +1729,14 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         env.ledger().set(LedgerInfo { timestamp: due_date + 1, ..env.ledger().get() });
         let non_admin = Address::generate(&env);
         let result = client.try_set_defaulted(&non_admin, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::NotAdmin);
     }
 
     #[test]
@@ -1630,14 +1848,14 @@ mod tests {
     fn test_get_nonexistent_invoice_fails() {
         let (_env, _admin, client) = setup();
         let result = client.try_get_invoice(&9999u64);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvoiceNotFound);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvoiceNotFound);
     }
 
     // ── timestamps ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_invoice_timestamps_recorded() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let cid = ipfs_cid(&env);
@@ -1652,9 +1870,10 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id);
 
-        let pool = Address::generate(&env);
         let funded_ts = env.ledger().timestamp();
         client.set_funded(&pool, &id);
         assert_eq!(client.get_invoice(&id).funded_at, Some(funded_ts));
@@ -1701,22 +1920,25 @@ mod tests {
 
     #[test]
     fn test_invalid_status_transition_created_to_funded_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         let result = client.try_set_funded(&pool, &id); // Created → Funded skips Listed
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
     fn test_invalid_status_transition_listed_to_repaid_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         let result = client.try_set_repaid(&pool, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
@@ -1843,11 +2065,13 @@ mod tests {
             funded_at: None,
             repaid_at: None,
         };
-        env.storage().persistent().set(&DataKey::Invoice(1u64), &old_record);
-        // Advance NextId so migrate() knows to scan ID 1.
-        env.storage().instance().set(&DataKey::NextId, &2u64);
-        // Force stored version back to 1 so migrate() re-runs the v1→v2 step.
-        env.storage().instance().set(&DataKey::MigrationVersion, &1u32);
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(&DataKey::Invoice(1u64), &old_record);
+            // Advance NextId so migrate() knows to scan ID 1.
+            env.storage().instance().set(&DataKey::NextId, &2u64);
+            // Force stored version back to 1 so migrate() re-runs the v1→v2 step.
+            env.storage().instance().set(&DataKey::MigrationVersion, &1u32);
+        });
 
         // Run migration — should rewrite the record with notes = None.
         client.migrate(&admin);
@@ -1886,6 +2110,8 @@ mod tests {
         assert_eq!(invoice.status, InvoiceStatus::Created);
 
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &invoice_id);
         assert_eq!(client.get_invoice(&invoice_id).status, InvoiceStatus::Listed);
     }
@@ -1913,7 +2139,7 @@ mod tests {
 
     #[test]
     fn test_outstanding_exposure_released_on_repaid() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let ipfs_cid = String::from_str(
@@ -1927,6 +2153,7 @@ mod tests {
         );
         let mp = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &mp, &pool);
         client.set_listed(&mp, &id);
         client.set_funded(&pool, &id);
         client.set_repaid(&pool, &id);
@@ -1999,12 +2226,12 @@ mod tests {
         let result = client.try_amend_invoice(
             &other, &id, &debtor_hash, &1_000_000_000i128, &due_date, &ipfs_cid, &10u32,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotInvoiceOwner);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::NotInvoiceOwner);
     }
 
     #[test]
     fn test_amend_invoice_after_listing_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let ipfs_cid = String::from_str(
@@ -2017,11 +2244,13 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id);
         let result = client.try_amend_invoice(
             &sme, &id, &debtor_hash, &1_000_000_000i128, &due_date, &ipfs_cid, &10u32,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     // ── withdraw_invoice ──────────────────────────────────────────────────────
@@ -2042,7 +2271,7 @@ mod tests {
         );
         client.withdraw_invoice(&sme, &id);
         let result = client.try_get_invoice(&id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvoiceNotFound);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvoiceNotFound);
     }
 
     #[test]
@@ -2061,12 +2290,12 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let result = client.try_withdraw_invoice(&other, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotInvoiceOwner);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::NotInvoiceOwner);
     }
 
     #[test]
     fn test_withdraw_invoice_after_listing_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let ipfs_cid = String::from_str(
@@ -2079,9 +2308,11 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id);
         let result = client.try_withdraw_invoice(&sme, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     // ── Per-invoice emergency freeze ──────────────────────────────────────────
@@ -2096,7 +2327,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         )
     }
 
@@ -2112,7 +2343,7 @@ mod tests {
         let (env, admin, client) = setup();
         let id = mint_one(&env, &client);
         assert!(!client.is_invoice_frozen(&id));
-        client.freeze_invoice(&admin, &id).unwrap();
+        client.freeze_invoice(&admin, &id);
         assert!(client.is_invoice_frozen(&id));
     }
 
@@ -2120,9 +2351,9 @@ mod tests {
     fn test_unfreeze_invoice_clears_frozen_flag() {
         let (env, admin, client) = setup();
         let id = mint_one(&env, &client);
-        client.freeze_invoice(&admin, &id).unwrap();
+        client.freeze_invoice(&admin, &id);
         assert!(client.is_invoice_frozen(&id));
-        client.unfreeze_invoice(&admin, &id).unwrap();
+        client.unfreeze_invoice(&admin, &id);
         assert!(!client.is_invoice_frozen(&id));
     }
 
@@ -2135,7 +2366,7 @@ mod tests {
             .try_freeze_invoice(&stranger, &id)
             .unwrap_err()
             .unwrap();
-        assert_eq!(err, KoraError::NotAdmin);
+        assert_eq!(err, InvoiceNftError::NotAdmin);
     }
 
     #[test]
@@ -2145,6 +2376,6 @@ mod tests {
             .try_freeze_invoice(&admin, &9999u64)
             .unwrap_err()
             .unwrap();
-        assert_eq!(err, KoraError::InvoiceNotFound);
+        assert_eq!(err, InvoiceNftError::InvoiceNotFound);
     }
 }
