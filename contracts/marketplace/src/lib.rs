@@ -204,7 +204,8 @@ impl MarketplaceContract {
         }
         env.storage()
             .persistent()
-            .remove(&DataKey::WhitelistedToken(token));
+            .remove(&DataKey::WhitelistedToken(token.clone()));
+        events::token_whitelist_removed(&env, &admin, &token);
         Ok(())
     }
 
@@ -1066,6 +1067,73 @@ mod tests {
         let new_token = Address::generate(&t.env);
         let result = t.mp.try_whitelist_token(&stranger, &new_token);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+    }
+
+    // ── remove_token_whitelist ────────────────────────────────────────────────
+
+    #[test]
+    fn test_remove_token_whitelist_success() {
+        let t = deploy();
+        let new_token = Address::generate(&t.env);
+        t.mp.whitelist_token(&t.admin, &new_token);
+        assert!(t.mp.is_token_whitelisted(&new_token));
+        t.mp.remove_token_whitelist(&t.admin, &new_token);
+        assert!(!t.mp.is_token_whitelisted(&new_token));
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_non_admin_rejected() {
+        let t = deploy();
+        let stranger = Address::generate(&t.env);
+        let new_token = Address::generate(&t.env);
+        t.mp.whitelist_token(&t.admin, &new_token);
+        let result = t.mp.try_remove_token_whitelist(&stranger, &new_token);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+        assert!(t.mp.is_token_whitelisted(&new_token));
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_not_whitelisted_rejected() {
+        let t = deploy();
+        let new_token = Address::generate(&t.env);
+        let result = t.mp.try_remove_token_whitelist(&t.admin, &new_token);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_blocks_new_listing() {
+        let t = deploy();
+        // t.token is whitelisted by deploy(); remove it, then listing must fail.
+        t.mp.remove_token_whitelist(&t.admin, &t.token);
+        assert!(!t.mp.is_token_whitelisted(&t.token));
+
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_000i128,
+            &10_000i128,
+            &t.token,
+            &deadline,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_existing_listing_unaffected() {
+        let t = deploy();
+        let id = list_one(&t);
+        // Remove the whitelist for the token used by the already-created listing.
+        t.mp.remove_token_whitelist(&t.admin, &t.token);
+        assert!(!t.mp.is_token_whitelisted(&t.token));
+
+        // The existing listing must remain funded-able despite the removal.
+        let listing = t.mp.get_listing(&id);
+        assert!(listing.is_active);
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_fund_invoice(&investor, &id, &1_000_000i128);
+        assert!(result.is_ok());
     }
 
     // ── list_invoice ──────────────────────────────────────────────────────────

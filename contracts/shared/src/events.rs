@@ -245,6 +245,15 @@ pub fn token_whitelisted(env: &Env, actor: &Address, token: &Address) {
     );
 }
 
+/// Schema: (actor=admin, token, timestamp)
+pub fn token_whitelist_removed(env: &Env, actor: &Address, token: &Address) {
+    emit(
+        env,
+        symbol_short!("TOK_UNWL"),
+        (actor.clone(), token.clone(), env.ledger().timestamp()),
+    );
+}
+
 /// Schema: (actor=current_admin, new_admin, timestamp)
 pub fn admin_transferred(env: &Env, actor: &Address, new_admin: &Address) {
     emit(
