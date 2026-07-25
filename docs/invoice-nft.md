@@ -465,10 +465,14 @@ admin calls invoice_nft.set_defaulted(admin_address, invoice_id)
 - No on-chain verification that the underlying invoice is real
 - Mitigated off-chain by the verifier network's KYC/KYB checks
 
-### TTL Management
-- Invoice NFT storage entries expire if TTL is not extended
-- Protocol operator or keeper bot must periodically extend TTL
-- Failure to do so could result in invoice data loss
+### TTL Management (Fixed in v1.1)
+- **[FIXED]** Invoice storage entries now have their TTL extended on all state transitions:
+  - `mint_invoice()`, `mint_invoices_batch()`, `amend_invoice()`
+  - `set_listed()`, `set_funded()`, `set_repaid()`, `set_defaulted()`
+  - `commit_metadata_hash()`
+- Previously, `set_repaid()` and `commit_metadata_hash()` did not refresh the TTL, leaving repaid invoices (terminal state, rarely touched) vulnerable to expiry
+- TTL extension now uses unified shared constants (`DEFAULT_TTL_THRESHOLD`, `DEFAULT_TTL_BUMP`) from `kora_shared::validation::extend_persistent_ttl`
+- Protocol operator should still monitor persistent storage to ensure TTL stays healthy
 
 ### No Signature Delegation
 - Only the SME can mint their own invoices (no delegation mechanism)
