@@ -201,7 +201,7 @@ impl TreasuryContract {
     /// - `KoraError::TokenNotWhitelisted` — Token is not whitelisted.
     /// - `KoraError::WithdrawalRateLimitExceeded` — Would exceed the rolling 24 h cap.
     /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
-    /// - `KoraError::InsufficientPoolBalance` — Contract balance is less than `amount`.
+    /// - `KoraError::InsufficientFunds` — Contract balance is less than `amount`.
     ///
     /// **Security:** Requires `admin.require_auth()`. Subject to the rolling 24 h withdrawal cap.
     /// Protected against reentrancy via RAII `ReentrancyGuard`.
@@ -229,7 +229,7 @@ impl TreasuryContract {
         let balance = token_client.balance(&env.current_contract_address());
 
         if balance < amount {
-            return Err(KoraError::InsufficientPoolBalance);
+            return Err(KoraError::InsufficientFunds);
         }
 
         // ── Effects ───────────────────────────────────────────────────────────
@@ -332,8 +332,8 @@ impl TreasuryContract {
     ///
     /// **Errors:**
     /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::NoCapChangeProposed` — No withdrawal cap proposal is pending.
-    /// - `KoraError::WithdrawalCapTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    /// - `KoraError::NoUpgradeProposed` — No withdrawal cap proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
     ///
     /// **Security:** Requires `admin.require_auth()`. Clears the proposal atomically before
     /// applying the new cap. Emits `withdrawal_cap_updated` event.
@@ -344,9 +344,9 @@ impl TreasuryContract {
             .storage()
             .instance()
             .get(&DataKey::WithdrawalCapProposal)
-            .ok_or(KoraError::NoCapChangeProposed)?;
+            .ok_or(KoraError::NoUpgradeProposed)?;
         if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
-            return Err(KoraError::WithdrawalCapTimelockNotElapsed);
+            return Err(KoraError::UpgradeTimelockNotElapsed);
         }
         let old_cap: i128 = env
             .storage()

@@ -36,7 +36,7 @@ pub fn invoice_created(env: &Env, invoice_id: u64, sme: &Address, amount: i128) 
 pub fn invoice_listed(env: &Env, invoice_id: u64, seller: &Address, asking_price: i128) {
     emit(
         env,
-        symbol_short!("INV_LISTED"),
+        symbol_short!("INV_LIST"),
         (
             seller.clone(),
             invoice_id,
@@ -51,7 +51,7 @@ pub fn invoice_listed(env: &Env, invoice_id: u64, seller: &Address, asking_price
 pub fn invoice_funded(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
     emit(
         env,
-        symbol_short!("INV_FUNDED"),
+        symbol_short!("INV_FUND"),
         (
             investor.clone(),
             invoice_id,
@@ -111,7 +111,7 @@ pub fn repayment_made(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
 pub fn installment_paid(env: &Env, invoice_id: u64, payer: &Address, index: u32, amount: i128) {
     emit(
         env,
-        symbol_short!("INSTLMT_PAID"),
+        symbol_short!("INSTLPAID"),
         (payer.clone(), invoice_id, index, amount, env.ledger().timestamp()),
     );
 }
@@ -130,7 +130,7 @@ pub fn yield_distributed(env: &Env, invoice_id: u64, investor: &Address, yield_a
 pub fn late_penalty_applied(env: &Env, invoice_id: u64, penalty_amount: i128, total_owed: i128) {
     emit(
         env,
-        symbol_short!("PROTOCOL_LATE_PEN"),
+        symbol_short!("LATE_PEN"),
         (invoice_id, penalty_amount, total_owed, env.ledger().timestamp()),
     );
 }
@@ -169,7 +169,7 @@ pub fn fee_collected(
 ) {
     emit(
         env,
-        symbol_short!("TREAS_FEE_COLLECTED"),
+        symbol_short!("FEE_COLL"),
         (
             investor.clone(),
             invoice_id,
@@ -231,7 +231,7 @@ pub fn protocol_paused(env: &Env, by: &Address) {
 pub fn protocol_unpaused(env: &Env, by: &Address) {
     emit(
         env,
-        symbol_short!("AC_UNPAUSED"),
+        symbol_short!("AC_UNPSD"),
         (by.clone(), env.ledger().timestamp()),
     );
 }
@@ -278,7 +278,7 @@ pub fn role_revoked(env: &Env, admin: &Address, target: &Address) {
 pub fn pool_opened(env: &Env, marketplace: &Address, invoice_id: u64, token: &Address, face_value: i128) {
     emit(
         env,
-        symbol_short!("POOL_OPENED"),
+        symbol_short!("POOL_OPN"),
         (
             marketplace.clone(),
             invoice_id,
@@ -300,7 +300,7 @@ pub fn position_recorded(
 ) {
     emit(
         env,
-        symbol_short!("POS_RECORDED"),
+        symbol_short!("POS_RECD"),
         (
             admin.clone(),
             invoice_id,
@@ -318,7 +318,7 @@ pub fn position_recorded(
 pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
-        symbol_short!("RISK_VERIFIER_ADDED"),
+        symbol_short!("VRF_ADDED"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
 }
@@ -327,7 +327,7 @@ pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
 pub fn verifier_removed(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
-        symbol_short!("RISK_VERIFIER_REMOVED"),
+        symbol_short!("VRF_RMVD"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
 }
@@ -336,7 +336,7 @@ pub fn verifier_removed(env: &Env, admin: &Address, verifier: &Address) {
 pub fn sme_registered(env: &Env, verifier: &Address, sme: &Address, risk_score: u32) {
     emit(
         env,
-        symbol_short!("RISK_SME_REGISTERED"),
+        symbol_short!("SME_REG"),
         (verifier.clone(), sme.clone(), risk_score, env.ledger().timestamp()),
     );
 }
@@ -345,7 +345,7 @@ pub fn sme_registered(env: &Env, verifier: &Address, sme: &Address, risk_score: 
 pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score: u32) {
     emit(
         env,
-        symbol_short!("RISK_SME_SCORE_UPDATED"),
+        symbol_short!("SME_SCORE"),
         (verifier.clone(), sme.clone(), new_score, env.ledger().timestamp()),
     );
 }
@@ -354,7 +354,7 @@ pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score
 pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_defaults: u32) {
     emit(
         env,
-        symbol_short!("RISK_SME_DEFAULT_REC"),
+        symbol_short!("SME_DFLT"),
         (admin.clone(), sme.clone(), total_defaults, env.ledger().timestamp()),
     );
 }
@@ -363,7 +363,7 @@ pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_def
 pub fn sme_invoice_count_incremented(env: &Env, sme: &Address, new_total: u32) {
     emit(
         env,
-        symbol_short!("RISK_SME_INV_COUNT"),
+        symbol_short!("SME_INVCT"),
         (sme.clone(), new_total, env.ledger().timestamp()),
     );
 }
@@ -372,7 +372,7 @@ pub fn sme_invoice_count_incremented(env: &Env, sme: &Address, new_total: u32) {
 pub fn debtor_score_set(env: &Env, verifier: &Address, debtor_hash: &Bytes, score: u32) {
     emit(
         env,
-        symbol_short!("RISK_DEBTOR_SCORE_SET"),
+        symbol_short!("DBT_SCORE"),
         (
             verifier.clone(),
             debtor_hash.clone(),
@@ -395,7 +395,7 @@ pub fn registry_initialized(env: &Env, admin: &Address, invoice_nft: &Address) {
 pub fn sub_account_added(env: &Env, primary: &Address, sub_account: &Address) {
     emit(
         env,
-        symbol_short!("VRF_SUB_ADD"),
+        symbol_short!("VRF_SADD"),
         (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
     );
 }
@@ -404,7 +404,7 @@ pub fn sub_account_added(env: &Env, primary: &Address, sub_account: &Address) {
 pub fn sub_account_removed(env: &Env, primary: &Address, sub_account: &Address) {
     emit(
         env,
-        symbol_short!("VRF_SUB_RMV"),
+        symbol_short!("VRF_SRMV"),
         (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
     );
 }
@@ -415,7 +415,7 @@ pub fn sub_account_removed(env: &Env, primary: &Address, sub_account: &Address) 
 pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
     emit(
         env,
-        symbol_short!("AC_UPGRADE_PROPOSED"),
+        symbol_short!("AC_UPG_PR"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
 }
@@ -424,7 +424,7 @@ pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
 pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
     emit(
         env,
-        symbol_short!("AC_UPGRADE_EXECUTED"),
+        symbol_short!("AC_UPG_EX"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
 }
@@ -436,7 +436,7 @@ pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
 pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
     emit(
         env,
-        symbol_short!("AC_MULTISIG_CFG"),
+        symbol_short!("MSIG_CFG"),
         (threshold, signer_count, env.ledger().timestamp()),
     );
 }
@@ -445,7 +445,7 @@ pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
 pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
     emit(
         env,
-        symbol_short!("AC_ACTION_PROPOSED"),
+        symbol_short!("ACT_PROP"),
         (proposal_id, proposer.clone(), env.ledger().timestamp()),
     );
 }
@@ -454,7 +454,7 @@ pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
 pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval_count: u32) {
     emit(
         env,
-        symbol_short!("AC_ACTION_APPROVED"),
+        symbol_short!("ACT_APPR"),
         (
             proposal_id,
             approver.clone(),
@@ -468,7 +468,7 @@ pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval
 pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
     emit(
         env,
-        symbol_short!("AC_ACTION_EXECUTED"),
+        symbol_short!("ACT_EXEC"),
         (proposal_id, executor.clone(), env.ledger().timestamp()),
     );
 }
@@ -479,7 +479,7 @@ pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
 pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
     emit(
         env,
-        symbol_short!("PROTOCOL_REFUND_CLAIMED"),
+        symbol_short!("REFUND_CL"),
         (
             investor.clone(),
             invoice_id,
@@ -533,7 +533,7 @@ pub fn withdrawal_cap_updated(env: &Env, admin: &Address, old_cap: i128, new_cap
 pub fn sme_credit_limit_set(env: &Env, verifier: &Address, sme: &Address, credit_limit: i128) {
     emit(
         env,
-        symbol_short!("SME_CL_SET"),
+        symbol_short!("SME_CLSET"),
         (verifier.clone(), sme.clone(), credit_limit, env.ledger().timestamp()),
     );
 }
@@ -566,6 +566,47 @@ pub fn cancellation_requested(env: &Env, invoice_id: u64, caller: &Address) {
         env,
         symbol_short!("CXL_REQ"),
         (caller.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+// ── Metadata Hash Dispute Events ──────────────────────────────────────────────
+
+/// Schema: (actor=challenger, invoice_id, timestamp)
+pub fn metadata_mismatch_flagged(env: &Env, invoice_id: u64, challenger: &Address) {
+    emit(
+        env,
+        symbol_short!("MTD_DISP"),
+        (challenger.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, invoice_id, upheld, timestamp)
+pub fn metadata_dispute_resolved(env: &Env, invoice_id: u64, admin: &Address, upheld: bool) {
+    emit(
+        env,
+        symbol_short!("MTD_RES"),
+        (admin.clone(), invoice_id, upheld, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, invoice_id, old_hash, new_hash, timestamp)
+pub fn metadata_hash_corrected(
+    env: &Env,
+    invoice_id: u64,
+    admin: &Address,
+    old_hash: &Bytes,
+    new_hash: &Bytes,
+) {
+    emit(
+        env,
+        symbol_short!("MTD_CORR"),
+        (
+            admin.clone(),
+            invoice_id,
+            old_hash.clone(),
+            new_hash.clone(),
+            env.ledger().timestamp(),
+        ),
     );
 }
 

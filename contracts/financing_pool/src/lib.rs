@@ -385,7 +385,7 @@ impl FinancingPoolContract {
 
         if pool.is_closed {
             env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
-            return Err(KoraError::RepaymentAlreadyMade);
+            return Err(KoraError::PoolAlreadyClosed);
         }
 
         // Fetch invoice for due_date check and currency conversion
@@ -413,7 +413,7 @@ impl FinancingPoolContract {
             if idx >= len {
                 // All installments already satisfied — pool should have been closed.
                 env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
-                return Err(KoraError::RepaymentAlreadyMade);
+                return Err(KoraError::PoolAlreadyClosed);
             }
             let installment = schedule.installments.get(idx).unwrap();
 
