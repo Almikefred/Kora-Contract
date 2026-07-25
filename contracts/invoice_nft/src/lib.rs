@@ -13,6 +13,7 @@
 //! See [Invoice NFT Model](../../../docs/invoice-nft.md) for detailed architecture.
 
 use kora_shared::{
+    audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
@@ -78,6 +79,13 @@ pub enum DataKey {
     /// Checked by marketplace.fund_invoice and financing_pool.repay in addition
     /// to the protocol-wide pause, enabling targeted freeze of disputed invoices.
     InvoiceFrozen(u64),
+    // ── Admin audit log ───────────────────────────────────────────────────────
+    /// Next write position in the admin audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
+    AuditLogHead,
+    /// Total admin actions ever recorded (monotonic; not capped at ring size).
+    AuditLogTotal,
+    /// An admin audit log entry at ring-buffer position `n`.
+    AuditEntry(u64),
 }
 
 /// Input type for a single invoice within a batch mint operation.
@@ -182,6 +190,7 @@ impl InvoiceNftContract {
         Self::require_admin(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &risk_registry)?;
         env.storage().instance().set(&DataKey::RiskRegistry, &risk_registry);
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftSetRiskRegistry);
         Ok(())
     }
 
@@ -197,6 +206,7 @@ impl InvoiceNftContract {
     pub fn migrate(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftMigrate);
 
         let current_version: u32 = env
             .storage()
@@ -278,6 +288,7 @@ impl InvoiceNftContract {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Marketplace, &marketplace);
         env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftSetAuthorizedCallers);
         Ok(())
     }
 
@@ -388,7 +399,7 @@ impl InvoiceNftContract {
             &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
         );
 
-        events::invoice_created(&env, id, &sme, invoice.amount);
+        events::invoice_created(&env, id, &sme, invoice.amount, invoice.currency.clone());
         Ok(id)
     }
 
@@ -448,7 +459,7 @@ impl InvoiceNftContract {
 
             env.storage().persistent().set(&DataKey::Invoice(id), &invoice);
             Self::bump_invoice_ttl(&env, id);
-            events::invoice_created(&env, id, &sme, invoice.amount);
+            events::invoice_created(&env, id, &sme, invoice.amount, invoice.currency.clone());
             ids.push_back(id);
 
             next_id = next_id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?;
@@ -520,7 +531,7 @@ impl InvoiceNftContract {
             .persistent()
             .set(&DataKey::Invoice(invoice_id), &invoice);
         Self::bump_invoice_ttl(&env, invoice_id);
-        events::invoice_amended(&env, invoice_id, &sme);
+        events::invoice_amended(&env, invoice_id, &sme, invoice.currency.clone());
         Ok(())
     }
 
@@ -566,7 +577,7 @@ impl InvoiceNftContract {
             &DataKey::OutstandingExposure(invoice.sme.clone()),
             &prev.saturating_sub(invoice.amount),
         );
-        events::invoice_withdrawn(&env, invoice_id, &sme);
+        events::invoice_withdrawn(&env, invoice_id, &sme, invoice.currency.clone());
         Ok(())
     }
 
@@ -593,7 +604,7 @@ impl InvoiceNftContract {
             .persistent()
             .set(&DataKey::Invoice(invoice_id), &invoice);
         Self::bump_invoice_ttl(&env, invoice_id);
-        events::invoice_listed(&env, invoice_id, &invoice.sme, invoice.amount);
+        events::invoice_listed(&env, invoice_id, &invoice.sme, invoice.amount, invoice.currency.clone());
         Ok(())
     }
 
@@ -621,7 +632,7 @@ impl InvoiceNftContract {
             .persistent()
             .set(&DataKey::Invoice(invoice_id), &invoice);
         Self::bump_invoice_ttl(&env, invoice_id);
-        events::invoice_funded(&env, invoice_id, &caller, invoice.amount);
+        events::invoice_funded(&env, invoice_id, &caller, invoice.amount, invoice.currency.clone());
         Ok(())
     }
 
@@ -655,7 +666,7 @@ impl InvoiceNftContract {
             &DataKey::OutstandingExposure(invoice.sme.clone()),
             &prev.saturating_sub(invoice.amount),
         );
-        events::invoice_repaid(&env, invoice_id, &invoice.sme, invoice.amount);
+        events::invoice_repaid(&env, invoice_id, &invoice.sme, invoice.amount, invoice.currency.clone());
         Ok(())
     }
 
@@ -693,7 +704,8 @@ impl InvoiceNftContract {
             &DataKey::OutstandingExposure(invoice.sme.clone()),
             &prev.saturating_sub(invoice.amount),
         );
-        events::invoice_defaulted(&env, invoice_id, &invoice.sme);
+        Self::append_audit_entry(&env, &caller, AdminActionType::InvoiceNftSetDefaulted);
+        events::invoice_defaulted(&env, invoice_id, &invoice.sme, invoice.amount, invoice.currency.clone());
         Ok(())
     }
 
@@ -811,6 +823,7 @@ impl InvoiceNftContract {
         let key = DataKey::InvoiceFrozen(invoice_id);
         env.storage().persistent().set(&key, &true);
         Self::bump_persistent(&env, &key);
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftFreezeInvoice);
         events::invoice_frozen(&env, invoice_id, &admin);
         Ok(())
     }
@@ -823,6 +836,7 @@ impl InvoiceNftContract {
         Self::load_invoice(&env, invoice_id)?;
         let key = DataKey::InvoiceFrozen(invoice_id);
         env.storage().persistent().remove(&key);
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftUnfreezeInvoice);
         events::invoice_unfrozen(&env, invoice_id, &admin);
         Ok(())
     }
@@ -858,6 +872,7 @@ impl InvoiceNftContract {
         env.storage()
             .instance()
             .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftProposeUpgrade);
         events::upgrade_proposed(&env, &admin, &new_wasm_hash);
         Ok(())
     }
@@ -887,6 +902,7 @@ impl InvoiceNftContract {
             return Err(KoraError::UpgradeTimelockNotElapsed);
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftExecuteUpgrade);
         events::upgrade_executed(&env, &admin, &wasm_hash);
         env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
@@ -906,6 +922,7 @@ impl InvoiceNftContract {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_BUMP,
         );
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftAddAllowedCurrency);
         Ok(())
     }
 
@@ -916,6 +933,7 @@ impl InvoiceNftContract {
         env.storage()
             .persistent()
             .remove(&DataKey::CurrencyAllowlist(currency));
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftRemoveAllowedCurrency);
         Ok(())
     }
 
@@ -927,7 +945,86 @@ impl InvoiceNftContract {
             .unwrap_or(false)
     }
 
+    // ── Audit Log ─────────────────────────────────────────────────────────────
+
+    /// Return a page of admin audit log entries, newest first.
+    /// `page` is 0-indexed; `page_size` is clamped to 1–50.
+    pub fn get_audit_log(env: Env, page: u32, page_size: u32) -> Vec<AdminAuditEntry> {
+        let page_size = (page_size.max(1).min(50)) as u64;
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+        let stored = total.min(MAX_AUDIT_LOG_SIZE);
+
+        let skip = (page as u64).saturating_mul(page_size);
+        let mut results = Vec::new(&env);
+
+        let mut i: u64 = 0;
+        while i < page_size {
+            let offset = skip + i;
+            if offset >= stored {
+                break;
+            }
+            // Walk backwards from the most recently written slot.
+            let pos = (head + MAX_AUDIT_LOG_SIZE - 1 - offset) % MAX_AUDIT_LOG_SIZE;
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AdminAuditEntry>(&DataKey::AuditEntry(pos))
+            {
+                results.push_back(entry);
+            }
+            i += 1;
+        }
+
+        results
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// Append one entry to the ring-buffer admin audit log and emit the canonical event.
+    fn append_audit_entry(env: &Env, actor: &Address, action: AdminActionType) {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+
+        let entry = AdminAuditEntry {
+            sequence: total,
+            timestamp: env.ledger().timestamp(),
+            actor: actor.clone(),
+            action,
+            source: AuditSource::InvoiceNft,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditEntry(head), &entry);
+        Self::bump_persistent(env, &DataKey::AuditEntry(head));
+
+        events::admin_action_audited(env, &entry);
+
+        let next_head = (head + 1) % MAX_AUDIT_LOG_SIZE;
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogHead, &next_head);
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogTotal, &(total + 1));
+    }
 
     fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), KoraError> {
         for key in allowed {
@@ -991,6 +1088,13 @@ impl InvoiceNftContract {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_BUMP,
         );
+    }
+
+    /// Extend the TTL of an arbitrary persistent storage entry to prevent expiry.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
     }
 }
 
@@ -2096,7 +2200,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         )
     }
 
@@ -2146,5 +2250,118 @@ mod tests {
             .unwrap_err()
             .unwrap();
         assert_eq!(err, KoraError::InvoiceNotFound);
+    }
+
+    // ── Admin audit log (issue #419) ──────────────────────────────────────────
+
+    #[test]
+    fn test_set_risk_registry_emits_audit_entry() {
+        let (env, admin, client) = setup();
+        let rr = Address::generate(&env);
+        client.set_risk_registry(&admin, &rr);
+
+        let log = client.get_audit_log(&0u32, &10u32);
+        assert_eq!(log.len(), 1);
+        let entry = log.get(0).unwrap();
+        assert_eq!(entry.action, AdminActionType::InvoiceNftSetRiskRegistry);
+        assert_eq!(entry.actor, admin);
+        assert_eq!(entry.source, AuditSource::InvoiceNft);
+        assert_eq!(entry.sequence, 0);
+    }
+
+    #[test]
+    fn test_freeze_and_unfreeze_invoice_emit_audit_entries_in_sequence() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+        client.freeze_invoice(&admin, &id);
+        client.unfreeze_invoice(&admin, &id);
+
+        // get_audit_log returns newest first.
+        let log = client.get_audit_log(&0u32, &10u32);
+        assert_eq!(log.len(), 2);
+        let newest = log.get(0).unwrap();
+        assert_eq!(newest.action, AdminActionType::InvoiceNftUnfreezeInvoice);
+        assert_eq!(newest.sequence, 1);
+        let oldest = log.get(1).unwrap();
+        assert_eq!(oldest.action, AdminActionType::InvoiceNftFreezeInvoice);
+        assert_eq!(oldest.sequence, 0);
+    }
+
+    #[test]
+    fn test_set_defaulted_emits_audit_entry() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400;
+        let id = client.mint_invoice(
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &cid,
+            &10u32, &None,
+        );
+        let marketplace = Address::generate(&env);
+        client.set_listed(&marketplace, &id);
+        let pool = Address::generate(&env);
+        client.set_funded(&pool, &id);
+        env.ledger().set(LedgerInfo { timestamp: due_date + 1, ..env.ledger().get() });
+        client.set_defaulted(&admin, &id);
+
+        let log = client.get_audit_log(&0u32, &10u32);
+        assert_eq!(log.len(), 1);
+        let entry = log.get(0).unwrap();
+        assert_eq!(entry.action, AdminActionType::InvoiceNftSetDefaulted);
+        assert_eq!(entry.actor, admin);
+    }
+
+    #[test]
+    fn test_propose_and_execute_upgrade_emit_audit_entries() {
+        let (env, admin, client) = setup();
+        let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash);
+
+        // execute_upgrade's audit entry is appended before the actual WASM swap
+        // (env.deployer().update_current_contract_wasm), which requires a real
+        // uploaded contract binary and so can't be exercised in this unit-test
+        // environment. Invoke the same append_audit_entry call the real
+        // execute_upgrade path makes to verify the ring buffer sequences both
+        // upgrade actions correctly.
+        let contract_id = client.address.clone();
+        env.as_contract(&contract_id, || {
+            InvoiceNftContract::append_audit_entry(
+                &env,
+                &admin,
+                AdminActionType::InvoiceNftExecuteUpgrade,
+            );
+        });
+
+        let log = client.get_audit_log(&0u32, &10u32);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.get(0).unwrap().action, AdminActionType::InvoiceNftExecuteUpgrade);
+        assert_eq!(log.get(0).unwrap().sequence, 1);
+        assert_eq!(log.get(1).unwrap().action, AdminActionType::InvoiceNftProposeUpgrade);
+        assert_eq!(log.get(1).unwrap().sequence, 0);
+    }
+
+    #[test]
+    fn test_get_audit_log_pagination() {
+        let (env, admin, client) = setup();
+        let rr = Address::generate(&env);
+        client.set_risk_registry(&admin, &rr);
+        let id = mint_one(&env, &client);
+        client.freeze_invoice(&admin, &id);
+        client.unfreeze_invoice(&admin, &id);
+
+        let page0 = client.get_audit_log(&0u32, &2u32);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page0.get(0).unwrap().action, AdminActionType::InvoiceNftUnfreezeInvoice);
+        assert_eq!(page0.get(1).unwrap().action, AdminActionType::InvoiceNftFreezeInvoice);
+
+        let page1 = client.get_audit_log(&1u32, &2u32);
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1.get(0).unwrap().action, AdminActionType::InvoiceNftSetRiskRegistry);
     }
 }

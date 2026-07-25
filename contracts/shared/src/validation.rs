@@ -52,23 +52,6 @@ pub fn require_non_negative_amount(amount: i128) -> Result<(), KoraError> {
     Ok(())
 }
 
-/// Reject amounts outside [0, max].
-///
-/// # Examples
-/// ```ignore
-/// use kora_shared::validation::require_amount_within_bounds;
-/// assert!(require_amount_within_bounds(50, 100).is_ok());
-/// assert!(require_amount_within_bounds(100, 100).is_ok());
-/// assert!(require_amount_within_bounds(101, 100).is_err());
-/// assert!(require_amount_within_bounds(-1, 100).is_err());
-/// ```
-pub fn require_amount_within_bounds(amount: i128, max: i128) -> Result<(), KoraError> {
-    if amount < 0 || amount > max {
-        return Err(KoraError::InvalidAmount);
-    }
-    Ok(())
-}
-
 // ── Timestamp guards ──────────────────────────────────────────────────────────
 
 /// Reject timestamps that are not strictly in the future relative to the
@@ -533,14 +516,6 @@ mod tests {
     }
 
     #[test]
-    fn test_require_amount_within_bounds() {
-        assert!(require_amount_within_bounds(-1, 100).is_err());
-        assert!(require_amount_within_bounds(0, 100).is_ok());
-        assert!(require_amount_within_bounds(100, 100).is_ok());
-        assert!(require_amount_within_bounds(101, 100).is_err());
-    }
-
-    #[test]
     fn test_require_future_timestamp() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000_000);
@@ -744,13 +719,6 @@ mod tests {
         assert_eq!(bps_of(1_000_000, 0).unwrap(), 0);
         // 1 bps (0.01%)
         assert_eq!(bps_of(10_000, 1).unwrap(), 1);
-    }
-
-    #[test]
-    fn test_require_amount_within_bounds_zero_max() {
-        assert!(require_amount_within_bounds(0, 0).is_ok());
-        assert!(require_amount_within_bounds(1, 0).is_err());
-        assert!(require_amount_within_bounds(-1, 0).is_err());
     }
 
     #[test]

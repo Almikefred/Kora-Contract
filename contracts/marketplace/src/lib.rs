@@ -293,7 +293,7 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::Listing(invoice_id), &listing);
         Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
-        events::invoice_listed(&env, invoice_id, &seller, asking_price);
+        events::invoice_listed(&env, invoice_id, &seller, asking_price, invoice.currency.clone());
         Ok(())
     }
 
@@ -387,7 +387,7 @@ impl MarketplaceContract {
             .set(&DataKey::Listing(invoice_id), &listing);
         Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
 
-        events::invoice_funded(&env, invoice_id, &investor, amount);
+        events::invoice_funded(&env, invoice_id, &investor, amount, invoice.currency.clone());
         if fee > 0 {
             events::fee_collected(&env, &investor, invoice_id, fee, &listing.token);
         }

@@ -5,7 +5,7 @@ use kora_shared::{
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
-    validation::{require_valid_fee_bps, require_within_max_amount, UPGRADE_TIMELOCK_DELAY},
+    validation::{require_non_negative_amount, require_valid_fee_bps, require_within_max_amount, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 
@@ -311,9 +311,7 @@ impl TreasuryContract {
     ) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        if new_cap < 0 {
-            return Err(KoraError::InvalidAmount);
-        }
+        require_non_negative_amount(new_cap)?;
         env.storage()
             .instance()
             .set(&DataKey::WithdrawalCapProposal, &(new_cap, env.ledger().timestamp()));

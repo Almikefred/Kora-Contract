@@ -6,7 +6,7 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::SmeProfile,
-    validation::{require_exact_length, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
+    validation::{require_exact_length, require_non_negative_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Vec};
 
@@ -426,9 +426,7 @@ impl RiskRegistryContract {
     ) -> Result<(), KoraError> {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
-        if credit_limit < 0 {
-            return Err(KoraError::InvalidAmount);
-        }
+        require_non_negative_amount(credit_limit)?;
 
         let mut profile: SmeProfile = env
             .storage()
@@ -1724,5 +1722,32 @@ mod tests {
         assert!(client
             .try_set_debtor_score(&verifier_b, &debtor_hash, &55u32)
             .is_ok());
+    }
+
+    // ── set_credit_limit (require_non_negative_amount guard) ─────────────────
+
+    #[test]
+    fn test_set_credit_limit_negative_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RiskRegistryContract);
+        let client = RiskRegistryContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let invoice_nft = Address::generate(&env);
+        let staking_token = Address::generate(&env);
+        client.initialize(&admin, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32);
+
+        // Seed a verifier directly into storage to exercise set_credit_limit's
+        // validation in isolation from the staking-token flow of add_verifier.
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Verifier(verifier.clone()), &true);
+        });
+
+        let result = client.try_set_credit_limit(&verifier, &sme, &-1i128);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 }
