@@ -643,10 +643,13 @@ impl MarketplaceContract {
 
     /// Get a listing by invoice_id.
     pub fn get_listing(env: Env, invoice_id: u64) -> Result<Listing, KoraError> {
-        env.storage()
+        let listing = env
+            .storage()
             .persistent()
             .get(&DataKey::Listing(invoice_id))
-            .ok_or(KoraError::ListingNotFound)
+            .ok_or(KoraError::ListingNotFound)?;
+        Self::bump_listing(&env, invoice_id);
+        Ok(listing)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -826,6 +829,7 @@ impl MarketplaceContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kora_access_control::AccessControlContract;
     use kora_financing_pool::{FinancingPoolContract, FinancingPoolContractClient};
     use kora_invoice_nft::{InvoiceNftContract, InvoiceNftContractClient};
     use kora_shared::errors::KoraError;
@@ -844,13 +848,17 @@ mod tests {
         treasury: Address,
         pool: Address,
         registry: Address,
+        staking_token: Address,
         mp: MarketplaceContractClient<'static>,
         nft: InvoiceNftContractClient<'static>,
     }
 
     fn deploy() -> TestEnv {
         let env = Env::default();
-        env.mock_all_auths();
+        // add_verifier's stake transfer requires verifier.require_auth() from
+        // inside a nested call (risk_registry -> token), which isn't tied to
+        // the root invocation — plain mock_all_auths() rejects that.
+        env.mock_all_auths_allowing_non_root_auth();
 
         env.ledger().set(LedgerInfo {
             timestamp: 1_700_000_000,
@@ -864,7 +872,14 @@ mod tests {
         });
 
         let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
+        let treasury_id = env.register_contract(None, kora_treasury::TreasuryContract);
+        let treasury_client = kora_treasury::TreasuryContractClient::new(&env, &treasury_id);
+        treasury_client.initialize(&admin, &50u32);
+        let treasury = treasury_id;
+
+        let ac_id = env.register_contract(None, AccessControlContract);
+        let ac_client = kora_access_control::AccessControlContractClient::new(&env, &ac_id);
+        ac_client.initialize(&admin);
 
         let nft_id = env.register_contract(None, InvoiceNftContract);
         let nft = InvoiceNftContractClient::new(&env, &nft_id);
@@ -874,28 +889,37 @@ mod tests {
         let pool_client = FinancingPoolContractClient::new(&env, &pool_id);
         let rr = Address::generate(&env);    // risk registry (unused in unit tests)
         let oracle = Address::generate(&env); // price oracle  (unused in unit tests)
-        pool_client.initialize(&admin, &nft_id, &rr, &treasury, &ac_id, &200u32, &oracle);
+        pool_client.initialize(&admin, &nft_id, &rr, &treasury, &ac_id, &200u32, &oracle, &5_000u32);
 
         let registry_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
         let registry = registry_id.clone();
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&env, &registry_id);
-        let staking_token = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let staking_token = env.register_stellar_asset_contract_v2(token_admin).address();
         registry_client.initialize(&admin, &nft_id, &staking_token, &1_000_000i128, &5_000u32);
 
-        let mp_ac = Address::generate(&env);
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &registry, &50u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &ac_id, &registry, &50u32);
 
         // Register marketplace and pool as authorized callers on the NFT contract (#209)
         nft.set_authorized_callers(&admin, &mp_id, &pool_id);
 
-        let token = Address::generate(&env);
+        let token_issuer = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_issuer).address();
         mp.whitelist_token(&admin, &token);
+        treasury_client.whitelist_token(&admin, &token);
 
         let seller = Address::generate(&env);
 
-        TestEnv { env, admin, token, seller, treasury, pool: pool_id, registry, mp, nft }
+        // list_invoice requires the seller to be a compliance-attested SME.
+        let verifier = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token)
+            .mint(&verifier, &1_000_000i128);
+        registry_client.add_verifier(&admin, &verifier, &1_000_000i128);
+        registry_client.register_sme(&verifier, &seller, &50u32, &true);
+
+        TestEnv { env, admin, token, seller, treasury, pool: pool_id, registry, staking_token, mp, nft }
     }
 
     /// Mint an invoice in the NFT contract and return its id.
@@ -915,6 +939,7 @@ mod tests {
             &due_date,
             &ipfs_cid,
             &30u32,
+            &None,
         )
     }
 
@@ -929,6 +954,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None,
         );
         id
     }
@@ -1123,6 +1149,7 @@ mod tests {
             &10_000i128,
             &bad_token,
             &deadline,
+            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
     }
@@ -1133,7 +1160,7 @@ mod tests {
         let _id = mint_invoice(&t);
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
-            t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline);
+            t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
@@ -1143,7 +1170,7 @@ mod tests {
         let _id = mint_invoice(&t);
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
-            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline);
+            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
@@ -1159,6 +1186,7 @@ mod tests {
             &10_000i128,
             &t.token,
             &deadline,
+            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -1175,6 +1203,7 @@ mod tests {
             &10_000i128,
             &t.token,
             &deadline,
+            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -1185,7 +1214,7 @@ mod tests {
         let _id = mint_invoice(&t);
         let past = t.env.ledger().timestamp() - 1;
         let result =
-            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past);
+            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past, &None);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
 
@@ -1201,6 +1230,7 @@ mod tests {
             &10_000i128,
             &t.token,
             &deadline,
+            &None,
         );
         assert_eq!(
             result.unwrap_err().unwrap(),
@@ -1213,7 +1243,7 @@ mod tests {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
-            t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline);
+            t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
@@ -1222,7 +1252,9 @@ mod tests {
         let t = deploy();
         let verifier = Address::generate(&t.env);
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&t.env, &t.registry);
-        registry_client.add_verifier(&t.admin, &verifier);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.staking_token)
+            .mint(&verifier, &1_000_000i128);
+        registry_client.add_verifier(&t.admin, &verifier, &1_000_000i128);
 
         let unattested_seller = Address::generate(&t.env);
         registry_client.register_sme(&verifier, &unattested_seller, &50u32, &false);
@@ -1236,6 +1268,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::ComplianceNotAttested);
     }
@@ -1245,7 +1278,9 @@ mod tests {
         let t = deploy();
         let verifier = Address::generate(&t.env);
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&t.env, &t.registry);
-        registry_client.add_verifier(&t.admin, &verifier);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.staking_token)
+            .mint(&verifier, &1_000_000i128);
+        registry_client.add_verifier(&t.admin, &verifier, &1_000_000i128);
 
         let attested_seller = Address::generate(&t.env);
         registry_client.register_sme(&verifier, &attested_seller, &50u32, &true);
@@ -1267,6 +1302,7 @@ mod tests {
                 &due_date,
                 &ipfs_cid,
                 &30u32,
+                &None,
             )
         };
 
@@ -1277,6 +1313,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None,
         ).is_ok());
     }
 
@@ -1301,6 +1338,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None,
         );
         let listing = t.mp.get_listing(&1u64);
         assert_eq!(listing.asking_price, 9_500_000_000i128);
@@ -1360,6 +1398,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None,
         );
         t.env.ledger().set(LedgerInfo {
             timestamp: deadline + 1,
@@ -1422,6 +1461,10 @@ mod tests {
         let id = list_one(&t);
         let inv1 = Address::generate(&t.env);
         let inv2 = Address::generate(&t.env);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&inv1, &5_000_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&inv2, &4_500_000_000i128);
 
         // First funding: 5B
         t.mp.fund_invoice(&inv1, &id, &5_000_000_000i128);
@@ -1528,16 +1571,18 @@ mod tests {
         let id = list_one(&t);
         let investor = Address::generate(&t.env);
         let partial_amount = 2_000_000_000i128;
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&investor, &partial_amount);
 
         // Investor funds the listing partially
         t.mp.fund_invoice(&investor, &id, &partial_amount);
-        let listing = t.mp.get_listing(&id).unwrap();
+        let listing = t.mp.get_listing(&id);
         assert_eq!(listing.funded_amount, partial_amount);
         assert!(listing.is_active);
 
         // Seller cancels the partially-funded listing
         assert!(t.mp.try_cancel_listing(&t.seller, &id).is_ok());
-        let cancelled_listing = t.mp.get_listing(&id).unwrap();
+        let cancelled_listing = t.mp.get_listing(&id);
         assert!(!cancelled_listing.is_active);
 
         // BROKEN: Investor cannot claim refund because claim_refund requires
@@ -1824,7 +1869,9 @@ mod tests {
         let t = deploy();
         let id = list_with_referrer(&t, None);
         let investor = Address::generate(&t.env);
-        assert!(t.mp.try_fund_invoice(&investor, &id, &10_000_000i128).is_ok());
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&investor, &10_000_000i128);
+        t.mp.fund_invoice(&investor, &id, &10_000_000i128);
     }
 
     #[test]
@@ -1838,6 +1885,8 @@ mod tests {
         let referrer = Address::generate(&t.env);
         let id = list_with_referrer(&t, Some(referrer));
         let investor = Address::generate(&t.env);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&investor, &10_000_000i128);
         assert!(t.mp.try_fund_invoice(&investor, &id, &10_000_000i128).is_ok());
     }
 
