@@ -1,6 +1,6 @@
 use soroban_sdk::contracterror;
 
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum KoraError {
@@ -70,8 +70,6 @@ pub enum KoraError {
     NotInitialized = 96,
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
-    // Field value exceeds the allowed maximum length
-    FieldTooLong = 102,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
@@ -94,4 +92,19 @@ pub enum KoraError {
     // Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+
+    // Multisig admin-action proposals
+    InvalidThreshold = 120,
+    ProposalNotFound = 121,
+    ProposalAlreadyExecuted = 122,
+    ProposalExpired = 123,
+    AlreadyApproved = 124,
+    ThresholdNotMet = 125,
+    MultisigNotConfigured = 126,
+    SignerNotFound = 127,
+
+    // Invoice ownership, credit limit, currency allowlist
+    CreditLimitExceeded = 130,
+    NotInvoiceOwner = 131,
+    CurrencyNotAllowed = 132,
 }

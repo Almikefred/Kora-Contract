@@ -33,6 +33,20 @@ pub enum DataKey {
     MaxPositionBps,
     /// Aggregate funded amount for a given token across all active pools.
     AggregateFunded(Address),
+    /// Optional installment repayment schedule for a pool.
+    InstallmentSchedule(u64),
+    /// Aggregate protocol-wide metrics.
+    ProtocolStats,
+}
+
+/// Aggregate protocol-wide metrics tracked across all pools.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolStats {
+    pub pools_opened: u32,
+    pub total_repaid: i128,
+    pub pools_defaulted: u32,
+    pub active_pools: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -1068,19 +1082,6 @@ impl FinancingPoolContract {
             return Err(KoraError::PoolAlreadyClosed);
         }
 
-    /// Paginated view of investor positions for an invoice.
-    ///
-    /// Returns at most `limit` positions starting at `offset` (0-based index
-    /// into the position list ordered by investor address key).  An `offset`
-    /// beyond the last position returns an empty vec; `limit` is capped at 100
-    /// to bound per-call CPU cost.
-    pub fn get_positions_page(
-        env: Env,
-        invoice_id: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<Position> {
-        let limit = limit.min(100);
         let positions: Map<Address, Position> = env
             .storage()
             .persistent()
@@ -1110,6 +1111,37 @@ impl FinancingPoolContract {
 
         events::position_listed_for_sale(&env, invoice_id, &seller, price);
         Ok(())
+    }
+
+    /// Paginated view of investor positions for an invoice.
+    ///
+    /// Returns at most `limit` positions starting at `offset` (0-based index
+    /// into the position list ordered by investor address key).  An `offset`
+    /// beyond the last position returns an empty vec; `limit` is capped at 100
+    /// to bound per-call CPU cost.
+    pub fn get_positions_page(
+        env: Env,
+        invoice_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Position> {
+        let limit = limit.min(100);
+        let positions: Map<Address, Position> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Positions(invoice_id))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let all: Vec<Position> = positions.values();
+        let total = all.len();
+        let start = offset.min(total) as usize;
+        let end = (start + limit as usize).min(total as usize);
+
+        let mut page: Vec<Position> = Vec::new(&env);
+        for i in start..end {
+            page.push_back(all.get(i as u32).unwrap());
+        }
+        page
     }
 
     /// Purchase an investor position from the secondary market.
@@ -1188,18 +1220,6 @@ impl FinancingPoolContract {
 
         events::position_sold(&env, invoice_id, &seller, &buyer, offer.price);
         Ok(())
-            .unwrap_or(Map::new(&env));
-
-        let all: Vec<Position> = positions.values();
-        let total = all.len();
-        let start = offset.min(total) as usize;
-        let end = (start + limit as usize).min(total as usize);
-
-        let mut page: Vec<Position> = Vec::new(&env);
-        for i in start..end {
-            page.push_back(all.get(i as u32).unwrap());
-        }
-        page
     }
 
     /// Returns the total number of investor positions recorded for an invoice.
@@ -1343,7 +1363,7 @@ impl FinancingPoolContract {
         // to reject operations without a valid price.
         let pool_currency = Symbol::new(env, "USDC");
 
-        oracle_client.convert(&amount, invoice_currency, &pool_currency)
+        Ok(oracle_client.convert(&amount, invoice_currency, &pool_currency))
     }
 }
 
@@ -1871,8 +1891,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-}
-
     #[test]
     fn test_repay_amount_exceeds_max_amount() {
         let (env, _admin, _nft, _treasury, _ac, client) = setup();
@@ -1898,6 +1916,7 @@ mod tests {
         assert!(client.try_mark_default(&admin, &999u64, &token).is_err());
     }
 }
+
 #[cfg(test)]
 mod proptests {
     use super::*;

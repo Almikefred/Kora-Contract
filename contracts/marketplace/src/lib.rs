@@ -6,7 +6,7 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::{Listing, RiskTier},
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
@@ -34,6 +34,15 @@ pub enum DataKey {
     Contribution(u64, Address),
     /// Refund claimed flag
     RefundClaimed(u64, Address),
+    /// Legacy individual risk_registry key (never written; present only so
+    /// load_config's legacy migration path can look it up and fail cleanly).
+    RiskRegistry,
+    /// Referrer address recorded at listing time, if any.
+    Referrer(u64),
+    /// Pending two-phase cancellation request (who requested it).
+    CancellationRequest(u64),
+    /// Marks a listing's cancellation as admin-confirmed, unblocking refunds.
+    CancellationConfirmed(u64),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -74,7 +83,10 @@ impl MarketplaceContract {
             return Err(KoraError::AlreadyInitialized);
         }
         require_valid_fee_bps(fee_bps)?;
-        require_valid_fee_bps(referrer_split_bps)?;
+        // Referrer splits are disabled at init and opted into later via
+        // set_referrer_split_bps — kept out of the constructor to avoid
+        // widening every deployment call site for a rarely-used feature.
+        let referrer_split_bps: u32 = 0;
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::InvoiceNft, &invoice_nft);
         env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
@@ -738,7 +750,14 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::FeeBps)
             .ok_or(KoraError::NotInitialized)?;
-        let risk_registry: Address = Address::generate(env);
+        // risk_registry was never part of the legacy per-key storage format —
+        // contracts still on that format must be re-initialized to consolidate
+        // into `Config` before risk_registry-dependent calls can succeed.
+        let risk_registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RiskRegistry)
+            .ok_or(KoraError::NotInitialized)?;
 
         let config = MarketplaceConfig {
             admin,
