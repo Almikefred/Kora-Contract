@@ -71,12 +71,62 @@ pub struct Invoice {
 pub struct Listing {
     pub invoice_id: u64,
     pub seller: Address,
-    pub asking_price: i128, // discounted price investors pay
+    pub asking_price: i128, // discounted price investors pay (the starting price for Dutch auction)
     pub face_value: i128,   // full repayment amount
     pub token: Address,     // whitelisted stablecoin
     pub funded_amount: i128,
     pub funding_deadline: u64,
     pub is_active: bool,
+    /// Optional deadline for the reverse-auction bidding window (#440).
+    /// When `Some`, direct `fund_invoice` calls are rejected until
+    /// `accept_bids` converts winning bids into positions.
+    /// When `None`, the listing uses the standard first-come-first-served flow.
+    pub bidding_deadline: Option<u64>,
+}
+
+/// Dutch-auction / linear-decay price schedule for a listing (#439).
+///
+/// When attached to a listing via `DataKey::DecaySchedule(invoice_id)`, the
+/// effective asking price decays linearly from `start_price` to `floor_price`
+/// over the window `[decay_start_ts, decay_end_ts]`.
+///
+/// - Before `decay_start_ts`  : price == `start_price` (original asking price)
+/// - After  `decay_end_ts`    : price == `floor_price`  (floor)
+/// - In between               : linear interpolation
+///
+/// `floor_price` must be > 0 and < `start_price`.
+/// `decay_end_ts` must be <= `funding_deadline` of the listing.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DecaySchedule {
+    /// The initial (ceiling) price — mirrors `Listing::asking_price`.
+    pub start_price: i128,
+    /// The minimum (floor) price the listing will reach.
+    pub floor_price: i128,
+    /// Timestamp at which price decay begins.
+    pub decay_start_ts: u64,
+    /// Timestamp at which the price reaches `floor_price` (and stays there).
+    pub decay_end_ts: u64,
+}
+
+/// A reverse-auction bid submitted by an investor (#440).
+///
+/// Stored under `DataKey::Bid(invoice_id, investor)`.
+/// The investor commits to funding `amount` tokens at `bid_price` total.
+/// `bid_price` must be <= current asking price and >= the floor price (if a
+/// decay schedule is active).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Bid {
+    pub investor: Address,
+    pub invoice_id: u64,
+    /// The total price the investor is willing to pay for their `amount` share.
+    /// Must satisfy `bid_price <= current_asking_price`.
+    pub bid_price: i128,
+    /// The token amount the investor proposes to contribute.
+    pub amount: i128,
+    /// Ledger timestamp when the bid was submitted.
+    pub submitted_at: u64,
 }
 
 /// A single investor position in a pool
