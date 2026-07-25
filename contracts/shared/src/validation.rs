@@ -263,6 +263,38 @@ pub const MAX_IPFS_CID_LEN: u32 = 128;
 /// Maximum allowed byte length for a debtor hash stored on-chain.
 pub const MAX_DEBTOR_HASH_LEN: u32 = 64;
 
+// ── Batch size guards ─────────────────────────────────────────────────────────
+
+/// Maximum number of invoices allowed in a single batch mint operation.
+///
+/// Chosen conservatively based on measured resource cost per invoice:
+/// - 1 persistent storage write (~50K CPU instructions)
+/// - 1 event emission (~5K CPU instructions)
+/// - 1 TTL bump (~10K CPU instructions)
+/// = ~65K CPU per invoice
+///
+/// With 25 invoices: ~1.625M total CPU (safe margin under Soroban's ~80M budget)
+/// Allows reasonable batch sizes while leaving headroom for auth checks, reentrancy
+/// guard, state transitions, and other middleware.
+pub const MAX_BATCH_MINT_SIZE: u32 = 25;
+
+/// Reject batch mint requests with more invoices than the configured maximum.
+///
+/// # Examples
+/// ```ignore
+/// use kora_shared::validation::require_batch_size_within_limit;
+/// assert!(require_batch_size_within_limit(10).is_ok());
+/// assert!(require_batch_size_within_limit(25).is_ok());  // At limit
+/// assert!(require_batch_size_within_limit(26).is_err()); // Over limit
+/// ```
+#[inline]
+pub fn require_batch_size_within_limit(batch_size: u32) -> Result<(), KoraError> {
+    if batch_size > MAX_BATCH_MINT_SIZE {
+        return Err(KoraError::BatchSizeExceeded);
+    }
+    Ok(())
+}
+
 // ── Safe arithmetic ───────────────────────────────────────────────────────────
 
 /// Compute `amount * bps / 10_000` with overflow protection.
@@ -842,6 +874,27 @@ mod tests {
         let env = Env::default();
         let b = Bytes::from_slice(&env, &[0u8; 65]);
         assert!(require_max_length_bytes(&b, 64).is_err());
+    }
+
+    #[test]
+    fn test_require_batch_size_within_limit_at_max() {
+        assert!(require_batch_size_within_limit(MAX_BATCH_MINT_SIZE).is_ok());
+    }
+
+    #[test]
+    fn test_require_batch_size_within_limit_under_max() {
+        assert!(require_batch_size_within_limit(10).is_ok());
+        assert!(require_batch_size_within_limit(1).is_ok());
+        assert!(require_batch_size_within_limit(0).is_ok());
+    }
+
+    #[test]
+    fn test_require_batch_size_within_limit_exceeds_max() {
+        assert!(require_batch_size_within_limit(MAX_BATCH_MINT_SIZE + 1).is_err());
+        assert_eq!(
+            require_batch_size_within_limit(MAX_BATCH_MINT_SIZE + 1).unwrap_err(),
+            KoraError::BatchSizeExceeded
+        );
     }
 }
 
