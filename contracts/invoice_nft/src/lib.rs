@@ -297,6 +297,7 @@ impl InvoiceNftContract {
     ///
     /// **Errors:**
     /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::SMENotVerified` — `sme` is not `verified` in the risk_registry (only when one is wired up).
     /// - `KoraError::ComplianceNotAttested` — `sme` lacks a compliance attestation (only when a risk_registry is wired up).
     /// - `KoraError::InvalidAmount` — `amount` is zero, negative, or exceeds `credit_limit`.
     /// - `KoraError::InvalidDueDate` — `due_date` is not in the future.
@@ -308,10 +309,10 @@ impl InvoiceNftContract {
     /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
     ///
     /// **Security:** Requires `sme.require_auth()`. The protocol must not be paused.
-    /// If a `risk_registry` is wired up: `sme` must be `compliance_attested` (checked here at
-    /// mint time — see docs/invoice-nft.md for why this is enforced at both mint and
-    /// marketplace-listing time), and outstanding exposure is checked against their
-    /// pre-approved credit limit before minting.
+    /// If a `risk_registry` is wired up: `sme` must be `verified` and `compliance_attested`
+    /// (checked here at mint time — see docs/invoice-nft.md for why this is enforced at both
+    /// mint and marketplace-listing time), and outstanding exposure is checked against
+    /// their pre-approved credit limit before minting.
     pub fn mint_invoice(
         env: Env,
         sme: Address,
@@ -325,6 +326,7 @@ impl InvoiceNftContract {
     ) -> Result<u64, KoraError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_verified_sme(&env, &sme)?;
         Self::require_compliance_attested(&env, &sme)?;
         let _guard = ReentrancyGuard::new(&env)?;
 
@@ -406,6 +408,7 @@ impl InvoiceNftContract {
     ///
     /// **Errors (in addition to per-entry field validation):**
     /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::SMENotVerified` — `sme` is not `verified` in the risk_registry (only when one is wired up).
     /// - `KoraError::ComplianceNotAttested` — `sme` lacks a compliance attestation (only when a risk_registry is wired up).
     pub fn mint_invoices_batch(
         env: Env,
@@ -414,6 +417,7 @@ impl InvoiceNftContract {
     ) -> Result<Vec<u64>, KoraError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_verified_sme(&env, &sme)?;
         Self::require_compliance_attested(&env, &sme)?;
         let _guard = ReentrancyGuard::new(&env)?;
 
@@ -993,6 +997,24 @@ impl InvoiceNftContract {
         Ok(())
     }
 
+    /// If a `risk_registry` is wired up, require `sme` to be a verified SME
+    /// (`SmeProfile.verified == true`). A no-op when no registry is configured,
+    /// for backward compatibility with deployments that haven't wired one up yet —
+    /// production deployments MUST call `set_risk_registry` for this to be enforced.
+    fn require_verified_sme(env: &Env, sme: &Address) -> Result<(), KoraError> {
+        if let Some(rr_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RiskRegistry)
+        {
+            let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &rr_addr);
+            if !rr.is_verified_sme(sme) {
+                return Err(KoraError::SMENotVerified);
+            }
+        }
+        Ok(())
+    }
+
     /// If a `risk_registry` is wired up, require `sme` to have a compliance
     /// attestation (`SmeProfile.compliance_attested == true`). A no-op when no
     /// registry is configured, for backward compatibility with deployments that
@@ -1375,6 +1397,83 @@ mod tests {
         });
         let result = client.try_mint_invoices_batch(&sme, &batch);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::ComplianceNotAttested);
+    }
+
+    #[test]
+    fn test_mint_invoice_unverified_sme_rejected() {
+        let (env, admin, client) = setup();
+        let (_registry, _verifier) = setup_with_registry(&env, &admin, &client);
+
+        // sme was never registered with the risk_registry — not verified.
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &25u32, &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::SMENotVerified);
+    }
+
+    #[test]
+    fn test_mint_invoice_no_registry_configured_bypasses_gating() {
+        // Backward compatibility: when set_risk_registry was never called,
+        // an arbitrary (unregistered, unverified) address may still mint.
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &25u32, &None,
+        );
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_unverified_sme_rejected() {
+        let (env, admin, client) = setup();
+        let (_registry, _verifier) = setup_with_registry(&env, &admin, &client);
+
+        let sme = Address::generate(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let mut batch = Vec::new(&env);
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(&env, &[1u8; 32]),
+            amount: 1_000_000_000i128,
+            currency: Symbol::new(&env, "USDC"),
+            due_date,
+            ipfs_cid: ipfs_cid(&env),
+            risk_score: 25u32,
+            notes: None,
+        });
+        let result = client.try_mint_invoices_batch(&sme, &batch);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::SMENotVerified);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_verified_attested_sme_succeeds() {
+        let (env, admin, client) = setup();
+        let (registry, verifier) = setup_with_registry(&env, &admin, &client);
+
+        let sme = Address::generate(&env);
+        registry.register_sme(&verifier, &sme, &50u32, &true);
+
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let mut batch = Vec::new(&env);
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(&env, &[1u8; 32]),
+            amount: 1_000_000_000i128,
+            currency: Symbol::new(&env, "USDC"),
+            due_date,
+            ipfs_cid: ipfs_cid(&env),
+            risk_score: 25u32,
+            notes: None,
+        });
+        let ids = client.mint_invoices_batch(&sme, &batch);
+        assert_eq!(ids.len(), 1);
     }
 
     #[test]

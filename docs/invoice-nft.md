@@ -124,6 +124,7 @@ pub fn mint_invoice(
 **Errors:**
 - `KoraError::ArithmeticOverflow` if amount > i128::MAX / 2 or ID counter overflows
 - `KoraError::ProtocolPaused` if the protocol is paused
+- `KoraError::SMENotVerified` if a risk_registry is configured and `sme` is not verified — see [Minting Rules](#minting-rules)
 - `KoraError::ComplianceNotAttested` if a risk_registry is configured and `sme` lacks a compliance attestation — see [Minting Rules](#minting-rules)
 - `KoraError::InvalidInput` if:
   - `amount <= 0`
@@ -347,26 +348,32 @@ pub fn invoice_count(env: Env) -> u64
    - Debtor hash must be non-empty (32-byte SHA-256 hash)
    - IPFS CID must be non-empty (pointer to encrypted invoice metadata)
 
-3. **Compliance gating.** When `set_risk_registry()` has been called (admin-only,
-   post-deployment), `mint_invoice()` and `mint_invoices_batch()` additionally
-   require `sme.compliance_attested == true` in the risk_registry — otherwise
-   `KoraError::ComplianceNotAttested`, checked *before any storage write*.
+3. **Verification and compliance gating.** When `set_risk_registry()` has been
+   called (admin-only, post-deployment), `mint_invoice()` and
+   `mint_invoices_batch()` additionally require, *before any storage write*:
+   - `sme` is `verified` in the risk_registry's `SmeProfile` — otherwise
+     `KoraError::SMENotVerified`. In practice this means `sme` must have been
+     registered via `risk_registry.register_sme()` by a verifier; there is
+     currently no code path that registers an SME as unverified.
+   - `sme.compliance_attested == true` — otherwise `KoraError::ComplianceNotAttested`.
 
    **This is enforced at two lifecycle stages, intentionally (defense in depth):**
    - **Mint time** (`invoice_nft.mint_invoice` / `mint_invoices_batch`) — closes the
-     window where a non-compliant SME could otherwise mint an on-chain invoice
-     (with real metadata, notes, and `invoice_created` events) that only gets
-     rejected much later, at listing.
+     window where a non-compliant or unverified SME could otherwise mint an
+     on-chain invoice (with real metadata, notes, and `invoice_created` events)
+     that only gets rejected much later, at listing.
    - **Listing time** (`marketplace.list_invoice`, via `require_compliance_attested`)
      — kept as an independent, second gate. It protects against `invoice_nft` and
      `marketplace` being wired to *different* `risk_registry` deployments, and
      against invoices minted before `invoice_nft.set_risk_registry()` was ever
-     called (mint-time gating is a no-op with no registry configured).
+     called (mint-time gating is a no-op with no registry configured). Note
+     marketplace only re-checks `compliance_attested`, not `verified` — `verified`
+     is invoice_nft-only, mint-time-only enforcement.
 
-   If no risk_registry has been configured on `invoice_nft`, the compliance check
-   is skipped entirely — an explicit backward-compatibility no-op, not a silent
-   bypass. Production deployments **must** call `set_risk_registry` for this to
-   be enforced.
+   If no risk_registry has been configured on `invoice_nft`, the verified/compliance
+   checks are skipped entirely — an explicit backward-compatibility no-op, not a
+   silent bypass. Production deployments **must** call `set_risk_registry` for
+   these checks to be enforced.
 
 4. **NFT Immutability**
    - Once minted, the following fields **never change:**
