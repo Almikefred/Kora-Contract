@@ -9,7 +9,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 kora-shared = { path = "../shared" }
+kora-access-control = { path = "../access_control" }
+kora-risk-registry = { path = "../risk_registry" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 kora-shared = { path = "../shared" }
+kora-access-control = { path = "../access_control" }
+kora-risk-registry = { path = "../risk_registry" }

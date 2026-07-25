@@ -1,7 +1,18 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
-use kora_shared::{errors::KoraError, events, reentrancy::ReentrancyGuard};
+use kora_shared::{
+    audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
+    errors::KoraError,
+    events,
+    reentrancy::ReentrancyGuard,
+    types::{AdminAction, MultisigConfig, ParameterKey, ParameterProposal, Proposal},
+    validation::UPGRADE_TIMELOCK_DELAY,
+};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Vec};
+
+/// Timelock delay between a parameter proposal reaching quorum and being executable.
+/// Mirrors the B1 upgrade timelock (~24h) so parameter changes get the same cooling-off period.
+const GOVERNANCE_TIMELOCK_DELAY: u64 = UPGRADE_TIMELOCK_DELAY;
 
 // ── TTL constants (~30 days) ──────────────────────────────────────────────────
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -9,11 +20,6 @@ const PERSISTENT_TTL_BUMP: u32 = 518_400;
 
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
-/// Storage key variants for the access control contract.
-///
-/// - `Admin` — stores the current admin address (instance storage)
-/// - `Paused` — stores the protocol pause flag (instance storage)
-/// - `Role(Address)` — maps addresses to their assigned roles (persistent storage)
 #[contracttype]
 pub enum DataKey {
     /// Admin address — persistent so it survives ledger archival.
@@ -22,7 +28,30 @@ pub enum DataKey {
     Paused,
     /// Per-address role mapping.
     Role(Address),
+    /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
+    UpgradeProposal,
+    /// Multisig configuration (threshold + signer set).
+    MultisigConfig,
+    /// Monotonic counter for the next multisig proposal id.
+    NextProposalId,
+    /// A pending multisig action proposal, keyed by proposal id.
+    Proposal(u64),
+    /// A pending protocol-parameter governance proposal, keyed by id.
+    ParameterProposal(u64),
+    /// Monotonic counter for the next parameter-proposal id.
+    NextParamProposalId,
+    /// The current governed value of a protocol parameter.
+    Parameter(ParameterKey),
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    /// Next write position in the audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
+    AuditLogHead,
+    /// Total admin actions ever recorded (monotonic; not capped at ring size).
+    AuditLogTotal,
+    /// An audit log entry at ring-buffer position `n`.
+    AuditEntry(u64),
 }
+
+const PROPOSAL_TTL_LEDGERS: u64 = 120_960; // ~7 days at ~5s/ledger
 
 // ── Role enum ─────────────────────────────────────────────────────────────────
 
@@ -43,12 +72,24 @@ pub struct AccessControlContract;
 #[contractimpl]
 impl AccessControlContract {
     /// One-time initialization. Sets the admin and initializes the paused flag.
+    ///
+    /// **Parameters:**
+    /// - `admin` — The address that will become the protocol administrator.
+    ///
+    /// **Errors:**
+    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `KoraError::InvalidAddress` — `admin` is the contract's own address.
+    ///
+    /// **Security:** No auth required on first call (contract is uninitialized). Subsequent
+    /// calls revert immediately, preventing privilege escalation.
     pub fn initialize(env: Env, admin: Address) -> Result<(), KoraError> {
         // Guard: prevent re-initialization
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        kora_shared::validation::require_not_self(&env, &admin)?;
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage()
             .persistent()
@@ -60,6 +101,16 @@ impl AccessControlContract {
     // ── Pause / Unpause ───────────────────────────────────────────────────────
 
     /// Pause the entire protocol. Admin only. Fails if already paused.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::Unauthorized` / `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::AlreadyPaused` — Protocol is already in the paused state.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered (should never happen in normal flow).
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `protocol_paused` event.
     pub fn pause(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -74,10 +125,21 @@ impl AccessControlContract {
         let _guard = ReentrancyGuard::new(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         events::protocol_paused(&env, &admin);
+        Self::append_audit_entry(&env, &admin, AdminActionType::Pause);
         Ok(())
     }
 
     /// Unpause the protocol. Admin only. Fails if not currently paused.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::Unauthorized` / `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NotPaused` — Protocol is not currently paused.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `protocol_unpaused` event.
     pub fn unpause(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -92,12 +154,26 @@ impl AccessControlContract {
         let _guard = ReentrancyGuard::new(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         events::protocol_unpaused(&env, &admin);
+        Self::append_audit_entry(&env, &admin, AdminActionType::Unpause);
         Ok(())
     }
 
     // ── Role management ───────────────────────────────────────────────────────
 
     /// Assign a role to an address. Admin only.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `target` — The address to assign the role to.
+    /// - `role` — The `Role` to assign (`Operator` or `Verifier`).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::Unauthorized` — Attempt to grant `Role::Admin` (use `transfer_admin`),
+    ///   grant `Role::None` (use `revoke_role`), or grant a role to the current admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Cannot grant `Role::Admin` directly —
+    /// use `transfer_admin` instead. Cannot grant `Role::None` — use `revoke_role` instead.
     /// - Cannot grant `Role::Admin` (use `transfer_admin`).
     /// - Cannot grant `Role::None` (use `revoke_role`).
     /// - Cannot grant a role to the current admin address.
@@ -125,10 +201,23 @@ impl AccessControlContract {
             .set(&DataKey::Role(target.clone()), &role);
         Self::bump_persistent(&env, &DataKey::Role(target.clone()));
         events::role_granted(&env, &admin, &target);
+        Self::append_audit_entry(&env, &admin, AdminActionType::GrantRole);
         Ok(())
     }
 
     /// Revoke a role from an address. Admin only.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `target` — The address whose role should be removed.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::Unauthorized` — Attempt to revoke the admin's own role.
+    /// - `KoraError::RoleNotAssigned` — Target has no role assigned.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Uses `remove()` to reclaim storage
+    /// rather than writing `Role::None`.
     /// - Cannot revoke the admin's own role.
     /// - Fails if the target has no role assigned.
     pub fn revoke_role(env: Env, admin: Address, target: Address) -> Result<(), KoraError> {
@@ -151,12 +240,26 @@ impl AccessControlContract {
             .persistent()
             .remove(&DataKey::Role(target.clone()));
         events::role_revoked(&env, &admin, &target);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RevokeRole);
         Ok(())
     }
 
     // ── Admin transfer ────────────────────────────────────────────────────────
 
     /// Transfer admin to a new address. Current admin must sign.
+    ///
+    /// **Parameters:**
+    /// - `current_admin` — The current admin address.
+    /// - `new_admin` — The address to transfer admin rights to.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the current admin.
+    /// - `KoraError::InvalidAddress` — `new_admin` equals `current_admin` or is the contract itself.
+    /// - `KoraError::Unauthorized` — `new_admin` already holds an `Operator` or `Verifier` role.
+    ///   The caller must revoke that role first.
+    ///
+    /// **Security:** Requires `current_admin.require_auth()`. Prevents silent role overwrites
+    /// by rejecting addresses that already hold a non-None, non-Admin role.
     /// - Cannot transfer to self.
     /// - Cannot transfer to an address that already holds a non-None role
     ///   (would silently overwrite it). The caller must revoke first.
@@ -171,8 +274,9 @@ impl AccessControlContract {
         if current_admin == new_admin {
             return Err(KoraError::InvalidAddress);
         }
-        // Guard: new_admin must not already hold a role (Operator/Verifier)
-        // to prevent silent role overwrite.
+        kora_shared::validation::require_not_self(&env, &new_admin)?;
+
+        // Guard: new_admin must not already hold a non-Admin role to prevent silent overwrite.
         let existing = env
             .storage()
             .persistent()
@@ -181,7 +285,9 @@ impl AccessControlContract {
         if existing != Role::None && existing != Role::Admin {
             return Err(KoraError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         env.storage()
             .persistent()
             .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
@@ -189,14 +295,462 @@ impl AccessControlContract {
         // Remove old admin's role entry to reclaim storage
         env.storage()
             .persistent()
-            .remove(&DataKey::Role(current_admin));
-        events::admin_transferred(&env, &new_admin);
+            .remove(&DataKey::Role(current_admin.clone()));
+        events::admin_transferred(&env, &current_admin, &new_admin);
+        Self::append_audit_entry(&env, &current_admin, AdminActionType::TransferAdmin);
         Ok(())
+    }
+
+    // ── Multisig ──────────────────────────────────────────────────────────────
+
+    /// Configure the N-of-M multisig. Admin only. Once configured, admin
+    /// actions must go through propose → approve → execute.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `signers` — The set of authorized signer addresses (M).
+    /// - `threshold` — The minimum number of approvals required to execute (N).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidThreshold` — `threshold` is 0 or greater than the number of signers.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Once this is called, sensitive admin actions
+    /// (pause, role management, admin transfer) must go through the multisig proposal flow.
+    pub fn configure_multisig(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let signer_count = signers.len();
+        if threshold == 0 || threshold > signer_count {
+            return Err(KoraError::InvalidThreshold);
+        }
+
+        let config = MultisigConfig { threshold, signers };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigConfig, &config);
+        Self::bump_persistent(&env, &DataKey::MultisigConfig);
+
+        if !env.storage().persistent().has(&DataKey::NextProposalId) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::NextProposalId, &1u64);
+        }
+
+        events::multisig_configured(&env, threshold, signer_count);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ConfigureMultisig);
+        Ok(())
+    }
+
+    /// Propose a new admin action. Caller must be a signer.
+    ///
+    /// **Parameters:**
+    /// - `proposer` — A configured multisig signer address.
+    /// - `action` — The `AdminAction` to propose (Pause, Unpause, GrantRole, RevokeRole, TransferAdmin).
+    ///
+    /// **Returns:** The ID of the new proposal.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ArithmeticOverflow` — Proposal ID counter overflowed (extremely unlikely).
+    ///
+    /// **Security:** Requires `proposer.require_auth()`. Proposer's vote is recorded automatically.
+    /// Proposals expire after ~7 days (`PROPOSAL_TTL_LEDGERS`).
+    pub fn propose_action(
+        env: Env,
+        proposer: Address,
+        action: AdminAction,
+    ) -> Result<u64, KoraError> {
+        proposer.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &proposer)?;
+
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextProposalId)
+            .unwrap_or(1);
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let proposal = Proposal {
+            id: proposal_id,
+            action,
+            proposer: proposer.clone(),
+            approvals,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            expires_at: env.ledger().timestamp() + PROPOSAL_TTL_LEDGERS,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+
+        env.storage().persistent().set(
+            &DataKey::NextProposalId,
+            &(proposal_id
+                .checked_add(1)
+                .ok_or(KoraError::ArithmeticOverflow)?),
+        );
+
+        events::action_proposed(&env, proposal_id, &proposer);
+        Ok(proposal_id)
+    }
+
+    /// Approve an existing proposal. Caller must be a signer who hasn't
+    /// already approved this proposal.
+    ///
+    /// **Parameters:**
+    /// - `approver` — A configured multisig signer address.
+    /// - `proposal_id` — The ID of the proposal to approve.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ProposalAlreadyExecuted` — Proposal has already been executed.
+    /// - `KoraError::ProposalExpired` — Proposal's TTL has elapsed.
+    /// - `KoraError::AlreadyApproved` — Caller has already voted on this proposal.
+    ///
+    /// **Security:** Requires `approver.require_auth()`. Each signer may only vote once per proposal.
+    pub fn approve_action(env: Env, approver: Address, proposal_id: u64) -> Result<(), KoraError> {
+        approver.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &approver)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ProposalAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(KoraError::ProposalExpired);
+        }
+
+        for i in 0..proposal.approvals.len() {
+            if proposal.approvals.get(i).ok_or(KoraError::Unauthorized)? == approver {
+                return Err(KoraError::AlreadyApproved);
+            }
+        }
+
+        proposal.approvals.push_back(approver.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+
+        events::action_approved(&env, proposal_id, &approver, proposal.approvals.len());
+        Ok(())
+    }
+
+    /// Execute a proposal once the approval threshold is met.
+    /// Any signer can call execute.
+    ///
+    /// **Parameters:**
+    /// - `executor` — A configured multisig signer address.
+    /// - `proposal_id` — The ID of the proposal to execute.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ProposalAlreadyExecuted` — Proposal has already been executed.
+    /// - `KoraError::ProposalExpired` — Proposal's TTL has elapsed.
+    /// - `KoraError::ThresholdNotMet` — Not enough approvals have been collected yet.
+    ///
+    /// **Security:** Requires `executor.require_auth()`. Once executed, the proposal is marked
+    /// as executed and cannot be re-executed. The proposal's action is applied atomically.
+    pub fn execute_action(env: Env, executor: Address, proposal_id: u64) -> Result<(), KoraError> {
+        executor.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &executor)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ProposalAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(KoraError::ProposalExpired);
+        }
+        if proposal.approvals.len() < config.threshold {
+            return Err(KoraError::ThresholdNotMet);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        match proposal.action {
+            AdminAction::Pause => {
+                env.storage().instance().set(&DataKey::Paused, &true);
+                events::protocol_paused(&env, &executor);
+            }
+            AdminAction::Unpause => {
+                env.storage().instance().set(&DataKey::Paused, &false);
+                events::protocol_unpaused(&env, &executor);
+            }
+            AdminAction::GrantRole(target, role_val) => {
+                let role = match role_val {
+                    1 => Role::Operator,
+                    2 => Role::Verifier,
+                    _ => return Err(KoraError::Unauthorized),
+                };
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Role(target.clone()), &role);
+                Self::bump_persistent(&env, &DataKey::Role(target.clone()));
+                events::role_granted(&env, &executor, &target);
+            }
+            AdminAction::RevokeRole(target) => {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Role(target.clone()));
+                events::role_revoked(&env, &executor, &target);
+            }
+            AdminAction::TransferAdmin(new_admin) => {
+                env.storage().persistent().set(&DataKey::Admin, &new_admin);
+                Self::bump_persistent(&env, &DataKey::Admin);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
+                Self::bump_persistent(&env, &DataKey::Role(new_admin.clone()));
+                events::admin_transferred(&env, &executor, &new_admin);
+            }
+        }
+
+        events::action_executed(&env, proposal_id, &executor);
+        Self::append_audit_entry(&env, &executor, AdminActionType::MultisigExecuteAction);
+        Ok(())
+    }
+
+    /// Get a proposal by ID.
+    ///
+    /// **Parameters:**
+    /// - `proposal_id` — The ID of the proposal to retrieve.
+    ///
+    /// **Returns:** The full `Proposal` struct, or `KoraError::ProposalNotFound`.
+    ///
+    /// **Security:** Read-only view with no authorization check.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)
+    }
+
+    /// Get the current multisig configuration.
+    ///
+    /// **Returns:** The `MultisigConfig` (threshold + signer set), or
+    /// `KoraError::MultisigNotConfigured` if multisig has not been set up.
+    ///
+    /// **Security:** Read-only view with no authorization check.
+    pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, KoraError> {
+        Self::load_multisig_config(&env)
+    }
+
+    // ── Parameter Governance ─────────────────────────────────────────────────────
+
+    /// Propose a change to a tunable protocol parameter.
+    ///
+    /// Gated by the B2 multisig signer set: only a configured signer may propose, and the
+    /// proposer's vote is recorded automatically. Execution additionally requires a quorum of
+    /// signer votes (B2 threshold) and a B1-style timelock to elapse.
+    pub fn propose_parameter_change(
+        env: Env,
+        proposer: Address,
+        key: ParameterKey,
+        new_value: u32,
+    ) -> Result<u64, KoraError> {
+        proposer.require_auth();
+
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &proposer)?;
+        Self::require_valid_parameter(&key, new_value)?;
+
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextParamProposalId)
+            .unwrap_or(1);
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let proposal = ParameterProposal {
+            id: proposal_id,
+            key,
+            new_value,
+            proposer: proposer.clone(),
+            approvals,
+            created_at: env.ledger().timestamp(),
+            executed: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ParameterProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::ParameterProposal(proposal_id));
+        env.storage().persistent().set(
+            &DataKey::NextParamProposalId,
+            &(proposal_id
+                .checked_add(1)
+                .ok_or(KoraError::ArithmeticOverflow)?),
+        );
+
+        events::action_proposed(&env, proposal_id, &proposer);
+        Self::append_audit_entry(&env, &proposer, AdminActionType::ProposeParameter);
+        Ok(proposal_id)
+    }
+
+    /// Vote in favour of a pending parameter-change proposal. Multisig signers only.
+    ///
+    /// **Parameters:**
+    /// - `signer` — A configured multisig signer address.
+    /// - `proposal_id` — The ID of the parameter-change proposal.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
+    /// - `KoraError::ParameterProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ParameterProposalAlreadyExecuted` — Proposal already executed.
+    /// - `KoraError::AlreadyVoted` — Caller has already cast their vote.
+    ///
+    /// **Security:** Requires `signer.require_auth()`. Each signer may only vote once.
+    pub fn vote_parameter_change(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), KoraError> {
+        signer.require_auth();
+
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &signer)?;
+
+        let mut proposal: ParameterProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ParameterProposal(proposal_id))
+            .ok_or(KoraError::ParameterProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ParameterProposalAlreadyExecuted);
+        }
+        for i in 0..proposal.approvals.len() {
+            if proposal.approvals.get(i).unwrap() == signer {
+                return Err(KoraError::AlreadyVoted);
+            }
+        }
+
+        proposal.approvals.push_back(signer.clone());
+        let count = proposal.approvals.len();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ParameterProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::ParameterProposal(proposal_id));
+
+        events::action_approved(&env, proposal_id, &signer, count);
+        Ok(())
+    }
+
+    /// Execute a parameter-change proposal once it has reached the multisig threshold (B2) and the
+    /// governance timelock has elapsed (B1). Commits the new value on-chain.
+    pub fn execute_parameter_change(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), KoraError> {
+        caller.require_auth();
+
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &caller)?;
+
+        let mut proposal: ParameterProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ParameterProposal(proposal_id))
+            .ok_or(KoraError::ParameterProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ParameterProposalAlreadyExecuted);
+        }
+        if proposal.approvals.len() < config.threshold {
+            return Err(KoraError::GovernanceThresholdNotMet);
+        }
+        if env.ledger().timestamp() < proposal.created_at + GOVERNANCE_TIMELOCK_DELAY {
+            return Err(KoraError::GovernanceTimelockNotElapsed);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ParameterProposal(proposal_id), &proposal);
+
+        env.storage().persistent().set(
+            &DataKey::Parameter(proposal.key.clone()),
+            &proposal.new_value,
+        );
+        Self::bump_persistent(&env, &DataKey::Parameter(proposal.key.clone()));
+
+        events::action_executed(&env, proposal_id, &caller);
+        Self::append_audit_entry(&env, &caller, AdminActionType::ExecuteParameter);
+        Ok(())
+    }
+
+    /// Read the current governed value of a parameter, if one has been executed.
+    ///
+    /// **Parameters:**
+    /// - `key` — The `ParameterKey` to look up (`FeeBps`, `LatePenaltyBps`, or `MaxRiskScore`).
+    ///
+    /// **Returns:** `Some(value)` if a governance proposal for this key has been executed,
+    /// `None` otherwise (callers should fall back to the contract's own initialized default).
+    ///
+    /// **Security:** Read-only view with no authorization check.
+    pub fn get_parameter(env: Env, key: ParameterKey) -> Option<u32> {
+        env.storage().persistent().get(&DataKey::Parameter(key))
+    }
+
+    /// Read a parameter-change proposal by id.
+    ///
+    /// **Parameters:**
+    /// - `proposal_id` — The ID of the parameter-change proposal.
+    ///
+    /// **Returns:** The full `ParameterProposal` struct, or `KoraError::ParameterProposalNotFound`.
+    ///
+    /// **Security:** Read-only view with no authorization check.
+    pub fn get_parameter_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ParameterProposal, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ParameterProposal(proposal_id))
+            .ok_or(KoraError::ParameterProposalNotFound)
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
 
     /// Returns `true` if the protocol is currently paused.
+    ///
+    /// **Security:** Read-only view. No authorization required. Other contracts should call
+    /// this before performing any state-mutating operation.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -205,21 +759,25 @@ impl AccessControlContract {
     }
 
     /// Returns the role assigned to `address`, or `Role::None` if unassigned.
+    ///
+    /// **Parameters:**
+    /// - `address` — The address to query.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_role(env: Env, address: Address) -> Role {
-        let key = DataKey::Role(address.clone());
-        if let Some(role) = env.storage().persistent().get::<_, Role>(&key) {
-            Self::bump_persistent(&env, &key);
-            return role;
-        }
-        if let Some(admin) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
-            if admin == address {
-                return Role::Admin;
-            }
-        }
-        Role::None
+        env.storage()
+            .persistent()
+            .get(&DataKey::Role(address))
+            .unwrap_or(Role::None)
     }
 
     /// Returns `true` if `address` holds the given `role`.
+    ///
+    /// **Parameters:**
+    /// - `address` — The address to check.
+    /// - `role` — The `Role` to test for.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn has_role(env: Env, address: Address, role: Role) -> bool {
         let assigned: Role = env
             .storage()
@@ -230,6 +788,11 @@ impl AccessControlContract {
     }
 
     /// Returns the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotInitialized` — Contract has not been initialized yet.
+    ///
+    /// **Security:** Read-only view. No authorization required.
     pub fn get_admin(env: Env) -> Result<Address, KoraError> {
         env.storage()
             .persistent()
@@ -237,7 +800,145 @@ impl AccessControlContract {
             .ok_or(KoraError::NotInitialized)
     }
 
+    // ── Upgrade ────────────────────────────────────────────────────────────────
+
+    /// Propose a WASM upgrade. Admin only. Begins a 24-hour timelock.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `new_wasm_hash` — The SHA-256 hash of the new WASM binary (32 bytes).
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. The upgrade cannot be applied until
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed via `execute_upgrade`.
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(
+            &DataKey::UpgradeProposal,
+            &(new_wasm_hash.clone(), env.ledger().timestamp()),
+        );
+        events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ProposeUpgrade);
+        Ok(())
+    }
+
+    /// Execute a previously proposed WASM upgrade after the 24-hour timelock has elapsed.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Clears the proposal before calling
+    /// `update_current_contract_wasm` to prevent re-execution.
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(KoraError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        events::upgrade_executed(&env, &admin, &wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ExecuteUpgrade);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
+    }
+
+    // ── Audit Log ─────────────────────────────────────────────────────────────
+
+    /// Return a page of audit log entries, newest first.
+    /// `page` is 0-indexed; `page_size` is clamped to 1–50.
+    pub fn get_audit_log(env: Env, page: u32, page_size: u32) -> Vec<AdminAuditEntry> {
+        let page_size = (page_size.max(1).min(50)) as u64;
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+        let stored = total.min(MAX_AUDIT_LOG_SIZE);
+
+        let skip = (page as u64).saturating_mul(page_size);
+        let mut results = Vec::new(&env);
+
+        let mut i: u64 = 0;
+        while i < page_size {
+            let offset = skip + i;
+            if offset >= stored {
+                break;
+            }
+            // Walk backwards from the most recently written slot.
+            let pos = (head + MAX_AUDIT_LOG_SIZE - 1 - offset) % MAX_AUDIT_LOG_SIZE;
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AdminAuditEntry>(&DataKey::AuditEntry(pos))
+            {
+                results.push_back(entry);
+            }
+            i += 1;
+        }
+
+        results
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Append one entry to the ring-buffer audit log and emit the canonical event.
+    fn append_audit_entry(env: &Env, actor: &Address, action: AdminActionType) {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+
+        let entry = AdminAuditEntry {
+            sequence: total,
+            timestamp: env.ledger().timestamp(),
+            actor: actor.clone(),
+            action,
+            source: AuditSource::AccessControl,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditEntry(head), &entry);
+        Self::bump_persistent(env, &DataKey::AuditEntry(head));
+
+        events::admin_action_audited(env, &entry);
+
+        let next_head = (head + 1) % MAX_AUDIT_LOG_SIZE;
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogHead, &next_head);
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogTotal, &(total + 1));
+    }
 
     /// Read the paused flag from persistent storage.
     fn read_paused(env: &Env) -> bool {
@@ -256,10 +957,6 @@ impl AccessControlContract {
         if &admin != caller {
             return Err(KoraError::NotAdmin);
         }
-        let key = DataKey::Role(caller.clone());
-        if env.storage().persistent().get::<_, Role>(&key).is_some() {
-            Self::bump_persistent(env, &key);
-        }
         Ok(())
     }
 
@@ -268,330 +965,41 @@ impl AccessControlContract {
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
     }
+
+    fn load_multisig_config(env: &Env) -> Result<MultisigConfig, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultisigConfig)
+            .ok_or(KoraError::MultisigNotConfigured)
+    }
+
+    fn require_signer(config: &MultisigConfig, caller: &Address) -> Result<(), KoraError> {
+        for i in 0..config.signers.len() {
+            if &config.signers.get(i).ok_or(KoraError::Unauthorized)? == caller {
+                return Ok(());
+            }
+        }
+        Err(KoraError::SignerNotFound)
+    }
+
+    /// Validate a proposed parameter value against its allowed range.
+    fn require_valid_parameter(key: &ParameterKey, value: u32) -> Result<(), KoraError> {
+        let ok = match key {
+            ParameterKey::FeeBps | ParameterKey::LatePenaltyBps => value <= 10_000,
+            ParameterKey::MaxRiskScore => value <= 100,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(KoraError::InvalidParameterValue)
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
-
-    fn setup() -> (Env, Address, AccessControlContractClient<'static>) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, AccessControlContract);
-        let client = AccessControlContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-        (env, admin, client)
-    }
-
-    // ── initialize ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_initialize_success() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, AccessControlContract);
-        let client = AccessControlContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        assert!(client.try_initialize(&admin).is_ok());
-        assert_eq!(client.get_admin(), admin);
-        assert_eq!(client.get_role(&admin), Role::Admin);
-        assert!(!client.is_paused());
-    }
-
-    #[test]
-    fn test_initialize_already_initialized() {
-        let (_, admin, client) = setup();
-        assert!(client.try_initialize(&admin).is_err());
-    }
-
-    // ── pause / unpause ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_pause_unpause() {
-        let (_, admin, client) = setup();
-        assert!(!client.is_paused());
-        client.pause(&admin);
-        assert!(client.is_paused());
-        client.unpause(&admin);
-        assert!(!client.is_paused());
-    }
-
-    #[test]
-    fn test_pause_already_paused() {
-        let (_, admin, client) = setup();
-        client.pause(&admin);
-        // Second pause must fail with AlreadyPaused, not silently succeed
-        let result = client.try_pause(&admin);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_unpause_when_not_paused() {
-        let (_, admin, client) = setup();
-        // Unpause on a non-paused contract must fail with NotPaused
-        let result = client.try_unpause(&admin);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_non_admin_cannot_pause() {
-        let (env, _, client) = setup();
-        let stranger = Address::generate(&env);
-        assert!(client.try_pause(&stranger).is_err());
-    }
-
-    #[test]
-    fn test_non_admin_cannot_unpause() {
-        let (env, admin, client) = setup();
-        client.pause(&admin);
-        let stranger = Address::generate(&env);
-        assert!(client.try_unpause(&stranger).is_err());
-    }
-
-    #[test]
-    fn test_pause_unpause_cycle_multiple_times() {
-        let (_, admin, client) = setup();
-        for _ in 0..3 {
-            client.pause(&admin);
-            assert!(client.is_paused());
-            client.unpause(&admin);
-            assert!(!client.is_paused());
-        }
-    }
-
-    // ── grant_role ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_grant_role_operator() {
-        let (env, admin, client) = setup();
-        let operator = Address::generate(&env);
-        client.grant_role(&admin, &operator, &Role::Operator);
-        assert_eq!(client.get_role(&operator), Role::Operator);
-    }
-
-    #[test]
-    fn test_grant_role_verifier() {
-        let (env, admin, client) = setup();
-        let verifier = Address::generate(&env);
-        client.grant_role(&admin, &verifier, &Role::Verifier);
-        assert_eq!(client.get_role(&verifier), Role::Verifier);
-    }
-
-    #[test]
-    fn test_grant_role_admin_forbidden() {
-        // Cannot grant Role::Admin — must use transfer_admin
-        let (env, admin, client) = setup();
-        let target = Address::generate(&env);
-        assert!(client
-            .try_grant_role(&admin, &target, &Role::Admin)
-            .is_err());
-    }
-
-    #[test]
-    fn test_grant_role_none_forbidden() {
-        // Cannot grant Role::None — must use revoke_role
-        let (env, admin, client) = setup();
-        let target = Address::generate(&env);
-        assert!(client.try_grant_role(&admin, &target, &Role::None).is_err());
-    }
-
-    #[test]
-    fn test_grant_role_to_admin_self_forbidden() {
-        // Admin cannot grant a role to their own address
-        let (_, admin, client) = setup();
-        assert!(client
-            .try_grant_role(&admin, &admin, &Role::Operator)
-            .is_err());
-    }
-
-    #[test]
-    fn test_grant_role_non_admin_forbidden() {
-        let (env, _, client) = setup();
-        let stranger = Address::generate(&env);
-        let target = Address::generate(&env);
-        assert!(client
-            .try_grant_role(&stranger, &target, &Role::Verifier)
-            .is_err());
-    }
-
-    #[test]
-    fn test_grant_role_override() {
-        let (env, admin, client) = setup();
-        let user = Address::generate(&env);
-        client.grant_role(&admin, &user, &Role::Operator);
-        assert_eq!(client.get_role(&user), Role::Operator);
-        client.grant_role(&admin, &user, &Role::Verifier);
-        assert_eq!(client.get_role(&user), Role::Verifier);
-    }
-
-    #[test]
-    fn test_grant_role_multiple_users() {
-        let (env, admin, client) = setup();
-        let v1 = Address::generate(&env);
-        let v2 = Address::generate(&env);
-        let op = Address::generate(&env);
-        client.grant_role(&admin, &v1, &Role::Verifier);
-        client.grant_role(&admin, &v2, &Role::Verifier);
-        client.grant_role(&admin, &op, &Role::Operator);
-        assert_eq!(client.get_role(&v1), Role::Verifier);
-        assert_eq!(client.get_role(&v2), Role::Verifier);
-        assert_eq!(client.get_role(&op), Role::Operator);
-    }
-
-    // ── revoke_role ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_revoke_role_success() {
-        let (env, admin, client) = setup();
-        let operator = Address::generate(&env);
-        client.grant_role(&admin, &operator, &Role::Operator);
-        assert_eq!(client.get_role(&operator), Role::Operator);
-        client.revoke_role(&admin, &operator);
-        // After revoke the entry is removed — should return None
-        assert_eq!(client.get_role(&operator), Role::None);
-        assert!(!client.has_role(&operator, &Role::Operator));
-    }
-
-    #[test]
-    fn test_revoke_role_admin_forbidden() {
-        // Cannot revoke the admin's own role
-        let (_, admin, client) = setup();
-        assert!(client.try_revoke_role(&admin, &admin).is_err());
-    }
-
-    #[test]
-    fn test_revoke_role_not_assigned() {
-        // Revoking a role from an address that has none must fail
-        let (env, admin, client) = setup();
-        let stranger = Address::generate(&env);
-        assert!(client.try_revoke_role(&admin, &stranger).is_err());
-    }
-
-    #[test]
-    fn test_revoke_role_non_admin_forbidden() {
-        let (env, admin, client) = setup();
-        let operator = Address::generate(&env);
-        let stranger = Address::generate(&env);
-        client.grant_role(&admin, &operator, &Role::Operator);
-        assert!(client.try_revoke_role(&stranger, &operator).is_err());
-    }
-
-    #[test]
-    fn test_revoke_then_re_grant() {
-        let (env, admin, client) = setup();
-        let user = Address::generate(&env);
-        client.grant_role(&admin, &user, &Role::Verifier);
-        client.revoke_role(&admin, &user);
-        assert_eq!(client.get_role(&user), Role::None);
-        // Re-granting after revoke must work
-        client.grant_role(&admin, &user, &Role::Operator);
-        assert_eq!(client.get_role(&user), Role::Operator);
-    }
-
-    // ── transfer_admin ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_transfer_admin_success() {
-        let (env, admin, client) = setup();
-        let new_admin = Address::generate(&env);
-        client.transfer_admin(&admin, &new_admin);
-        assert_eq!(client.get_admin(), new_admin);
-        assert_eq!(client.get_role(&new_admin), Role::Admin);
-        // Old admin's role entry must be removed
-        assert_eq!(client.get_role(&admin), Role::None);
-    }
-
-    #[test]
-    fn test_transfer_admin_to_self_forbidden() {
-        let (_, admin, client) = setup();
-        assert!(client.try_transfer_admin(&admin, &admin).is_err());
-    }
-
-    #[test]
-    fn test_transfer_admin_non_admin_forbidden() {
-        let (env, _, client) = setup();
-        let stranger = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-        assert!(client.try_transfer_admin(&stranger, &new_admin).is_err());
-    }
-
-    #[test]
-    fn test_transfer_admin_to_existing_role_holder_forbidden() {
-        // new_admin already has Operator role — transfer must fail to avoid silent overwrite
-        let (env, admin, client) = setup();
-        let operator = Address::generate(&env);
-        client.grant_role(&admin, &operator, &Role::Operator);
-        assert!(client.try_transfer_admin(&admin, &operator).is_err());
-    }
-
-    #[test]
-    fn test_transfer_admin_to_verifier_forbidden() {
-        let (env, admin, client) = setup();
-        let verifier = Address::generate(&env);
-        client.grant_role(&admin, &verifier, &Role::Verifier);
-        assert!(client.try_transfer_admin(&admin, &verifier).is_err());
-    }
-
-    #[test]
-    fn test_transfer_admin_old_admin_loses_privileges() {
-        let (env, admin, client) = setup();
-        let new_admin = Address::generate(&env);
-        client.transfer_admin(&admin, &new_admin);
-        // Old admin can no longer pause
-        assert!(client.try_pause(&admin).is_err());
-    }
-
-    #[test]
-    fn test_transfer_admin_new_admin_can_act() {
-        let (env, admin, client) = setup();
-        let new_admin = Address::generate(&env);
-        client.transfer_admin(&admin, &new_admin);
-        // New admin can pause
-        assert!(client.try_pause(&new_admin).is_ok());
-    }
-
-    #[test]
-    fn test_transfer_admin_chain() {
-        // A → B → C
-        let (env, admin_a, client) = setup();
-        let admin_b = Address::generate(&env);
-        let admin_c = Address::generate(&env);
-        client.transfer_admin(&admin_a, &admin_b);
-        assert_eq!(client.get_admin(), admin_b);
-        client.transfer_admin(&admin_b, &admin_c);
-        assert_eq!(client.get_admin(), admin_c);
-        assert_eq!(client.get_role(&admin_a), Role::None);
-        assert_eq!(client.get_role(&admin_b), Role::None);
-        assert_eq!(client.get_role(&admin_c), Role::Admin);
-    }
-
-    // ── get_admin ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_get_admin_before_init_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, AccessControlContract);
-        let client = AccessControlContractClient::new(&env, &contract_id);
-        assert!(client.try_get_admin().is_err());
-    }
-
-    // ── get_role ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_get_role_unknown_address_returns_none() {
-        let (env, _, client) = setup();
-        let unknown = Address::generate(&env);
-        assert_eq!(client.get_role(&unknown), Role::None);
-    }
-}
-
-#[cfg(test)]
-mod tests_extended {
     use super::*;
     use kora_shared::errors::KoraError;
     use soroban_sdk::{
@@ -791,7 +1199,7 @@ mod tests_extended {
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "grant_role",
-                args: (&admin, &target, Role::Verifier).into_val(&env),
+                args: (&admin, &target, &Role::Verifier).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
@@ -1097,7 +1505,6 @@ mod tests_extended {
 
     // ── get_admin ─────────────────────────────────────────────────────────────
 
-
     #[test]
     fn test_pause_before_init_returns_not_initialized() {
         let (env, client) = deploy_uninit();
@@ -1107,6 +1514,26 @@ mod tests_extended {
     }
 
     #[test]
+    fn test_initialize_self_as_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AccessControlContract);
+        let client = AccessControlContractClient::new(&env, &contract_id);
+        // Passing the contract's own address as admin must be rejected
+        let result = client.try_initialize(&contract_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transfer_admin_to_self_contract_rejected() {
+        let (env, admin, client) = setup();
+        let contract_id = client.address.clone();
+        let result = client.try_transfer_admin(&admin, &contract_id);
+        assert!(result.is_err());
+    }
+}
+#[test]
+fn test_role_override() {
     fn test_grant_role_before_init_returns_not_initialized() {
         let (env, client) = deploy_uninit();
         let admin = Address::generate(&env);
@@ -1136,7 +1563,9 @@ mod tests_extended {
     #[test]
     fn test_get_role_falls_back_to_admin_when_role_key_missing() {
         let (env, admin, client) = setup();
-        env.storage().persistent().remove(&DataKey::Role(admin.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Role(admin.clone()));
         assert_eq!(client.get_role(&admin), Role::Admin);
     }
 
@@ -1273,5 +1702,46 @@ mod tests_extended {
         let (_, admin, client) = setup();
         let result = client.try_initialize(&admin);
         assert!(result.is_err());
+    }
+}
+
+    #[test]
+    fn test_interleaved_pause_and_role_operations_remain_independent() {
+        // Long interleaved sequence: grant → pause → revoke → unpause → re-grant
+        // Verify that pause state and role assignments never affect each other
+        let (env, admin, client) = setup();
+        let target1 = Address::generate(&env);
+        let target2 = Address::generate(&env);
+
+        // Phase 1: Grant roles
+        client.grant_role(&admin, &target1, &Role::Verifier);
+        client.grant_role(&admin, &target2, &Role::Operator);
+        assert!(client.has_role(&target1, &Role::Verifier));
+        assert!(client.has_role(&target2, &Role::Operator));
+        assert!(!client.is_paused());
+
+        // Phase 2: Pause protocol
+        client.pause(&admin);
+        assert!(client.is_paused());
+        assert!(client.has_role(&target1, &Role::Verifier), "Role should survive pause");
+        assert!(client.has_role(&target2, &Role::Operator), "Role should survive pause");
+
+        // Phase 3: Revoke roles while paused
+        client.revoke_role(&admin, &target1);
+        assert!(client.is_paused(), "Pause state should persist after revoke");
+        assert!(!client.has_role(&target1, &Role::Verifier));
+        assert!(client.has_role(&target2, &Role::Operator), "Other role should be unaffected");
+
+        // Phase 4: Unpause protocol
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+        assert!(!client.has_role(&target1, &Role::Verifier), "Revoked role should stay revoked");
+        assert!(client.has_role(&target2, &Role::Operator), "Role should survive unpause");
+
+        // Phase 5: Re-grant role after unpause
+        client.grant_role(&admin, &target1, &Role::Verifier);
+        assert!(!client.is_paused(), "Pause state should remain unpaused");
+        assert!(client.has_role(&target1, &Role::Verifier), "Re-granted role should be assigned");
+        assert!(client.has_role(&target2, &Role::Operator), "Other role should be unaffected");
     }
 }

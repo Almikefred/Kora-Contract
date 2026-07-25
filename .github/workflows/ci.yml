@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feature/**", "fix/**", "docs/**"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Type-check all contracts ──────────────────────────────────────────────
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo check (native)
+        run: cargo check --workspace
+
+      - name: cargo check (wasm32)
+        run: cargo check --workspace --target wasm32-unknown-unknown --exclude kora-tests
+
+  # ── Lint ──────────────────────────────────────────────────────────────────
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-clippy-
+
+      - name: cargo clippy (warnings as errors)
+        run: cargo clippy --workspace -- -D warnings
+
+  # ── Formatting ────────────────────────────────────────────────────────────
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ── Dependency cycle guard (issue #275) ──────────────────────────────────
+  #
+  # Runs `cargo tree` and fails if any cycle is detected.
+  # Cargo itself rejects cyclic Cargo.toml graphs, so this step
+  # catches the error and surfaces it clearly in the CI log.
+  #
+  # If a cycle is ever introduced, cargo tree will exit non-zero and
+  # print the cycle path. Fix by removing the circular dependency.
+  cycle-guard:
+    name: dependency cycle guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-tree-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-tree-
+
+      - name: Install cargo-tree (bundled with cargo, verify it works)
+        run: cargo tree --version
+
+      - name: Check for dependency cycles
+        run: |
+          echo "=== Kora workspace dependency graph ==="
+          cargo tree --workspace --depth 3
+          echo ""
+          echo "=== Cycle check ==="
+          # cargo tree exits non-zero if it encounters a cycle.
+          # An explicit check with --no-dedupe surfaces all paths.
+          if cargo tree --workspace --no-dedupe 2>&1 | grep -i "cycle detected"; then
+            echo "ERROR: Circular dependency detected in workspace."
+            echo "Fix: remove the cycle shown above before merging."
+            exit 1
+          fi
+          echo "No dependency cycles detected."
+
+  # ── Unit & integration tests ──────────────────────────────────────────────
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-test-
+
+      - name: cargo test
+        run: cargo test --workspace

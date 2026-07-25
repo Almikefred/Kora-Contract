@@ -11,9 +11,13 @@ soroban-sdk = { workspace = true }
 kora-shared = { path = "../shared" }
 kora-invoice-nft = { path = "../invoice_nft" }
 kora-access-control = { path = "../access_control" }
+kora-price-oracle = { path = "../price_oracle" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 kora-shared = { path = "../shared" }
 kora-invoice-nft = { path = "../invoice_nft" }
+kora-risk-registry = { path = "../risk_registry" }
 kora-access-control = { path = "../access_control" }
+kora-price-oracle = { path = "../price_oracle" }
+proptest = "1.4"
