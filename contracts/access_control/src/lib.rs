@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
-use kora_shared::{errors::KoraError, events};
+use kora_shared::{errors::KoraError, events, reentrancy::ReentrancyGuard};
 
 // ── TTL constants (~30 days) ──────────────────────────────────────────────────
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;

@@ -11,14 +11,42 @@ pub enum GuardKey {
     Lock,
 }
 
+// ── RAII guard ────────────────────────────────────────────────────────────────
+
+/// RAII reentrancy guard.
+///
+/// Acquires the lock on construction; releases it on drop.
+/// Usage: `let _guard = ReentrancyGuard::new(&env)?;`
+pub struct ReentrancyGuard<'a> {
+    env: &'a Env,
+}
+
+impl<'a> ReentrancyGuard<'a> {
+    /// Attempt to acquire the reentrancy lock.
+    ///
+    /// Returns `KoraError::Reentrancy` if already held.
+    pub fn new(env: &'a Env) -> Result<Self, KoraError> {
+        if env.storage().instance().has(&GuardKey::Lock) {
+            return Err(KoraError::Reentrancy);
+        }
+        env.storage().instance().set(&GuardKey::Lock, &true);
+        Ok(Self { env })
+    }
+}
+
+impl<'a> Drop for ReentrancyGuard<'a> {
+    fn drop(&mut self) {
+        self.env.storage().instance().remove(&GuardKey::Lock);
+    }
+}
+
 // ── Low-level helpers ─────────────────────────────────────────────────────────
 
 /// Acquire the reentrancy lock.
 ///
-/// Returns `KoraError::Reentrant` if the lock is already held, preventing
-/// any recursive (reentrant) call from proceeding.
+/// Returns `KoraError::Reentrancy` if the lock is already held.
 pub fn acquire_guard(env: &Env) -> Result<(), KoraError> {
-    if env.storage().instance().has(&GuardKey::ReentrancyGuard) {
+    if env.storage().instance().has(&GuardKey::Lock) {
         return Err(KoraError::Reentrancy);
     }
     env.storage().instance().set(&GuardKey::Lock, &true);
@@ -26,9 +54,6 @@ pub fn acquire_guard(env: &Env) -> Result<(), KoraError> {
 }
 
 /// Release the reentrancy lock.
-///
-/// Must be called on every exit path of a protected function.
-/// Prefer [`ReentrancyGuard`] which handles this automatically.
 pub fn release_guard(env: &Env) {
     env.storage().instance().remove(&GuardKey::Lock);
 }
@@ -57,7 +82,7 @@ mod tests {
         let env = Env::default();
         acquire_guard(&env).unwrap();
         let result = acquire_guard(&env);
-        assert_eq!(result.unwrap_err(), KoraError::Reentrant);
+        assert_eq!(result.unwrap_err(), KoraError::Reentrancy);
         release_guard(&env);
     }
 
@@ -92,33 +117,23 @@ mod tests {
     #[test]
     fn test_release_without_acquire_is_safe() {
         let env = Env::default();
-        // Should not panic
         release_guard(&env);
         assert!(acquire_guard(&env).is_ok());
         release_guard(&env);
     }
 
     #[test]
-    fn test_raii_guard_releases_on_early_return() {
+    fn test_raii_guard_acquires_and_releases() {
         let env = Env::default();
-
-        fn protected(env: &Env) -> Result<(), KoraError> {
-            let _guard = ReentrancyGuard::new(env)?;
-            // Simulate early return via ?
-            Err(KoraError::InvalidAmount)
+        {
+            let _guard = ReentrancyGuard::new(&env).unwrap();
+            assert!(is_locked(&env));
+            // Second acquire must fail
+            assert!(ReentrancyGuard::new(&env).is_err());
         }
-
-        let _ = protected(&env);
-        // Lock must be released even after early return
+        // After drop, lock must be released
         assert!(!is_locked(&env));
-    }
-
-    #[test]
-    fn test_release_without_acquire_is_safe() {
-        let env = Env::default();
-        // Releasing when not locked should not panic
-        release_guard(&env);
-        // And acquiring afterwards should succeed
         assert!(acquire_guard(&env).is_ok());
+        release_guard(&env);
     }
 }

@@ -19,6 +19,7 @@ pub enum DataKey {
     NextId,
     Admin,
     AccessControl,
+    FrozenInvoice(u64),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -95,6 +96,7 @@ impl InvoiceNftContract {
     pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_not_frozen(&env, invoice_id)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Created {
             return Err(KoraError::InvalidInvoiceStatus);
@@ -111,6 +113,7 @@ impl InvoiceNftContract {
     pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_not_frozen(&env, invoice_id)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Listed {
             return Err(KoraError::InvalidInvoiceStatus);
@@ -126,6 +129,7 @@ impl InvoiceNftContract {
     /// Mark invoice as Repaid. Called by Financing Pool on full repayment.
     pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_not_frozen(&env, invoice_id)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
             return Err(KoraError::InvalidInvoiceStatus);
@@ -155,6 +159,40 @@ impl InvoiceNftContract {
             .set(&DataKey::Invoice(invoice_id), &invoice);
         events::invoice_defaulted(&env, invoice_id, &invoice.sme);
         Ok(())
+    }
+
+    // ── Freeze ───────────────────────────────────────────────────────────────
+
+    /// Freeze an invoice. Admin only. A frozen invoice cannot advance through
+    /// any status transition until explicitly unfrozen. Use for KYC disputes,
+    /// compliance holds, or other administrative blocks.
+    pub fn freeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        // Invoice must exist before it can be frozen.
+        Self::load_invoice(&env, invoice_id)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::FrozenInvoice(invoice_id), &true);
+        Ok(())
+    }
+
+    /// Unfreeze a previously frozen invoice. Admin only.
+    pub fn unfreeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FrozenInvoice(invoice_id));
+        Ok(())
+    }
+
+    /// Returns true if the invoice is currently frozen.
+    pub fn is_invoice_frozen(env: Env, invoice_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FrozenInvoice(invoice_id))
+            .unwrap_or(false)
     }
 
     // ── Views ────────────────────────────────────────────────────────────────
@@ -202,6 +240,21 @@ impl InvoiceNftContract {
         let _ = ac;
         // Cross-contract pause check wired at deployment via AccessControl contract.
         // Local guard: no-op until cross-contract call is integrated.
+        Ok(())
+    }
+
+    /// Internal guard: rejects any state transition on a frozen invoice.
+    /// This must be called at the top of every status-mutating function so
+    /// that freeze enforcement is owned by invoice_nft itself, not by callers.
+    fn require_not_frozen(env: &Env, invoice_id: u64) -> Result<(), KoraError> {
+        let is_frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FrozenInvoice(invoice_id))
+            .unwrap_or(false);
+        if is_frozen {
+            return Err(KoraError::InvoiceFrozen);
+        }
         Ok(())
     }
 }
@@ -455,7 +508,7 @@ mod tests {
         let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
-        let test_cases = vec![
+        let test_cases: &[(u32, RiskTier)] = &[
             (0u32, RiskTier::AAA),
             (20u32, RiskTier::AAA),
             (21u32, RiskTier::AA),
@@ -471,10 +524,10 @@ mod tests {
         for (score, expected_tier) in test_cases {
             let id = client.mint_invoice(
                 &sme, &debtor_hash, &1_000_000_000i128,
-                &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &score,
+                &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, score,
             );
             let invoice = client.get_invoice(&id);
-            assert_eq!(invoice.risk_tier, expected_tier);
+            assert_eq!(invoice.risk_tier, *expected_tier);
         }
     }
 
@@ -604,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_get_nonexistent_invoice_fails() {
-        let (env, _admin, client) = setup();
+        let (_env, _admin, client) = setup();
         let result = client.try_get_invoice(&999u64);
         assert!(result.is_err());
     }
@@ -774,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_set_defaulted_non_admin_fails() {
-        let (env, admin, client) = setup();
+        let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
@@ -816,5 +869,151 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &21u32,
         );
         assert_eq!(client.get_invoice(&id2).risk_tier, RiskTier::AA);
+    }
+
+    // ── Freeze enforcement tests ───────────────────────────────────────────
+
+    fn mint_one(env: &Env, client: &InvoiceNftContractClient) -> u64 {
+        let sme = Address::generate(env);
+        let debtor_hash = Bytes::from_slice(env, &[1u8; 32]);
+        let ipfs_cid = String::from_str(env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32,
+        )
+    }
+
+    /// Core regression test: a frozen Created invoice must NOT be listable,
+    /// even when set_listed is called directly (bypassing marketplace).
+    #[test]
+    fn test_frozen_invoice_blocks_set_listed() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+
+        // Admin freezes the invoice (e.g., KYC dispute)
+        client.freeze_invoice(&admin, &id);
+        assert!(client.is_invoice_frozen(&id));
+
+        // Direct call to set_listed must fail with InvoiceFrozen
+        let caller = Address::generate(&env);
+        let result = client.try_set_listed(&caller, &id);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::InvoiceFrozen,
+            "frozen invoice must not transition to Listed"
+        );
+
+        // Status must remain Created
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Created);
+    }
+
+    /// set_funded must also reject a frozen invoice.
+    #[test]
+    fn test_frozen_invoice_blocks_set_funded() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+
+        // List first (unfrozen), then freeze, then attempt to fund
+        let marketplace = Address::generate(&env);
+        client.set_listed(&marketplace, &id);
+
+        client.freeze_invoice(&admin, &id);
+
+        let pool = Address::generate(&env);
+        let result = client.try_set_funded(&pool, &id);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::InvoiceFrozen,
+            "frozen invoice must not transition to Funded"
+        );
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
+    }
+
+    /// set_repaid must also reject a frozen invoice.
+    #[test]
+    fn test_frozen_invoice_blocks_set_repaid() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+
+        let marketplace = Address::generate(&env);
+        client.set_listed(&marketplace, &id);
+        let pool = Address::generate(&env);
+        client.set_funded(&pool, &id);
+
+        client.freeze_invoice(&admin, &id);
+
+        let result = client.try_set_repaid(&pool, &id);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::InvoiceFrozen,
+            "frozen invoice must not transition to Repaid"
+        );
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Funded);
+    }
+
+    /// Unfreezing must restore normal state transitions.
+    #[test]
+    fn test_unfreeze_restores_transitions() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+
+        client.freeze_invoice(&admin, &id);
+        assert!(client.is_invoice_frozen(&id));
+
+        // set_listed blocked while frozen
+        let caller = Address::generate(&env);
+        assert!(client.try_set_listed(&caller, &id).is_err());
+
+        // Unfreeze
+        client.unfreeze_invoice(&admin, &id);
+        assert!(!client.is_invoice_frozen(&id));
+
+        // set_listed now succeeds
+        client.set_listed(&caller, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
+    }
+
+    /// freeze_invoice must require admin auth — strangers cannot freeze.
+    #[test]
+    fn test_freeze_requires_admin() {
+        let (env, _admin, client) = setup();
+        let id = mint_one(&env, &client);
+        let stranger = Address::generate(&env);
+        let result = client.try_freeze_invoice(&stranger, &id);
+        assert!(result.is_err(), "non-admin must not be able to freeze");
+    }
+
+    /// unfreeze_invoice must require admin auth.
+    #[test]
+    fn test_unfreeze_requires_admin() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+        client.freeze_invoice(&admin, &id);
+        let stranger = Address::generate(&env);
+        let result = client.try_unfreeze_invoice(&stranger, &id);
+        assert!(result.is_err(), "non-admin must not be able to unfreeze");
+        // Still frozen
+        assert!(client.is_invoice_frozen(&id));
+    }
+
+    /// A non-frozen invoice must pass through transitions normally (regression guard).
+    #[test]
+    fn test_unfrozen_invoice_transitions_succeed() {
+        let (env, _admin, client) = setup();
+        let id = mint_one(&env, &client);
+
+        assert!(!client.is_invoice_frozen(&id));
+
+        let marketplace = Address::generate(&env);
+        client.set_listed(&marketplace, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
+
+        let pool = Address::generate(&env);
+        client.set_funded(&pool, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Funded);
+
+        client.set_repaid(&pool, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Repaid);
     }
 }

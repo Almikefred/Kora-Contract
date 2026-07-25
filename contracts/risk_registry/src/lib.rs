@@ -3,6 +3,7 @@
 use kora_shared::{
     errors::KoraError,
     events,
+    reentrancy::ReentrancyGuard,
     types::SmeProfile,
     validation::require_valid_risk_score,
 };
