@@ -55,6 +55,7 @@ const MAX_AMOUNT: i128 = i128::MAX / 2;
 // EVENT SCHEMA: (topic_symbol, actor, account, amount, ledger_sequence)
 // All events follow standardized format: operation topic + actor, account, amount, ledger
 //All events follow standardized format: operation topic + actor, account, amount, ledger
+// All events follow standardized format: operation topic + actor, account, amount, ledger
 fn emit_pool_created(env: &Env, invoice_id: u64, actor: &Address) {
     env.events().publish(
         (soroban_sdk::symbol_short!("pool_open"),),
