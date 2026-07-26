@@ -143,6 +143,87 @@ pub fn mint_invoice(
 
 ---
 
+### Batch Minting
+
+```rust
+pub fn mint_invoices_batch(
+    env: Env,
+    sme: Address,
+    invoices: Vec<BatchInvoiceInput>,
+) -> Result<Vec<u64>, KoraError>
+```
+
+**Purpose:** Create multiple invoice NFTs in a single transaction, with atomic validation (all-or-nothing semantics).
+
+**Parameters:**
+- `env` — Soroban environment
+- `sme` — Address of the SME (must be the same for all invoices in the batch)
+- `invoices` — Vector of `BatchInvoiceInput` structs (maximum **25 invoices**)
+
+**Batch Size Limit:**
+- Maximum batch size is **`MAX_BATCH_MINT_SIZE = 25`**
+- This limit is enforced before any validation or storage writes occur
+- Batches exceeding 25 invoices are rejected immediately with `KoraError::BatchSizeExceeded`
+- The limit is conservatively chosen based on measured resource cost per invoice:
+  - ~50K CPU instructions for persistent storage write
+  - ~5K CPU instructions for event emission
+  - ~10K CPU instructions for TTL bump
+  - Total: ~65K CPU per invoice × 25 = ~1.625M (safe margin under Soroban's ~80M CPU budget)
+
+**Rationale:**
+- Prevents transactions from exceeding Soroban's CPU, memory, and ledger-write resource limits
+- Provides a stable, documented maximum that enables predictable client-side tooling
+- Allows reasonable batch sizes while preserving headroom for other middleware
+
+**Returns:** A vector of newly allocated invoice IDs (in order), or an error.
+
+**Errors:**
+- `KoraError::BatchSizeExceeded` if `invoices.len() > 25` (fast-fail, before any validation)
+- `KoraError::ProtocolPaused` if the protocol is paused
+- Validation errors (applied to each invoice in the batch):
+  - `KoraError::InvalidAmount` if any invoice has `amount <= 0` or `amount > i128::MAX / 2`
+  - `KoraError::InvalidDueDate` if any invoice has `due_date <= current_time`
+  - `KoraError::InvalidRiskScore` if any invoice has `risk_score > 100`
+  - `KoraError::EmptyBytes` if any invoice has an empty `debtor_hash`
+  - `KoraError::FieldTooLong` if any invoice has a `debtor_hash` longer than 64 bytes or `ipfs_cid` longer than 128 bytes
+  - `KoraError::EmptyString` if any invoice has an empty `ipfs_cid`
+
+**Atomicity:**
+- All inputs are validated **before** any storage writes
+- If any validation fails, the entire batch is aborted (no invoices are stored)
+- `next_id` is only updated after all invoices are successfully stored
+
+**Authorization:** Requires `sme.require_auth()`.
+
+**Security:**
+- Validates all inputs before state changes
+- Uses checked arithmetic for ID allocation
+- Each invoice emits an `invoice_created` event with ID, SME, and amount
+- All invoices are stored in persistent storage with TTL managed by the protocol operator
+- Batch size limit prevents resource exhaustion
+
+**Example:**
+
+```javascript
+// Client-side: batch up to 25 invoices
+const batch = [];
+for (let i = 0; i < 25; i++) {
+  batch.push({
+    debtor_hash: Buffer.from(...), // SHA-256 hash
+    amount: 10_000_000i128,        // In stroops
+    currency: "USDC",
+    due_date: Math.floor(Date.now() / 1000) + 86_400 * 30,
+    ipfs_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+    risk_score: 50,
+    notes: "Batch invoice",
+  });
+}
+const ids = await nftContract.mint_invoices_batch(smeMAddress, batch);
+console.log(`Created ${ids.length} invoices`);
+```
+
+---
+
 ### Metadata Integrity
 
 #### commit_metadata_hash

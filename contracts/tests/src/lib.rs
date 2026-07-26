@@ -923,4 +923,82 @@ mod integration {
         assert!(result.is_err());
         assert_eq!(k.invoice_nft.next_id(), 1);
     }
+
+    /// Batch minting rejects requests exceeding MAX_BATCH_MINT_SIZE (25).
+    /// Should fail before any validation/storage work, returning BatchSizeExceeded error.
+    #[test]
+    fn test_batch_mint_size_exceeded_rejects_early() {
+        use soroban_sdk::Vec;
+        use kora_shared::errors::KoraError;
+
+        let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
+
+        // Create batch with 26 invoices (exceeds MAX_BATCH_MINT_SIZE of 25)
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&k.env);
+        for _ in 0..26u32 {
+            batch.push_back(BatchInvoiceInput {
+                debtor_hash: debtor_hash.clone(),
+                amount,
+                currency: currency.clone(),
+                due_date,
+                ipfs_cid: ipfs_cid.clone(),
+                risk_score,
+                notes: None,
+            });
+        }
+
+        let result = k.invoice_nft.try_mint_invoices_batch(&sme, &batch);
+        assert!(result.is_err(), "batch size 26 must be rejected");
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::BatchSizeExceeded,
+            "error must be BatchSizeExceeded"
+        );
+        // next_id must not advance — no invoices stored
+        assert_eq!(k.invoice_nft.next_id(), 1, "next_id must not change on early rejection");
+    }
+
+    /// Batch minting succeeds at the maximum allowed batch size (25).
+    #[test]
+    fn test_batch_mint_at_max_size_succeeds() {
+        use soroban_sdk::Vec;
+        use kora_shared::validation::MAX_BATCH_MINT_SIZE;
+
+        let k = deploy_protocol();
+        let sme = Address::generate(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
+
+        // Create batch with exactly MAX_BATCH_MINT_SIZE (25) invoices
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&k.env);
+        for _ in 0..MAX_BATCH_MINT_SIZE {
+            batch.push_back(BatchInvoiceInput {
+                debtor_hash: debtor_hash.clone(),
+                amount,
+                currency: currency.clone(),
+                due_date,
+                ipfs_cid: ipfs_cid.clone(),
+                risk_score,
+                notes: None,
+            });
+        }
+
+        let ids = k.invoice_nft.mint_invoices_batch(&sme, &batch);
+        assert_eq!(ids.len(), MAX_BATCH_MINT_SIZE as usize);
+        // All invoices must be stored with sequential IDs
+        for i in 0..MAX_BATCH_MINT_SIZE {
+            let invoice = k.invoice_nft.get_invoice(&(i + 1));
+            assert_eq!(invoice.status, InvoiceStatus::Created);
+            assert_eq!(invoice.sme, sme);
+        }
+        // next_id advanced by 25
+        assert_eq!(
+            k.invoice_nft.next_id(),
+            (MAX_BATCH_MINT_SIZE + 1) as u64,
+            "next_id must advance by batch size"
+        );
+    }
 }

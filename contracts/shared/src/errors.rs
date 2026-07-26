@@ -49,6 +49,7 @@ pub enum KoraError {
     InvalidRiskScore = 16,
     InvalidCid = 17,
     InvoiceFrozen = 18,
+    BatchSizeExceeded = 19,
     NotInvoiceOwner = 19,
 
     // Marketplace

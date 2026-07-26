@@ -18,6 +18,10 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, RiskTier},
     validation::{
+        require_batch_size_within_limit, require_future_timestamp, require_max_length_bytes,
+        require_max_length_string, require_non_empty_bytes, require_non_empty_string,
+        require_non_zero_amount, require_valid_risk_score, MAX_DEBTOR_HASH_LEN, MAX_IPFS_CID_LEN,
+        UPGRADE_TIMELOCK_DELAY,
         require_future_timestamp, require_max_length_bytes, require_max_length_string,
         require_non_empty_bytes, require_non_empty_string, require_non_zero_amount,
         require_valid_ipfs_cid, require_valid_risk_score, safe_sub, MAX_DEBTOR_HASH_LEN,
@@ -555,6 +559,9 @@ impl InvoiceNftContract {
         Self::require_verified_sme(&env, &sme)?;
         Self::require_compliance_attested(&env, &sme)?;
         let _guard = ReentrancyGuard::new(&env)?;
+
+        // ── Check batch size before any validation/minting ────────────────────
+        require_batch_size_within_limit(invoices.len() as u32)?;
 
         // ── Phase 1: validate ALL inputs before touching storage ──────────────
         // Track a running cumulative exposure so items that each individually fit
