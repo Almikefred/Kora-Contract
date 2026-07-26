@@ -1,5 +1,67 @@
 # Invoice NFT Contract
 
+<<<<<<< HEAD
+## Overview
+
+The `invoice_nft` contract is the source of truth for every invoice in the Kora protocol. It mints invoice NFTs, owns the invoice lifecycle state machine, and is the sole authority that may advance or block status transitions.
+
+## Status State Machine
+
+```
+Created → Listed → Funded → Repaid
+                          ↘ Defaulted
+```
+
+| Transition   | Function      | Caller           |
+|--------------|---------------|------------------|
+| → Listed     | `set_listed`  | Marketplace      |
+| → Funded     | `set_funded`  | Financing Pool   |
+| → Repaid     | `set_repaid`  | Financing Pool   |
+| → Defaulted  | `set_defaulted` | Admin          |
+
+## Freeze Mechanism
+
+### Design
+
+Freeze enforcement is **owned internally by `invoice_nft`**, not delegated to callers. Every status-mutating function (`set_listed`, `set_funded`, `set_repaid`) calls the private `require_not_frozen` guard before executing. This provides defense-in-depth: no caller — current or future — can advance a frozen invoice's state by forgetting an external pre-check.
+
+This is intentional and important. Earlier designs relied on external callers (e.g., `marketplace.fund_invoice`) to call `is_invoice_frozen` themselves before invoking invoice transitions. That approach is fragile: a single missed call site anywhere in the protocol silently defeats the freeze. The current design closes that class of bypass entirely.
+
+### Admin Operations
+
+| Function           | Who can call | Effect                                      |
+|--------------------|--------------|---------------------------------------------|
+| `freeze_invoice`   | Admin only   | Blocks all status transitions on the invoice |
+| `unfreeze_invoice` | Admin only   | Removes the freeze; transitions resume       |
+| `is_invoice_frozen`| Anyone       | Returns `true` if the invoice is frozen      |
+
+### Error
+
+A frozen invoice returns `KoraError::InvoiceFrozen (17)` on any attempted transition.
+
+### Use Cases
+
+- KYC / AML dispute on the SME or debtor
+- Regulatory hold pending investigation
+- Emergency administrative block
+
+### Storage
+
+Freeze state is stored as a `persistent` boolean under `DataKey::FrozenInvoice(invoice_id)`. The key is removed (not set to false) on unfreeze to reclaim storage.
+
+## Error Codes
+
+| Code | Variant                | Meaning                                  |
+|------|------------------------|------------------------------------------|
+| 10   | `InvoiceNotFound`      | No invoice exists for the given ID       |
+| 11   | `InvoiceAlreadyExists` | Duplicate invoice ID in marketplace      |
+| 12   | `InvalidInvoiceStatus` | Transition not allowed from current state |
+| 13   | `InvoiceExpired`       | Invoice past due date                    |
+| 14   | `InvalidAmount`        | Zero or negative amount                  |
+| 15   | `InvalidDueDate`       | Due date not in the future               |
+| 16   | `InvalidRiskScore`     | Risk score out of 0–100 range            |
+| 17   | `InvoiceFrozen`        | Invoice is administratively frozen       |
+=======
 The `invoice_nft` contract is the canonical source of truth for all invoice state in the Kora Protocol. Each invoice is represented as an immutable NFT with a unique ID, capturing all financial and metadata details of the underlying invoice.
 
 ## Invoice NFT Data Model
@@ -594,11 +656,16 @@ admin calls invoice_nft.set_defaulted(admin_address, invoice_id)
 - No on-chain verification that the underlying invoice is real
 - Mitigated off-chain by the verifier network's KYC/KYB checks
 
-### TTL Management
-- Invoice NFT storage entries expire if TTL is not extended
-- Protocol operator or keeper bot must periodically extend TTL
-- Failure to do so could result in invoice data loss
+### TTL Management (Fixed in v1.1)
+- **[FIXED]** Invoice storage entries now have their TTL extended on all state transitions:
+  - `mint_invoice()`, `mint_invoices_batch()`, `amend_invoice()`
+  - `set_listed()`, `set_funded()`, `set_repaid()`, `set_defaulted()`
+  - `commit_metadata_hash()`
+- Previously, `set_repaid()` and `commit_metadata_hash()` did not refresh the TTL, leaving repaid invoices (terminal state, rarely touched) vulnerable to expiry
+- TTL extension now uses unified shared constants (`DEFAULT_TTL_THRESHOLD`, `DEFAULT_TTL_BUMP`) from `kora_shared::validation::extend_persistent_ttl`
+- Protocol operator should still monitor persistent storage to ensure TTL stays healthy
 
 ### No Signature Delegation
 - Only the SME can mint their own invoices (no delegation mechanism)
 - Future versions may support signed delegation for agents
+>>>>>>> origin/Kora-Contract46
