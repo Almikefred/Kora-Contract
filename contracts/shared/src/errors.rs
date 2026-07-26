@@ -23,6 +23,7 @@ pub enum KoraError {
     InvalidRiskScore = 16,
     InvalidCid = 17,
     InvoiceFrozen = 18,
+    NotInvoiceOwner = 19,
 
     // Marketplace
     ListingNotFound = 20,
@@ -59,6 +60,8 @@ pub enum KoraError {
     DebtorNotRegistered = 51,
     RiskScoreOutOfRange = 52,
     ComplianceNotAttested = 53,
+    // SME profile exists but has not been marked `verified` by a risk_registry verifier
+    SMENotVerified = 54,
 
     // General
     ArithmeticOverflow = 90,
@@ -107,4 +110,18 @@ pub enum KoraError {
     CreditLimitExceeded = 130,
     NotInvoiceOwner = 131,
     CurrencyNotAllowed = 132,
+    // Minting/amending an invoice would push the SME's aggregate OutstandingExposure
+    // above their risk_registry-assigned SmeProfile.credit_limit
+    CreditLimitExceeded = 120,
+    // A currency symbol is not on the invoice_nft CurrencyAllowlist
+    CurrencyNotAllowed = 121,
+    // Access-control admin-action multisig
+    InvalidThreshold = 122,
+    ProposalNotFound = 123,
+    ProposalAlreadyExecuted = 124,
+    ProposalExpired = 125,
+    AlreadyApproved = 126,
+    ThresholdNotMet = 127,
+    MultisigNotConfigured = 128,
+    SignerNotFound = 129,
 }
