@@ -6,13 +6,19 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::{Listing, RiskTier},
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
 // ~30 days in ledgers at ~5 s/ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
 const PERSISTENT_TTL_BUMP: u32 = 518_400;
+
+/// Default minimum contribution floor for `fund_invoice`, in a token's smallest unit.
+/// ~1 unit assuming a 7-decimal stablecoin (Stellar/Soroban's `STANDARD_DECIMALS`) —
+/// small enough not to block genuine small investors, large enough that dust-sized
+/// storage-griefing contributions are no longer economically free (#451).
+const DEFAULT_MIN_CONTRIBUTION: i128 = 10_000_000;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -30,6 +36,9 @@ pub enum DataKey {
     UpgradeProposal,
     /// Per-risk-tier fee override: TierFeeBps(ordinal) where AAA=0, AA=1, A=2, B=3, C=4 (#210)
     TierFeeBps(u32),
+    /// Minimum contribution floor for `fund_invoice` (#451). Defaults to
+    /// `DEFAULT_MIN_CONTRIBUTION` when unset.
+    MinContributionAmount,
     /// Per-investor net contribution for refunds
     Contribution(u64, Address),
     /// Refund claimed flag
@@ -74,7 +83,6 @@ impl MarketplaceContract {
             return Err(KoraError::AlreadyInitialized);
         }
         require_valid_fee_bps(fee_bps)?;
-        require_valid_fee_bps(referrer_split_bps)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::InvoiceNft, &invoice_nft);
         env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
@@ -89,7 +97,8 @@ impl MarketplaceContract {
             access_control,
             risk_registry,
             fee_bps,
-            referrer_split_bps,
+            // No referrer split at initialization; configure via set_referrer_split_bps.
+            referrer_split_bps: 0,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(())
@@ -131,6 +140,36 @@ impl MarketplaceContract {
     /// Returns the current fee in basis points.
     pub fn get_fee_bps(env: Env) -> Result<u32, KoraError> {
         Ok(Self::load_config(&env)?.fee_bps)
+    }
+
+    /// Set the minimum contribution floor for `fund_invoice`. Admin only.
+    ///
+    /// Contributions below this amount are rejected unless they exactly complete the
+    /// listing's remaining funding target, closing off cheap dust-contribution
+    /// storage-griefing of a listing (#451).
+    pub fn set_min_contribution(
+        env: Env,
+        admin: Address,
+        min_contribution: i128,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        if min_contribution < 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinContributionAmount, &min_contribution);
+        Ok(())
+    }
+
+    /// Returns the current minimum contribution floor for `fund_invoice` (#451).
+    /// Defaults to `DEFAULT_MIN_CONTRIBUTION` when never explicitly set.
+    pub fn get_min_contribution(env: Env) -> i128 {
+        Self::min_contribution_floor(&env)
     }
 
     /// Set a per-risk-tier fee override. Admin only. (#210)
@@ -326,6 +365,13 @@ impl MarketplaceContract {
         let remaining = safe_sub(listing.asking_price, listing.funded_amount)?;
         if amount > remaining {
             return Err(KoraError::ExceedsFundingTarget);
+        }
+
+        // Reject dust contributions below the configured floor unless this contribution
+        // exactly completes the remaining funding target — genuine "top-off" contributions
+        // near full funding must not be blocked (#451).
+        if amount < Self::min_contribution_floor(&env) && amount != remaining {
+            return Err(KoraError::ContributionBelowMinimum);
         }
 
         let config = Self::load_config(&env)?;
@@ -771,6 +817,15 @@ impl MarketplaceContract {
             }
         }
         Ok(())
+    }
+
+    /// Current minimum contribution floor for `fund_invoice`, defaulting to
+    /// `DEFAULT_MIN_CONTRIBUTION` when never explicitly set via `set_min_contribution` (#451).
+    fn min_contribution_floor(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinContributionAmount)
+            .unwrap_or(DEFAULT_MIN_CONTRIBUTION)
     }
 
     /// Extend the TTL of any persistent storage entry.

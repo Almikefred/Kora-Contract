@@ -70,8 +70,6 @@ pub enum KoraError {
     NotInitialized = 96,
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
-    // Field value exceeds the allowed maximum length
-    FieldTooLong = 102,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
@@ -94,4 +92,8 @@ pub enum KoraError {
     // Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+    // Contribution below the configured per-listing minimum floor (#451)
+    ContributionBelowMinimum = 120,
+    // emergency_withdraw called without a prior declare_emergency (#453)
+    EmergencyNotDeclared = 121,
 }

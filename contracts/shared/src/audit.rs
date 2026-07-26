@@ -39,6 +39,9 @@ pub enum AdminActionType {
     ExecuteWithdrawalCap,
     TreasuryProposeUpgrade,
     TreasuryExecuteUpgrade,
+    SetAccessControl,
+    DeclareEmergency,
+    RevokeEmergency,
     // ── RiskRegistry ─────────────────────────────────────────────────────────
     AddVerifier,
     RemoveVerifier,

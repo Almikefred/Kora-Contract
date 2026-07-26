@@ -32,14 +32,21 @@ pub enum DataKey {
     UpgradeProposal,
     /// Reentrancy guard flag (instance-level).
     WithdrawalLock,
-    /// Maximum total withdrawal allowed per EPOCH_DURATION window (0 = uncapped).
-    WithdrawalCap,
-    /// Pending cap change proposal: (new_cap, proposed_at).
-    WithdrawalCapProposal,
-    /// Timestamp when the current rate-limit epoch started.
-    EpochStart,
-    /// Total withdrawn in the current epoch (resets each epoch).
-    EpochWithdrawn,
+    /// Maximum total withdrawal allowed per EPOCH_DURATION window for a given
+    /// token (0 = uncapped). Keyed by token so unrelated tokens' caps don't
+    /// share a single global quota (#452).
+    WithdrawalCap(Address),
+    /// Pending cap change proposal for a given token: (new_cap, proposed_at).
+    WithdrawalCapProposal(Address),
+    /// Timestamp when the current rate-limit epoch started, per token.
+    EpochStart(Address),
+    /// Total withdrawn in the current epoch, per token (resets each epoch).
+    EpochWithdrawn(Address),
+    /// Address of the `access_control` contract instance (optional — pause
+    /// enforcement is skipped when unset, e.g. in unit tests) (#454).
+    AccessControl,
+    /// Distinct, admin-declared flag gating `emergency_withdraw` (#453).
+    EmergencyDeclared,
     // ── Audit log ─────────────────────────────────────────────────────────────
     /// Next write position in the audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
     AuditLogHead,
@@ -68,7 +75,9 @@ impl TreasuryContract {
     /// - `KoraError::InvalidAddress` — `admin` is the contract's own address.
     ///
     /// **Security:** No auth required on first call. Subsequent calls revert immediately.
-    /// Initializes rate-limit state (epoch start, epoch withdrawn, cap = 0 = uncapped).
+    /// Per-token rate-limit state (cap, epoch start, epoch withdrawn) is lazily
+    /// initialized the first time each token is whitelisted / rate-limited — see
+    /// `enforce_rate_limit` — and defaults to uncapped (#452).
     pub fn initialize(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
@@ -87,13 +96,32 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        // Initialize rate-limit state: uncapped, epoch starts now, zero withdrawn.
-        env.storage().instance().set(&DataKey::WithdrawalCap, &0i128);
+        events::treasury_initialized(&env, &admin, fee_bps);
+        Ok(())
+    }
+
+    /// Set (or update) the `access_control` contract reference used to gate
+    /// `withdraw` behind the protocol-wide pause flag. Admin only.
+    ///
+    /// A post-init setter rather than an `initialize` parameter, so existing
+    /// deployments/tests can opt in without changing `initialize`'s signature.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`.
+    pub fn set_access_control(
+        env: Env,
+        admin: Address,
+        access_control: Address,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
-            .set(&DataKey::EpochStart, &env.ledger().timestamp());
-        env.storage().instance().set(&DataKey::EpochWithdrawn, &0i128);
-        events::treasury_initialized(&env, &admin, fee_bps);
+            .set(&DataKey::AccessControl, &access_control);
+        events::access_control_updated(&env, &admin, &access_control);
+        Self::append_audit_entry(&env, &admin, AdminActionType::SetAccessControl);
         Ok(())
     }
 
@@ -168,6 +196,14 @@ impl TreasuryContract {
     ///
     /// **Security:** No auth required — the token transfer itself is the proof of payment.
     /// The amount is validated to be > 0 to prevent no-op accounting entries.
+    ///
+    /// **Pause behavior (#454):** Intentionally *exempt* from the protocol pause check.
+    /// `collect_fee` is only ever invoked mid-transaction by `marketplace.fund_invoice`,
+    /// which already gates its own entry point with `require_not_paused`. Re-checking
+    /// pause state here would let a treasury-only pause (with marketplace left unpaused)
+    /// silently revert an otherwise-valid marketplace funding flow after the fee transfer
+    /// already landed, for no added security benefit — mirroring the documented pause
+    /// exceptions for repayment paths in `invoice_nft` / `financing_pool`.
     pub fn collect_fee(env: Env, token: Address, amount: i128) -> Result<(), KoraError> {
         if amount <= 0 {
             return Err(KoraError::InvalidAmount);
@@ -197,14 +233,16 @@ impl TreasuryContract {
     ///
     /// **Errors:**
     /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::ProtocolPaused` — The protocol is paused (see `set_access_control`).
     /// - `KoraError::InvalidAmount` — `amount` is ≤ 0 or exceeds `MAX_AMOUNT`.
     /// - `KoraError::TokenNotWhitelisted` — Token is not whitelisted.
-    /// - `KoraError::WithdrawalRateLimitExceeded` — Would exceed the rolling 24 h cap.
+    /// - `KoraError::WithdrawalRateLimitExceeded` — Would exceed the token's rolling 24 h cap.
     /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
     /// - `KoraError::InsufficientPoolBalance` — Contract balance is less than `amount`.
     ///
-    /// **Security:** Requires `admin.require_auth()`. Subject to the rolling 24 h withdrawal cap.
-    /// Protected against reentrancy via RAII `ReentrancyGuard`.
+    /// **Security:** Requires `admin.require_auth()`. Blocked while the protocol is paused.
+    /// Subject to the token's own rolling 24 h withdrawal cap. Protected against reentrancy
+    /// via RAII `ReentrancyGuard`.
     pub fn withdraw(
         env: Env,
         admin: Address,
@@ -215,12 +253,13 @@ impl TreasuryContract {
         // ── Checks ────────────────────────────────────────────────────────────
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(KoraError::InvalidAmount);
         }
         require_within_max_amount(amount)?;
         Self::require_whitelisted_token(&env, &token)?;
-        Self::enforce_rate_limit(&env, amount)?;
+        Self::enforce_rate_limit(&env, &token, amount)?;
 
         // Acquire reentrancy guard — released automatically when _guard drops
         let _guard = ReentrancyGuard::new(&env)?;
@@ -243,7 +282,7 @@ impl TreasuryContract {
             env.storage().persistent().set(&collected_key, &new_collected);
             Self::bump_persistent(&env, &collected_key);
         }
-        Self::record_withdrawal(&env, amount);
+        Self::record_withdrawal(&env, &token, amount);
 
         // ── Interactions ──────────────────────────────────────────────────────
         token_client.transfer(&env.current_contract_address(), &recipient, &amount);
@@ -262,11 +301,22 @@ impl TreasuryContract {
     ///
     /// **Errors:**
     /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::EmergencyNotDeclared` — No prior `declare_emergency` call is in effect.
     /// - `KoraError::TokenNotWhitelisted` — Token is not whitelisted.
     /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
     ///
-    /// **Security:** Requires `admin.require_auth()`. Protected against reentrancy via RAII
-    /// `ReentrancyGuard`. No-ops silently when balance is zero (not an error).
+    /// **Security:** Requires `admin.require_auth()`. Gated behind `declare_emergency` (#453)
+    /// so the uncapped drain path is a distinct, auditable admin action rather than always
+    /// callable. Protected against reentrancy via RAII `ReentrancyGuard`. No-ops silently
+    /// when balance is zero (not an error).
+    ///
+    /// **Deliberately independent of the protocol pause flag** (unlike `withdraw`): the whole
+    /// point of `emergency_withdraw` is to evacuate funds during an incident, which is
+    /// precisely when the protocol is most likely to already be paused. Gating it on
+    /// `!is_paused()` (as a literal reading of #454 would require) would make it unusable
+    /// exactly when it's needed, and combined with #453's requirement would make the function
+    /// permanently uncallable. `declare_emergency` is the intentionally distinct precondition
+    /// instead — see #453 and #454 for the full reasoning.
     pub fn emergency_withdraw(
         env: Env,
         admin: Address,
@@ -276,6 +326,14 @@ impl TreasuryContract {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         Self::require_whitelisted_token(&env, &token)?;
+        let declared: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyDeclared)
+            .unwrap_or(false);
+        if !declared {
+            return Err(KoraError::EmergencyNotDeclared);
+        }
 
         let _guard = ReentrancyGuard::new(&env)?;
 
@@ -290,13 +348,74 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Declare a treasury emergency, unlocking `emergency_withdraw`. Admin only.
+    ///
+    /// A distinct, auditable action from ordinary withdrawals — required before the
+    /// uncapped drain path in `emergency_withdraw` becomes callable (#453). Stays in
+    /// effect until `revoke_emergency` is called.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `emergency_declared` event.
+    pub fn declare_emergency(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyDeclared, &true);
+        events::emergency_declared(&env, &admin);
+        Self::append_audit_entry(&env, &admin, AdminActionType::DeclareEmergency);
+        Ok(())
+    }
+
+    /// Revoke a previously declared emergency, re-locking `emergency_withdraw`. Admin only.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Emits `emergency_revoked` event.
+    pub fn revoke_emergency(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyDeclared, &false);
+        events::emergency_revoked(&env, &admin);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RevokeEmergency);
+        Ok(())
+    }
+
+    /// Returns whether a treasury emergency is currently declared.
+    ///
+    /// **Security:** Read-only view. No authorization required.
+    pub fn is_emergency_declared(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyDeclared)
+            .unwrap_or(false)
+    }
+
+    /// Returns whether the protocol is currently paused, as seen by this treasury
+    /// instance's configured `access_control` reference (`false` if unset).
+    ///
+    /// **Security:** Read-only view. No authorization required.
+    pub fn is_paused(env: Env) -> bool {
+        Self::require_not_paused(&env).is_err()
+    }
+
     // ── Withdrawal cap management ─────────────────────────────────────────────
 
-    /// Propose a new withdrawal cap. Takes effect after `UPGRADE_TIMELOCK_DELAY` (24 h).
+    /// Propose a new withdrawal cap for a specific token. Takes effect after
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h). Each whitelisted token has its own independent
+    /// rolling cap and epoch (#452) — proposing a cap for one token never affects any
+    /// other token's quota.
     ///
     /// **Parameters:**
     /// - `admin` — Must be the current admin address.
-    /// - `new_cap` — The new rolling 24 h withdrawal limit in stroops. Set to 0 to remove the limit.
+    /// - `token` — The token this cap applies to.
+    /// - `new_cap` — The new rolling 24 h withdrawal limit in the token's smallest unit.
+    ///   Set to 0 to remove the limit.
     ///
     /// **Errors:**
     /// - `KoraError::NotAdmin` — Caller is not the admin.
@@ -307,6 +426,7 @@ impl TreasuryContract {
     pub fn propose_withdrawal_cap(
         env: Env,
         admin: Address,
+        token: Address,
         new_cap: i128,
     ) -> Result<(), KoraError> {
         admin.require_auth();
@@ -314,66 +434,64 @@ impl TreasuryContract {
         if new_cap < 0 {
             return Err(KoraError::InvalidAmount);
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::WithdrawalCapProposal, &(new_cap, env.ledger().timestamp()));
-        events::withdrawal_cap_proposed(&env, &admin, new_cap);
+        env.storage().instance().set(
+            &DataKey::WithdrawalCapProposal(token.clone()),
+            &(new_cap, env.ledger().timestamp()),
+        );
+        events::withdrawal_cap_proposed(&env, &admin, &token, new_cap);
         Self::append_audit_entry(&env, &admin, AdminActionType::ProposeWithdrawalCap);
         Ok(())
     }
 
-    /// Execute a previously proposed withdrawal cap change after the timelock elapses.
+    /// Execute a previously proposed withdrawal cap change for a token after the
+    /// timelock elapses.
     ///
     /// Admin only. Applies the new rolling 24-hour withdrawal limit that was previously
     /// queued via `propose_withdrawal_cap`, atomically clearing the pending proposal.
     ///
     /// **Parameters:**
     /// - `admin` — Must be the current admin address.
+    /// - `token` — The token whose proposed cap should be applied.
     ///
     /// **Errors:**
     /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::NoCapChangeProposed` — No withdrawal cap proposal is pending.
+    /// - `KoraError::NoCapChangeProposed` — No withdrawal cap proposal is pending for `token`.
     /// - `KoraError::WithdrawalCapTimelockNotElapsed` — 24-hour timelock has not yet passed.
     ///
     /// **Security:** Requires `admin.require_auth()`. Clears the proposal atomically before
     /// applying the new cap. Emits `withdrawal_cap_updated` event.
-    pub fn execute_withdrawal_cap(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn execute_withdrawal_cap(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        let proposal_key = DataKey::WithdrawalCapProposal(token.clone());
         let (new_cap, proposed_at): (i128, u64) = env
             .storage()
             .instance()
-            .get(&DataKey::WithdrawalCapProposal)
+            .get(&proposal_key)
             .ok_or(KoraError::NoCapChangeProposed)?;
         if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
             return Err(KoraError::WithdrawalCapTimelockNotElapsed);
         }
-        let old_cap: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawalCap)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::WithdrawalCap, &new_cap);
-        env.storage()
-            .instance()
-            .remove(&DataKey::WithdrawalCapProposal);
-        events::withdrawal_cap_updated(&env, &admin, old_cap, new_cap);
+        let cap_key = DataKey::WithdrawalCap(token.clone());
+        let old_cap: i128 = env.storage().instance().get(&cap_key).unwrap_or(0);
+        env.storage().instance().set(&cap_key, &new_cap);
+        env.storage().instance().remove(&proposal_key);
+        events::withdrawal_cap_updated(&env, &admin, &token, old_cap, new_cap);
         Self::append_audit_entry(&env, &admin, AdminActionType::ExecuteWithdrawalCap);
         Ok(())
     }
 
-    /// Returns the current rolling 24-hour withdrawal cap in stroops.
+    /// Returns the current rolling 24-hour withdrawal cap for a token, in its smallest unit.
     ///
-    /// A value of `0` means the cap is disabled (uncapped). A positive value is the
-    /// maximum total amount that can be withdrawn within any 24-hour epoch.
+    /// A value of `0` means the cap is disabled (uncapped) for that token. A positive value
+    /// is the maximum total amount that can be withdrawn within any 24-hour epoch. Each
+    /// token's cap is fully independent of every other token's (#452).
     ///
     /// **Security:** Read-only view. No authorization required.
-    pub fn get_withdrawal_cap(env: Env) -> i128 {
+    pub fn get_withdrawal_cap(env: Env, token: Address) -> i128 {
         env.storage()
             .instance()
-            .get(&DataKey::WithdrawalCap)
+            .get(&DataKey::WithdrawalCap(token))
             .unwrap_or(0)
     }
 
@@ -560,34 +678,35 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Advance the epoch if 24 h have elapsed, then check the cap.
-    fn enforce_rate_limit(env: &Env, amount: i128) -> Result<(), KoraError> {
+    /// Advance `token`'s epoch if 24 h have elapsed, then check its cap. Each token has
+    /// its own independent cap/epoch (#452) — exhausting one token's quota never blocks
+    /// another token's withdrawal.
+    fn enforce_rate_limit(env: &Env, token: &Address, amount: i128) -> Result<(), KoraError> {
         let cap: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::WithdrawalCap)
+            .get(&DataKey::WithdrawalCap(token.clone()))
             .unwrap_or(0);
         if cap == 0 {
             return Ok(());
         }
 
         let now = env.ledger().timestamp();
+        let epoch_start_key = DataKey::EpochStart(token.clone());
+        let epoch_withdrawn_key = DataKey::EpochWithdrawn(token.clone());
         let epoch_start: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::EpochStart)
+            .get(&epoch_start_key)
             .unwrap_or(now);
 
         let epoch_withdrawn: i128 = if now.saturating_sub(epoch_start) >= EPOCH_DURATION {
             // New epoch: reset counters.
-            env.storage().instance().set(&DataKey::EpochStart, &now);
-            env.storage().instance().set(&DataKey::EpochWithdrawn, &0i128);
+            env.storage().instance().set(&epoch_start_key, &now);
+            env.storage().instance().set(&epoch_withdrawn_key, &0i128);
             0
         } else {
-            env.storage()
-                .instance()
-                .get(&DataKey::EpochWithdrawn)
-                .unwrap_or(0)
+            env.storage().instance().get(&epoch_withdrawn_key).unwrap_or(0)
         };
 
         let new_total = epoch_withdrawn
@@ -599,24 +718,46 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Record a successful withdrawal against the current epoch's running total.
-    fn record_withdrawal(env: &Env, amount: i128) {
+    /// Record a successful withdrawal against `token`'s current epoch running total.
+    fn record_withdrawal(env: &Env, token: &Address, amount: i128) {
         let cap: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::WithdrawalCap)
+            .get(&DataKey::WithdrawalCap(token.clone()))
             .unwrap_or(0);
         if cap == 0 {
             return;
         }
+        let epoch_withdrawn_key = DataKey::EpochWithdrawn(token.clone());
         let current: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::EpochWithdrawn)
+            .get(&epoch_withdrawn_key)
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::EpochWithdrawn, &current.saturating_add(amount));
+            .set(&epoch_withdrawn_key, &current.saturating_add(amount));
+    }
+
+    /// Blocks the caller if the protocol is paused, as reported by the configured
+    /// `access_control` contract. Mirrors `marketplace::require_not_paused` (#454).
+    ///
+    /// If `DataKey::AccessControl` has never been set (e.g. in unit tests that don't
+    /// wire up a real access-control instance), the pause check is skipped rather than
+    /// erroring, so existing deployments/tests are unaffected until they opt in via
+    /// `set_access_control`.
+    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+        if let Some(ac_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AccessControl)
+        {
+            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
+            if ac.is_paused() {
+                return Err(KoraError::ProtocolPaused);
+            }
+        }
+        Ok(())
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
@@ -984,6 +1125,7 @@ mod tests {
         let token_id = deploy_token(&env, &admin, &contract_id, 0);
         let recipient = Address::generate(&env);
         client.whitelist_token(&admin, &token_id).unwrap();
+        client.declare_emergency(&admin).unwrap();
         assert!(client
             .try_emergency_withdraw(&admin, &token_id, &recipient)
             .is_ok());
@@ -996,6 +1138,7 @@ mod tests {
         let token_id = deploy_token(&env, &admin, &contract_id, 5_000);
         let recipient = Address::generate(&env);
         client.whitelist_token(&admin, &token_id).unwrap();
+        client.declare_emergency(&admin).unwrap();
         client.emergency_withdraw(&admin, &token_id, &recipient).unwrap();
         assert_eq!(client.get_balance(&token_id), 0);
     }
@@ -1058,34 +1201,41 @@ mod tests {
 
     #[test]
     fn test_withdrawal_cap_default_is_uncapped() {
-        let (_env, _admin, client) = setup();
-        assert_eq!(client.get_withdrawal_cap(), 0);
+        let (env, _admin, client) = setup();
+        let token = Address::generate(&env);
+        assert_eq!(client.get_withdrawal_cap(&token), 0);
     }
 
     #[test]
     fn test_propose_withdrawal_cap_requires_admin() {
         let (env, _admin, client) = setup();
         let non_admin = Address::generate(&env);
-        assert!(client.try_propose_withdrawal_cap(&non_admin, &1_000_000i128).is_err());
+        let token = Address::generate(&env);
+        assert!(client
+            .try_propose_withdrawal_cap(&non_admin, &token, &1_000_000i128)
+            .is_err());
     }
 
     #[test]
     fn test_propose_negative_cap_rejected() {
-        let (_env, admin, client) = setup();
-        assert!(client.try_propose_withdrawal_cap(&admin, &-1i128).is_err());
+        let (env, admin, client) = setup();
+        let token = Address::generate(&env);
+        assert!(client.try_propose_withdrawal_cap(&admin, &token, &-1i128).is_err());
     }
 
     #[test]
     fn test_execute_cap_before_timelock_fails() {
-        let (_env, admin, client) = setup();
-        client.propose_withdrawal_cap(&admin, &1_000_000i128);
+        let (env, admin, client) = setup();
+        let token = Address::generate(&env);
+        client.propose_withdrawal_cap(&admin, &token, &1_000_000i128);
         // Timelock hasn't elapsed
-        assert!(client.try_execute_withdrawal_cap(&admin).is_err());
+        assert!(client.try_execute_withdrawal_cap(&admin, &token).is_err());
     }
 
     #[test]
     fn test_execute_cap_without_proposal_fails() {
-        let (_env, admin, client) = setup();
-        assert!(client.try_execute_withdrawal_cap(&admin).is_err());
+        let (env, admin, client) = setup();
+        let token = Address::generate(&env);
+        assert!(client.try_execute_withdrawal_cap(&admin, &token).is_err());
     }
 }
