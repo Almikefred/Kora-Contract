@@ -3,7 +3,7 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer},
+    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer, ProtocolStats},
     validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
@@ -33,6 +33,10 @@ pub enum DataKey {
     MaxPositionBps,
     /// Aggregate funded amount for a given token across all active pools.
     AggregateFunded(Address),
+    /// Installment repayment schedule for a pool, if attached.
+    InstallmentSchedule(u64),
+    /// Protocol-wide aggregate stats.
+    ProtocolStats,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -215,6 +219,16 @@ impl FinancingPoolContract {
             .instance()
             .get(&DataKey::MaxPositionBps)
             .unwrap_or(5_000)
+    }
+
+    /// Returns the configured price oracle address. Lets other protocol
+    /// contracts (e.g. marketplace, for cross-currency funding) reuse the
+    /// same oracle instance instead of wiring a separate reference. (#449)
+    pub fn get_price_oracle(env: Env) -> Result<Address, KoraError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PriceOracle)
+            .ok_or(KoraError::NotInitialized)
     }
 
     /// Register an investor position for a funded invoice. Admin only.
@@ -1068,19 +1082,6 @@ impl FinancingPoolContract {
             return Err(KoraError::PoolAlreadyClosed);
         }
 
-    /// Paginated view of investor positions for an invoice.
-    ///
-    /// Returns at most `limit` positions starting at `offset` (0-based index
-    /// into the position list ordered by investor address key).  An `offset`
-    /// beyond the last position returns an empty vec; `limit` is capped at 100
-    /// to bound per-call CPU cost.
-    pub fn get_positions_page(
-        env: Env,
-        invoice_id: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<Position> {
-        let limit = limit.min(100);
         let positions: Map<Address, Position> = env
             .storage()
             .persistent()
@@ -1095,7 +1096,7 @@ impl FinancingPoolContract {
             .persistent()
             .has(&DataKey::SaleOffer(invoice_id, seller.clone()))
         {
-            return Err(KoraError::SaleAlreadyListed);
+            return Err(KoraError::AlreadyInitialized);
         }
 
         let offer = PositionSaleOffer {
@@ -1188,7 +1189,26 @@ impl FinancingPoolContract {
 
         events::position_sold(&env, invoice_id, &seller, &buyer, offer.price);
         Ok(())
-            .unwrap_or(Map::new(&env));
+    }
+
+    /// Paginated view of investor positions for an invoice.
+    ///
+    /// Returns at most `limit` positions starting at `offset` (0-based index
+    /// into the position list ordered by investor address key).  An `offset`
+    /// beyond the last position returns an empty vec; `limit` is capped at 100
+    /// to bound per-call CPU cost.
+    pub fn get_positions_page(
+        env: Env,
+        invoice_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Position> {
+        let limit = limit.min(100);
+        let positions: Map<Address, Position> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Positions(invoice_id))
+            .unwrap_or_else(|| Map::new(&env));
 
         let all: Vec<Position> = positions.values();
         let total = all.len();
@@ -1343,7 +1363,7 @@ impl FinancingPoolContract {
         // to reject operations without a valid price.
         let pool_currency = Symbol::new(env, "USDC");
 
-        oracle_client.convert(&amount, invoice_currency, &pool_currency)
+        Ok(oracle_client.convert(&amount, invoice_currency, &pool_currency))
     }
 }
 
@@ -1870,8 +1890,6 @@ mod tests {
         let result = client.try_record_position(&admin, &1u64, &investor, &100i128, &1000i128);
         assert!(result.is_ok());
     }
-
-}
 
     #[test]
     fn test_repay_amount_exceeds_max_amount() {

@@ -47,6 +47,10 @@ pub enum DataKey {
     AuditLogTotal,
     /// An audit log entry at ring-buffer position `n`.
     AuditEntry(u64),
+    /// The authorized marketplace contract address. Gates `refund_fee` so
+    /// only the marketplace contract can claw back a previously collected
+    /// fee on behalf of an investor whose listing failed to fund (#450).
+    Marketplace,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -153,6 +157,34 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Set the authorized marketplace contract address. Admin only. Required
+    /// before `refund_fee` can be called by the marketplace. (#450)
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `marketplace` — The marketplace contract address to authorize.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`.
+    pub fn set_marketplace(env: Env, admin: Address, marketplace: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Marketplace, &marketplace);
+        Self::bump_persistent(&env, &DataKey::Marketplace);
+        Ok(())
+    }
+
+    /// Returns the configured marketplace contract address, if set.
+    ///
+    /// **Security:** Read-only view. No authorization required.
+    pub fn get_marketplace(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Marketplace)
+    }
+
     /// Record an incoming fee for a given token. Called by the marketplace after
     /// transferring the fee amount to this contract. Updates the informational
     /// accounting ledger.
@@ -184,6 +216,68 @@ impl TreasuryContract {
         Self::bump_persistent(&env, &key);
 
         events::fee_collected(&env, &env.current_contract_address(), 0, amount, &token);
+        Ok(())
+    }
+
+    /// Claw back a previously collected fee and pay it directly to a recipient.
+    /// Restricted to the authorized marketplace contract (set via
+    /// `set_marketplace`). Used when a listing fails to reach full funding and
+    /// the protocol fee already sent to treasury must be refunded to the
+    /// investor. (#450)
+    ///
+    /// **Parameters:**
+    /// - `marketplace` — Must be the authorized marketplace contract address.
+    /// - `token` — The whitelisted token to refund.
+    /// - `amount` — The amount to claw back (must be > 0).
+    /// - `recipient` — The investor address to receive the refunded fee.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotInitialized` — No marketplace has been configured via `set_marketplace`.
+    /// - `KoraError::Unauthorized` — Caller is not the authorized marketplace contract.
+    /// - `KoraError::InvalidAmount` — `amount` is ≤ 0.
+    /// - `KoraError::TokenNotWhitelisted` — Token is not whitelisted.
+    ///
+    /// **Security:** Requires `marketplace.require_auth()`, mirroring the
+    /// `financing_pool::release_funds` cross-contract authorization pattern —
+    /// the marketplace contract calls this passing its own address, and the
+    /// host attributes the call to the marketplace contract. Not subject to
+    /// the reentrancy guard or rate-limit cap used by `withdraw`, as this is a
+    /// narrowly-scoped clawback path restricted to the marketplace contract only.
+    pub fn refund_fee(
+        env: Env,
+        marketplace: Address,
+        token: Address,
+        amount: i128,
+        recipient: Address,
+    ) -> Result<(), KoraError> {
+        marketplace.require_auth();
+
+        let authorized: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Marketplace)
+            .ok_or(KoraError::NotInitialized)?;
+        if authorized != marketplace {
+            return Err(KoraError::Unauthorized);
+        }
+
+        if amount <= 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+        Self::require_whitelisted_token(&env, &token)?;
+
+        // Reverse the earlier collect_fee entry (never below zero).
+        let collected_key = DataKey::Collected(token.clone());
+        if let Some(collected) = env.storage().persistent().get::<_, i128>(&collected_key) {
+            let new_collected = collected.saturating_sub(amount);
+            env.storage().persistent().set(&collected_key, &new_collected);
+            Self::bump_persistent(&env, &collected_key);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        events::fee_withdrawn(&env, &marketplace, &token, amount);
         Ok(())
     }
 
@@ -344,9 +438,9 @@ impl TreasuryContract {
             .storage()
             .instance()
             .get(&DataKey::WithdrawalCapProposal)
-            .ok_or(KoraError::NoCapChangeProposed)?;
+            .ok_or(KoraError::NoUpgradeProposed)?;
         if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
-            return Err(KoraError::WithdrawalCapTimelockNotElapsed);
+            return Err(KoraError::UpgradeTimelockNotElapsed);
         }
         let old_cap: i128 = env
             .storage()

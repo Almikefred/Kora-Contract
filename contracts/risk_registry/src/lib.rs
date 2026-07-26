@@ -151,7 +151,7 @@ impl RiskRegistryContract {
             .ok_or(KoraError::NotInitialized)?;
 
         if stake_amount < minimum_stake {
-            return Err(KoraError::InsufficientFunds);
+            return Err(KoraError::InsufficientPoolBalance);
         }
 
         let token_addr: Address = env
@@ -591,7 +591,7 @@ impl RiskRegistryContract {
                 .checked_add(MIN_SCORE_UPDATE_INTERVAL)
                 .ok_or(KoraError::ArithmeticOverflow)?;
             if env.ledger().timestamp() < next_allowed {
-                return Err(KoraError::ScoreUpdateCooldownNotElapsed);
+                return Err(KoraError::UpgradeTimelockNotElapsed);
             }
         }
 
@@ -737,7 +737,7 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&key)
-            .ok_or(KoraError::DebtorNotRegistered)?;
+            .ok_or(KoraError::SMENotRegistered)?;
         Self::bump_persistent(&env, &key);
         Ok(score)
     }

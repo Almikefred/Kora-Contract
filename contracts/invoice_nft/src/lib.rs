@@ -251,6 +251,7 @@ impl InvoiceNftContract {
                         created_at: old.created_at,
                         funded_at: old.funded_at,
                         repaid_at: old.repaid_at,
+                        metadata_hash: Bytes::new(&env),
                         notes: None,
                     };
                     env.storage().persistent().set(&key, &upgraded);
@@ -303,7 +304,7 @@ impl InvoiceNftContract {
     /// - `KoraError::EmptyBytes` — `debtor_hash` is empty.
     /// - `KoraError::EmptyString` — `ipfs_cid` is empty.
     /// - `KoraError::FieldTooLong` — `debtor_hash` or `ipfs_cid` exceed their max lengths.
-    /// - `KoraError::CreditLimitExceeded` — Adding this invoice would exceed the SME's credit limit.
+    /// - `KoraError::ExceedsFundingTarget` — Adding this invoice would exceed the SME's credit limit.
     /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
     ///
     /// **Security:** Requires `sme.require_auth()`. The protocol must not be paused.
@@ -352,7 +353,7 @@ impl InvoiceNftContract {
                             .checked_add(amount)
                             .ok_or(KoraError::ArithmeticOverflow)?;
                         if new_exposure > profile.credit_limit {
-                            return Err(KoraError::CreditLimitExceeded);
+                            return Err(KoraError::ExceedsFundingTarget);
                         }
                     }
                 }
@@ -477,7 +478,7 @@ impl InvoiceNftContract {
     /// - `KoraError::ProtocolPaused` — Protocol is paused.
     /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
     /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
-    /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    /// - `KoraError::Unauthorized` — Caller is not the invoice's SME.
     /// - `KoraError::InvalidAmount` / `KoraError::InvalidDueDate` / `KoraError::InvalidRiskScore` — Validation failures.
     ///
     /// **Security:** Requires `sme.require_auth()`. Rejected once the invoice is listed
@@ -506,7 +507,7 @@ impl InvoiceNftContract {
             return Err(KoraError::InvalidInvoiceStatus);
         }
         if invoice.sme != sme {
-            return Err(KoraError::NotInvoiceOwner);
+            return Err(KoraError::Unauthorized);
         }
 
         invoice.debtor_hash = debtor_hash;
@@ -537,7 +538,7 @@ impl InvoiceNftContract {
     /// - `KoraError::ProtocolPaused` — Protocol is paused.
     /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
     /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
-    /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    /// - `KoraError::Unauthorized` — Caller is not the invoice's SME.
     ///
     /// **Security:** Requires `sme.require_auth()`. Irreversible — the invoice is deleted
     /// from on-chain storage and cannot be recovered. Outstanding exposure is decremented.
@@ -554,7 +555,7 @@ impl InvoiceNftContract {
             return Err(KoraError::InvalidInvoiceStatus);
         }
         if invoice.sme != sme {
-            return Err(KoraError::NotInvoiceOwner);
+            return Err(KoraError::Unauthorized);
         }
 
         env.storage().persistent().remove(&DataKey::Invoice(invoice_id));
@@ -966,7 +967,7 @@ impl InvoiceNftContract {
             .get(&DataKey::CurrencyAllowlist(currency.clone()))
             .unwrap_or(false);
         if !allowed {
-            return Err(KoraError::CurrencyNotAllowed);
+            return Err(KoraError::TokenNotWhitelisted);
         }
         Ok(())
     }
@@ -991,6 +992,13 @@ impl InvoiceNftContract {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_BUMP,
         );
+    }
+
+    /// Extend the TTL of any persistent storage entry.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
     }
 }
 
@@ -1999,7 +2007,7 @@ mod tests {
         let result = client.try_amend_invoice(
             &other, &id, &debtor_hash, &1_000_000_000i128, &due_date, &ipfs_cid, &10u32,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotInvoiceOwner);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::Unauthorized);
     }
 
     #[test]
@@ -2061,7 +2069,7 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let result = client.try_withdraw_invoice(&other, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotInvoiceOwner);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::Unauthorized);
     }
 
     #[test]

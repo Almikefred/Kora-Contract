@@ -313,7 +313,7 @@ impl AccessControlContract {
     ///
     /// **Errors:**
     /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::InvalidThreshold` — `threshold` is 0 or greater than the number of signers.
+    /// - `KoraError::InvalidAmount` — `threshold` is 0 or greater than the number of signers.
     ///
     /// **Security:** Requires `admin.require_auth()`. Once this is called, sensitive admin actions
     /// (pause, role management, admin transfer) must go through the multisig proposal flow.
@@ -328,7 +328,7 @@ impl AccessControlContract {
 
         let signer_count = signers.len();
         if threshold == 0 || threshold > signer_count {
-            return Err(KoraError::InvalidThreshold);
+            return Err(KoraError::InvalidAmount);
         }
 
         let config = MultisigConfig { threshold, signers };
@@ -415,10 +415,10 @@ impl AccessControlContract {
     ///
     /// **Errors:**
     /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
-    /// - `KoraError::ProposalNotFound` — No proposal exists with the given ID.
-    /// - `KoraError::ProposalAlreadyExecuted` — Proposal has already been executed.
-    /// - `KoraError::ProposalExpired` — Proposal's TTL has elapsed.
-    /// - `KoraError::AlreadyApproved` — Caller has already voted on this proposal.
+    /// - `KoraError::ParameterProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ParameterProposalAlreadyExecuted` — Proposal has already been executed.
+    /// - `KoraError::FundingDeadlinePassed` — Proposal's TTL has elapsed.
+    /// - `KoraError::ParameterProposalAlreadyExecuted` — Caller has already voted on this proposal.
     ///
     /// **Security:** Requires `approver.require_auth()`. Each signer may only vote once per proposal.
     pub fn approve_action(env: Env, approver: Address, proposal_id: u64) -> Result<(), KoraError> {
@@ -430,18 +430,18 @@ impl AccessControlContract {
             .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .ok_or(KoraError::ProposalNotFound)?;
+            .ok_or(KoraError::ParameterProposalNotFound)?;
 
         if proposal.executed {
-            return Err(KoraError::ProposalAlreadyExecuted);
+            return Err(KoraError::ParameterProposalAlreadyExecuted);
         }
         if env.ledger().timestamp() > proposal.expires_at {
-            return Err(KoraError::ProposalExpired);
+            return Err(KoraError::FundingDeadlinePassed);
         }
 
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).ok_or(KoraError::Unauthorized)? == approver {
-                return Err(KoraError::AlreadyApproved);
+                return Err(KoraError::ParameterProposalAlreadyExecuted);
             }
         }
 
@@ -465,10 +465,10 @@ impl AccessControlContract {
     ///
     /// **Errors:**
     /// - `KoraError::NotMultisigSigner` — Caller is not a configured signer.
-    /// - `KoraError::ProposalNotFound` — No proposal exists with the given ID.
-    /// - `KoraError::ProposalAlreadyExecuted` — Proposal has already been executed.
-    /// - `KoraError::ProposalExpired` — Proposal's TTL has elapsed.
-    /// - `KoraError::ThresholdNotMet` — Not enough approvals have been collected yet.
+    /// - `KoraError::ParameterProposalNotFound` — No proposal exists with the given ID.
+    /// - `KoraError::ParameterProposalAlreadyExecuted` — Proposal has already been executed.
+    /// - `KoraError::FundingDeadlinePassed` — Proposal's TTL has elapsed.
+    /// - `KoraError::Unauthorized` — Not enough approvals have been collected yet.
     ///
     /// **Security:** Requires `executor.require_auth()`. Once executed, the proposal is marked
     /// as executed and cannot be re-executed. The proposal's action is applied atomically.
@@ -481,16 +481,16 @@ impl AccessControlContract {
             .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .ok_or(KoraError::ProposalNotFound)?;
+            .ok_or(KoraError::ParameterProposalNotFound)?;
 
         if proposal.executed {
-            return Err(KoraError::ProposalAlreadyExecuted);
+            return Err(KoraError::ParameterProposalAlreadyExecuted);
         }
         if env.ledger().timestamp() > proposal.expires_at {
-            return Err(KoraError::ProposalExpired);
+            return Err(KoraError::FundingDeadlinePassed);
         }
         if proposal.approvals.len() < config.threshold {
-            return Err(KoraError::ThresholdNotMet);
+            return Err(KoraError::Unauthorized);
         }
 
         proposal.executed = true;
@@ -546,20 +546,20 @@ impl AccessControlContract {
     /// **Parameters:**
     /// - `proposal_id` — The ID of the proposal to retrieve.
     ///
-    /// **Returns:** The full `Proposal` struct, or `KoraError::ProposalNotFound`.
+    /// **Returns:** The full `Proposal` struct, or `KoraError::ParameterProposalNotFound`.
     ///
     /// **Security:** Read-only view with no authorization check.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, KoraError> {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .ok_or(KoraError::ProposalNotFound)
+            .ok_or(KoraError::ParameterProposalNotFound)
     }
 
     /// Get the current multisig configuration.
     ///
     /// **Returns:** The `MultisigConfig` (threshold + signer set), or
-    /// `KoraError::MultisigNotConfigured` if multisig has not been set up.
+    /// `KoraError::NotInitialized` if multisig has not been set up.
     ///
     /// **Security:** Read-only view with no authorization check.
     pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, KoraError> {
@@ -654,7 +654,7 @@ impl AccessControlContract {
         }
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == signer {
-                return Err(KoraError::AlreadyVoted);
+                return Err(KoraError::ParameterProposalAlreadyExecuted);
             }
         }
 
@@ -692,10 +692,10 @@ impl AccessControlContract {
             return Err(KoraError::ParameterProposalAlreadyExecuted);
         }
         if proposal.approvals.len() < config.threshold {
-            return Err(KoraError::GovernanceThresholdNotMet);
+            return Err(KoraError::Unauthorized);
         }
         if env.ledger().timestamp() < proposal.created_at + GOVERNANCE_TIMELOCK_DELAY {
-            return Err(KoraError::GovernanceTimelockNotElapsed);
+            return Err(KoraError::UpgradeTimelockNotElapsed);
         }
 
         proposal.executed = true;
@@ -970,7 +970,7 @@ impl AccessControlContract {
         env.storage()
             .persistent()
             .get(&DataKey::MultisigConfig)
-            .ok_or(KoraError::MultisigNotConfigured)
+            .ok_or(KoraError::NotInitialized)
     }
 
     fn require_signer(config: &MultisigConfig, caller: &Address) -> Result<(), KoraError> {
@@ -979,7 +979,7 @@ impl AccessControlContract {
                 return Ok(());
             }
         }
-        Err(KoraError::SignerNotFound)
+        Err(KoraError::Unauthorized)
     }
 
     /// Validate a proposed parameter value against its allowed range.
@@ -991,7 +991,7 @@ impl AccessControlContract {
         if ok {
             Ok(())
         } else {
-            Err(KoraError::InvalidParameterValue)
+            Err(KoraError::InvalidAmount)
         }
     }
 }
@@ -1703,7 +1703,6 @@ fn test_role_override() {
         let result = client.try_initialize(&admin);
         assert!(result.is_err());
     }
-}
 
     #[test]
     fn test_interleaved_pause_and_role_operations_remain_independent() {
