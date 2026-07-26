@@ -1,6 +1,32 @@
 use soroban_sdk::contracterror;
 
+/// Common validation/arithmetic errors shared by every contract's
+/// `kora_shared::validation` and `kora_shared::reentrancy` helpers.
+///
+/// Kept deliberately small: Soroban's `#[contracterror]` macro caps an error
+/// enum at 50 variants (`SCSpecUDTErrorEnumV0.cases<50>` in the XDR spec).
+/// Domain-specific errors belong on each contract's own local error enum,
+/// which implements `From<CommonError>` so `?` still works through the
+/// shared validation helpers.
 #[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CommonError {
+    InvalidAmount = 1,
+    InvalidDueDate = 2,
+    InvalidRiskScore = 3,
+    InvalidCid = 4,
+    InvalidFeeRate = 5,
+    InvalidAddress = 6,
+    EmptyString = 7,
+    EmptyBytes = 8,
+    FieldTooLong = 9,
+    ArithmeticOverflow = 10,
+    /// Returned by `safe_sub` when the result would underflow (a < b).
+    ArithmeticUnderflow = 11,
+    /// Reentrancy guard triggered.
+    Reentrancy = 12,
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum KoraError {
@@ -23,6 +49,7 @@ pub enum KoraError {
     InvalidRiskScore = 16,
     InvalidCid = 17,
     InvoiceFrozen = 18,
+    NotInvoiceOwner = 19,
 
     // Marketplace
     ListingNotFound = 20,
@@ -69,6 +96,8 @@ pub enum KoraError {
     DebtorNotRegistered = 51,
     RiskScoreOutOfRange = 52,
     ComplianceNotAttested = 53,
+    // SME profile exists but has not been marked `verified` by a risk_registry verifier
+    SMENotVerified = 54,
 
     // General
     ArithmeticOverflow = 90,
@@ -81,6 +110,7 @@ pub enum KoraError {
     /// Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
     /// Reentrancy guard triggered
+    // Reentrancy guard triggered
     Reentrancy = 98,
     /// Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
     InvalidLength = 99,
@@ -102,4 +132,33 @@ pub enum KoraError {
     /// Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+
+    // Multisig admin-action proposals
+    InvalidThreshold = 120,
+    ProposalNotFound = 121,
+    ProposalAlreadyExecuted = 122,
+    ProposalExpired = 123,
+    AlreadyApproved = 124,
+    ThresholdNotMet = 125,
+    MultisigNotConfigured = 126,
+    SignerNotFound = 127,
+
+    // Invoice ownership, credit limit, currency allowlist
+    CreditLimitExceeded = 130,
+    NotInvoiceOwner = 131,
+    CurrencyNotAllowed = 132,
+    // Minting/amending an invoice would push the SME's aggregate OutstandingExposure
+    // above their risk_registry-assigned SmeProfile.credit_limit
+    CreditLimitExceeded = 120,
+    // A currency symbol is not on the invoice_nft CurrencyAllowlist
+    CurrencyNotAllowed = 121,
+    // Access-control admin-action multisig
+    InvalidThreshold = 122,
+    ProposalNotFound = 123,
+    ProposalAlreadyExecuted = 124,
+    ProposalExpired = 125,
+    AlreadyApproved = 126,
+    ThresholdNotMet = 127,
+    MultisigNotConfigured = 128,
+    SignerNotFound = 129,
 }
