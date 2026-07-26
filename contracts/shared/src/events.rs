@@ -1,5 +1,6 @@
 use crate::audit::AdminAuditEntry;
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol};
+use crate::types::RiskTier;
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 
 // ── Canonical Event Schema ────────────────────────────────────────────────────
 //
@@ -102,6 +103,50 @@ pub fn invoice_withdrawn(env: &Env, invoice_id: u64, sme: &Address, currency: Sy
     );
 }
 
+/// Batch-level correlation event for `mint_invoices_batch`, emitted once per
+/// call (in addition to the per-invoice `invoice_created` events) so an
+/// off-chain indexer can group invoices minted together in one batch.
+/// Schema: (actor=sme, batch_id, invoice_ids, timestamp)
+pub fn invoice_batch_minted(env: &Env, batch_id: u64, sme: &Address, invoice_ids: &Vec<u64>) {
+    emit(
+        env,
+        symbol_short!("INV_BATCH"),
+        (
+            sme.clone(),
+            batch_id,
+            invoice_ids.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Records a risk-score refresh on an already-`Funded` invoice, capturing both
+/// the prior and updated score/tier for audit purposes.
+/// Schema: (actor=caller, invoice_id, old_score, new_score, old_tier, new_tier, timestamp)
+pub fn risk_score_refreshed(
+    env: &Env,
+    invoice_id: u64,
+    caller: &Address,
+    old_score: u32,
+    new_score: u32,
+    old_tier: &RiskTier,
+    new_tier: &RiskTier,
+) {
+    emit(
+        env,
+        symbol_short!("RISK_RFSH"),
+        (
+            caller.clone(),
+            invoice_id,
+            old_score,
+            new_score,
+            old_tier.clone(),
+            new_tier.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 // ── Repayment Events ──────────────────────────────────────────────────────────
 
 /// Schema: (actor=payer, invoice_id, amount, timestamp)
@@ -176,6 +221,7 @@ pub fn fee_collected(
 ) {
     emit(
         env,
+        symbol_short!("FEE_COL"),
         symbol_short!("TREAS_FEE"),
         symbol_short!("TRES_FEE"),
         (
@@ -346,6 +392,7 @@ pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
 pub fn verifier_removed(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
+        symbol_short!("VRF_REM"),
         symbol_short!("VRF_RMV"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
@@ -364,6 +411,7 @@ pub fn sme_registered(env: &Env, verifier: &Address, sme: &Address, risk_score: 
 pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score: u32) {
     emit(
         env,
+        symbol_short!("SME_UPD"),
         symbol_short!("SME_SCORE"),
         symbol_short!("SME_SCU"),
         (verifier.clone(), sme.clone(), new_score, env.ledger().timestamp()),
@@ -374,6 +422,7 @@ pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score
 pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_defaults: u32) {
     emit(
         env,
+        symbol_short!("SME_DFT"),
         symbol_short!("SME_DFLT"),
         (admin.clone(), sme.clone(), total_defaults, env.ledger().timestamp()),
     );
@@ -383,6 +432,7 @@ pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_def
 pub fn sme_invoice_count_incremented(env: &Env, sme: &Address, new_total: u32) {
     emit(
         env,
+        symbol_short!("SME_INV"),
         symbol_short!("SME_INVCT"),
         symbol_short!("SME_INVC"),
         (sme.clone(), new_total, env.ledger().timestamp()),
@@ -462,6 +512,7 @@ pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
 pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
     emit(
         env,
+        symbol_short!("MS_CFG"),
         symbol_short!("MSIG_CFG"),
         symbol_short!("AC_MSIG"),
         (threshold, signer_count, env.ledger().timestamp()),
@@ -472,6 +523,7 @@ pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
 pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
     emit(
         env,
+        symbol_short!("MS_PROP"),
         symbol_short!("ACT_PROP"),
         symbol_short!("AC_ACT_P"),
         (proposal_id, proposer.clone(), env.ledger().timestamp()),
@@ -482,6 +534,7 @@ pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
 pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval_count: u32) {
     emit(
         env,
+        symbol_short!("MS_APPR"),
         symbol_short!("ACT_APPR"),
         symbol_short!("AC_ACT_A"),
         (
@@ -497,6 +550,7 @@ pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval
 pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
     emit(
         env,
+        symbol_short!("MS_EXEC"),
         symbol_short!("ACT_EXEC"),
         symbol_short!("AC_ACT_E"),
         (proposal_id, executor.clone(), env.ledger().timestamp()),
@@ -509,6 +563,7 @@ pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
 pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
     emit(
         env,
+        symbol_short!("REFUND"),
         symbol_short!("RFND_CLM"),
         (
             investor.clone(),

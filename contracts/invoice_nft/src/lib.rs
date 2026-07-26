@@ -27,6 +27,13 @@ use kora_shared::{
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
+// ── TTL constants (~30 days at ~5s/ledger) ───────────────────────────────────
+const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
+const PERSISTENT_TTL_BUMP: u32 = 518_400;
+
+/// Maximum invoice IDs returned per `get_sme_invoice_ids` page, bounding per-call CPU cost.
+const MAX_SME_INVOICE_PAGE: u32 = 100;
+
 // ── Storage Keys ────────────────────────────────────────────────────────────
 //
 // Storage versioning: The contract uses a MigrationVersion key to track schema changes.
@@ -76,6 +83,11 @@ pub enum DataKey {
     /// Checked by marketplace.fund_invoice and financing_pool.repay in addition
     /// to the protocol-wide pause, enabling targeted freeze of disputed invoices.
     InvoiceFrozen(u64),
+    /// Persistent: Vec<u64> of invoice IDs minted by this SME, in mint order.
+    /// Appended to in mint_invoice/mint_invoices_batch, pruned in withdraw_invoice.
+    SmeInvoiceIds(Address),
+    /// Instance key: monotonic counter allocating the next batch-mint correlation ID.
+    NextBatchId,
     // ── Admin audit log ───────────────────────────────────────────────────────
     /// Next write position in the admin audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
     AuditLogHead,
@@ -252,6 +264,7 @@ impl InvoiceNftContract {
                         currency: old.currency,
                         due_date: old.due_date,
                         ipfs_cid: old.ipfs_cid,
+                        metadata_hash: Bytes::new(&env),
                         risk_score: old.risk_score,
                         risk_tier: old.risk_tier,
                         status: old.status,
@@ -395,6 +408,7 @@ impl InvoiceNftContract {
             &DataKey::NextId,
             &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
         );
+        Self::append_sme_invoice_id(&env, &sme, id);
 
         events::invoice_created(&env, id, &sme, invoice.amount, invoice.currency.clone());
         Ok(id)
@@ -463,6 +477,15 @@ impl InvoiceNftContract {
         }
 
         env.storage().instance().set(&DataKey::NextId, &next_id);
+        Self::append_sme_invoice_ids(&env, &sme, &ids);
+
+        let batch_id: u64 = env.storage().instance().get(&DataKey::NextBatchId).unwrap_or(1);
+        env.storage().instance().set(
+            &DataKey::NextBatchId,
+            &(batch_id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
+        );
+        events::invoice_batch_minted(&env, batch_id, &sme, &ids);
+
         Ok(ids)
     }
 
@@ -574,6 +597,8 @@ impl InvoiceNftContract {
             &DataKey::OutstandingExposure(invoice.sme.clone()),
             &prev.saturating_sub(invoice.amount),
         );
+        Self::remove_sme_invoice_id(&env, &invoice.sme, invoice_id);
+        events::invoice_withdrawn(&env, invoice_id, &sme);
         events::invoice_withdrawn(&env, invoice_id, &sme, invoice.currency.clone());
         Ok(())
     }
@@ -805,6 +830,33 @@ impl InvoiceNftContract {
             .unwrap_or(0i128)
     }
 
+    /// Paginated view of the invoice IDs minted by a given SME, in mint order.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The SME address to query.
+    /// - `start` — 0-based offset into the SME's invoice ID list.
+    /// - `limit` — Maximum IDs to return; capped at `MAX_SME_INVOICE_PAGE` (100)
+    ///   to bound per-call CPU cost.
+    ///
+    /// **Returns:** Up to `limit` invoice IDs starting at `start`. An empty
+    /// `Vec` if `start` is beyond the last ID or the SME has no invoices.
+    ///
+    /// **Security:** Read-only view. No authorization required.
+    pub fn get_sme_invoice_ids(env: Env, sme: Address, start: u32, limit: u32) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SmeInvoiceIds(sme))
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = ids.len();
+        if start >= len {
+            return Vec::new(&env);
+        }
+        let limit = limit.min(MAX_SME_INVOICE_PAGE);
+        let end = start.saturating_add(limit).min(len);
+        ids.slice(start..end)
+    }
+
     // ── Per-invoice emergency freeze ──────────────────────────────────────────
     //
     // Complements the protocol-wide pause in AccessControl by letting an admin
@@ -846,6 +898,165 @@ impl InvoiceNftContract {
             .persistent()
             .get(&DataKey::InvoiceFrozen(invoice_id))
             .unwrap_or(false)
+    }
+
+    // ── Bulk SME-scoped freeze ─────────────────────────────────────────────────
+    //
+    // Incident-response tool sitting between per-invoice freeze and a full
+    // protocol pause: freezes every currently-active invoice tied to a single
+    // SME. Bounded by `max_to_process` per call so an SME with more invoices
+    // than fit in one transaction's resource budget can be fully frozen by
+    // calling this repeatedly; already-frozen and terminal-status invoices are
+    // skipped without counting against the budget, so a follow-up call always
+    // makes forward progress.
+
+    /// Freeze up to `max_to_process` of `sme`'s currently active (non-terminal)
+    /// invoices. Returns the number of invoices newly frozen by this call.
+    ///
+    /// Safely re-callable: already-frozen invoices are skipped without error,
+    /// and repeated calls with the same arguments make monotonic progress
+    /// through the SME's invoice list until none remain to freeze.
+    pub fn freeze_sme_invoices(
+        env: Env,
+        admin: Address,
+        sme: Address,
+        max_to_process: u32,
+    ) -> Result<u32, KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SmeInvoiceIds(sme))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut processed: u32 = 0;
+        for id in ids.iter() {
+            if processed >= max_to_process {
+                break;
+            }
+            let invoice = match env.storage().persistent().get::<DataKey, Invoice>(&DataKey::Invoice(id)) {
+                Some(invoice) => invoice,
+                None => continue,
+            };
+            if matches!(invoice.status, InvoiceStatus::Repaid | InvoiceStatus::Defaulted) {
+                continue;
+            }
+            let key = DataKey::InvoiceFrozen(id);
+            if env.storage().persistent().has(&key) {
+                continue;
+            }
+            env.storage().persistent().set(&key, &true);
+            Self::bump_persistent(&env, &key);
+            events::invoice_frozen(&env, id, &admin);
+            processed += 1;
+        }
+
+        Ok(processed)
+    }
+
+    /// Unfreeze up to `max_to_process` of `sme`'s currently frozen invoices.
+    /// Returns the number of invoices newly unfrozen by this call. Symmetric
+    /// to `freeze_sme_invoices` — safely re-callable, skips already-unfrozen
+    /// invoices without error.
+    pub fn unfreeze_sme_invoices(
+        env: Env,
+        admin: Address,
+        sme: Address,
+        max_to_process: u32,
+    ) -> Result<u32, KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SmeInvoiceIds(sme))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut processed: u32 = 0;
+        for id in ids.iter() {
+            if processed >= max_to_process {
+                break;
+            }
+            let key = DataKey::InvoiceFrozen(id);
+            if !env.storage().persistent().has(&key) {
+                continue;
+            }
+            env.storage().persistent().remove(&key);
+            events::invoice_unfrozen(&env, id, &admin);
+            processed += 1;
+        }
+
+        Ok(processed)
+    }
+
+    // ── Risk score refresh ─────────────────────────────────────────────────────
+
+    /// Re-reads `sme`'s current risk score from the wired-up `risk_registry`
+    /// and applies it to an already-`Funded` invoice, keeping its stored
+    /// `risk_score`/`risk_tier` in sync with the SME's latest assessment
+    /// without resetting `created_at` or any other immutable field.
+    ///
+    /// **Parameters:**
+    /// - `caller` — Must be the current admin address.
+    /// - `invoice_id` — The ID of the `Funded` invoice to refresh.
+    ///
+    /// **Errors:**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
+    /// - `KoraError::InvalidInvoiceStatus` — Invoice is not `Funded` (covers
+    ///   `Created`/`Listed`, which use `amend_invoice` instead, and the
+    ///   terminal `Repaid`/`Defaulted` statuses, which reject refresh).
+    /// - `KoraError::NotInitialized` — No `risk_registry` has been wired up.
+    ///
+    /// **Security:** Requires `caller.require_auth()` and admin privileges.
+    /// Emits `risk_score_refreshed` with both the old and new score/tier.
+    pub fn refresh_risk_score(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        Self::require_not_paused(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
+
+        let mut invoice = Self::load_invoice(&env, invoice_id)?;
+        if invoice.status != InvoiceStatus::Funded {
+            return Err(KoraError::InvalidInvoiceStatus);
+        }
+
+        let rr_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RiskRegistry)
+            .ok_or(KoraError::NotInitialized)?;
+        let rr = kora_risk_registry::RiskRegistryContractClient::new(&env, &rr_addr);
+        let profile = rr
+            .try_get_sme_profile(&invoice.sme)
+            .map_err(|_| KoraError::SMENotRegistered)?
+            .map_err(|_| KoraError::SMENotRegistered)?;
+
+        let old_score = invoice.risk_score;
+        let old_tier = invoice.risk_tier.clone();
+        let new_score = profile.risk_score;
+        let new_tier = RiskTier::from_score(new_score);
+
+        invoice.risk_score = new_score;
+        invoice.risk_tier = new_tier.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id), &invoice);
+        Self::bump_invoice_ttl(&env, invoice_id);
+
+        events::risk_score_refreshed(
+            &env,
+            invoice_id,
+            &caller,
+            old_score,
+            new_score,
+            &old_tier,
+            &new_tier,
+        );
+        Ok(())
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
@@ -1091,11 +1302,52 @@ impl InvoiceNftContract {
         );
     }
 
+    /// Extend the TTL of an arbitrary persistent storage key to prevent expiry.
     /// Extend the TTL of an arbitrary persistent storage entry to prevent expiry.
     fn bump_persistent(env: &Env, key: &DataKey) {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+    }
+
+    /// Append a single newly-minted invoice ID to `sme`'s invoice index.
+    fn append_sme_invoice_id(env: &Env, sme: &Address, id: u64) {
+        let key = DataKey::SmeInvoiceIds(sme.clone());
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(id);
+        env.storage().persistent().set(&key, &ids);
+        Self::bump_persistent(env, &key);
+    }
+
+    /// Append a batch of newly-minted invoice IDs to `sme`'s invoice index in one write.
+    fn append_sme_invoice_ids(env: &Env, sme: &Address, new_ids: &Vec<u64>) {
+        let key = DataKey::SmeInvoiceIds(sme.clone());
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.append(new_ids);
+        env.storage().persistent().set(&key, &ids);
+        Self::bump_persistent(env, &key);
+    }
+
+    /// Remove a withdrawn invoice's ID from `sme`'s invoice index, if present.
+    fn remove_sme_invoice_id(env: &Env, sme: &Address, id: u64) {
+        let key = DataKey::SmeInvoiceIds(sme.clone());
+        let mut ids: Vec<u64> = match env.storage().persistent().get(&key) {
+            Some(ids) => ids,
+            None => return,
+        };
+        if let Some(idx) = ids.first_index_of(id) {
+            ids.remove(idx);
+            env.storage().persistent().set(&key, &ids);
+            Self::bump_persistent(env, &key);
+        }
     }
 }
 
@@ -1106,7 +1358,7 @@ mod tests {
     use super::*;
     use kora_shared::errors::KoraError;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger, LedgerInfo},
+        testutils::{Address as _, Events as _, Ledger, LedgerInfo},
         Bytes, Env, String, Symbol,
     };
 
@@ -2271,7 +2523,7 @@ mod tests {
         let (env, admin, client) = setup();
         let id = mint_one(&env, &client);
         assert!(!client.is_invoice_frozen(&id));
-        client.freeze_invoice(&admin, &id).unwrap();
+        client.freeze_invoice(&admin, &id);
         assert!(client.is_invoice_frozen(&id));
     }
 
@@ -2279,9 +2531,9 @@ mod tests {
     fn test_unfreeze_invoice_clears_frozen_flag() {
         let (env, admin, client) = setup();
         let id = mint_one(&env, &client);
-        client.freeze_invoice(&admin, &id).unwrap();
+        client.freeze_invoice(&admin, &id);
         assert!(client.is_invoice_frozen(&id));
-        client.unfreeze_invoice(&admin, &id).unwrap();
+        client.unfreeze_invoice(&admin, &id);
         assert!(!client.is_invoice_frozen(&id));
     }
 
@@ -2307,6 +2559,130 @@ mod tests {
         assert_eq!(err, KoraError::InvoiceNotFound);
     }
 
+    // ── #427: batch-mint correlation event ─────────────────────────────────────
+
+    fn batch_input(env: &Env, risk_score: u32) -> BatchInvoiceInput {
+        BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(env, &[9u8; 32]),
+            amount: 500_000_000i128,
+            currency: Symbol::new(env, "USDC"),
+            due_date: env.ledger().timestamp() + 86_400 * 30,
+            ipfs_cid: ipfs_cid(env),
+            risk_score,
+            notes: None,
+        }
+    }
+
+    /// Decodes the most recently published event's data tuple as (actor, u64, Vec<u64>, u64).
+    fn last_event_data(env: &Env) -> (Address, u64, Vec<u64>, u64) {
+        let (_contract, _topics, data) = env.events().all().last().unwrap();
+        soroban_sdk::TryFromVal::try_from_val(env, &data).unwrap()
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_single_item_emits_batch_event_matching_return() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let mut inputs = Vec::new(&env);
+        inputs.push_back(batch_input(&env, 10u32));
+
+        let ids = client.mint_invoices_batch(&sme, &inputs);
+        assert_eq!(ids.len(), 1);
+
+        let (_actor, _batch_id, event_ids, _ts) = last_event_data(&env);
+        assert_eq!(event_ids, ids);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_multi_item_emits_batch_event_matching_return() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let mut inputs = Vec::new(&env);
+        inputs.push_back(batch_input(&env, 10u32));
+        inputs.push_back(batch_input(&env, 20u32));
+        inputs.push_back(batch_input(&env, 30u32));
+
+        let ids = client.mint_invoices_batch(&sme, &inputs);
+        assert_eq!(ids.len(), 3);
+
+        let (_actor, _batch_id, event_ids, _ts) = last_event_data(&env);
+        assert_eq!(event_ids, ids);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_does_not_replace_per_invoice_events() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let mut inputs = Vec::new(&env);
+        inputs.push_back(batch_input(&env, 10u32));
+        inputs.push_back(batch_input(&env, 20u32));
+
+        let events_before = env.events().all().len();
+        client.mint_invoices_batch(&sme, &inputs);
+        // 2 per-invoice `invoice_created` events + 1 batch-level `invoice_batch_minted` event.
+        assert_eq!(env.events().all().len(), events_before + 3);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_ids_are_distinct_batch_ids() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let mut inputs1 = Vec::new(&env);
+        inputs1.push_back(batch_input(&env, 10u32));
+        client.mint_invoices_batch(&sme, &inputs1);
+        let (_actor1, batch_id1, _ids1, _ts1) = last_event_data(&env);
+
+        let mut inputs2 = Vec::new(&env);
+        inputs2.push_back(batch_input(&env, 10u32));
+        client.mint_invoices_batch(&sme, &inputs2);
+        let (_actor2, batch_id2, _ids2, _ts2) = last_event_data(&env);
+
+        assert_ne!(batch_id1, batch_id2);
+    }
+
+    // ── #428: SME-to-invoice-IDs index ──────────────────────────────────────────
+
+    #[test]
+    fn test_get_sme_invoice_ids_empty_for_unknown_sme() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        assert_eq!(client.get_sme_invoice_ids(&sme, &0u32, &10u32).len(), 0);
+    }
+
+    #[test]
+    fn test_sme_invoice_index_grows_on_single_mint() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id1 = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        let id2 = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        let ids = client.get_sme_invoice_ids(&sme, &0u32, &10u32);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.get(0).unwrap(), id1);
+        assert_eq!(ids.get(1).unwrap(), id2);
+    }
+
+    #[test]
+    fn test_sme_invoice_index_grows_on_batch_mint() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let mut inputs = Vec::new(&env);
+        inputs.push_back(batch_input(&env, 10u32));
+        inputs.push_back(batch_input(&env, 20u32));
+        let ids = client.mint_invoices_batch(&sme, &inputs);
+        assert_eq!(client.get_sme_invoice_ids(&sme, &0u32, &10u32), ids);
+    }
+
+    #[test]
+    fn test_sme_invoice_index_shrinks_on_withdraw() {
     // ── Admin audit log (issue #419) ──────────────────────────────────────────
 
     #[test]
@@ -5313,6 +5689,265 @@ mod tests {
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let cid = ipfs_cid(&env);
         let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id1 = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        let id2 = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        client.withdraw_invoice(&sme, &id1);
+        let ids = client.get_sme_invoice_ids(&sme, &0u32, &10u32);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0).unwrap(), id2);
+    }
+
+    #[test]
+    fn test_sme_invoice_index_pagination_at_scale() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+
+        let mut minted: Vec<u64> = Vec::new(&env);
+        for _ in 0..120 {
+            let id = client.mint_invoice(
+                &sme, &debtor_hash, &1_000_000i128,
+                &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+            );
+            minted.push_back(id);
+        }
+
+        // Page size is capped at MAX_SME_INVOICE_PAGE (100) even if a larger limit is requested.
+        let page1 = client.get_sme_invoice_ids(&sme, &0u32, &1000u32);
+        assert_eq!(page1.len(), 100);
+        assert_eq!(page1, minted.slice(0..100));
+
+        let page2 = client.get_sme_invoice_ids(&sme, &100u32, &100u32);
+        assert_eq!(page2.len(), 20);
+        assert_eq!(page2, minted.slice(100..120));
+
+        // Offset beyond the last invoice returns an empty, stable slice.
+        assert_eq!(client.get_sme_invoice_ids(&sme, &120u32, &10u32).len(), 0);
+    }
+
+    // ── #429: bulk SME-scoped freeze/unfreeze ───────────────────────────────────
+
+    fn mint_n_for_sme(env: &Env, client: &InvoiceNftContractClient, sme: &Address, n: u32) -> Vec<u64> {
+        let debtor_hash = Bytes::from_slice(env, &[2u8; 32]);
+        let cid = ipfs_cid(env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let mut ids: Vec<u64> = Vec::new(env);
+        for _ in 0..n {
+            let id = client.mint_invoice(
+                sme, &debtor_hash, &1_000_000i128,
+                &Symbol::new(env, "USDC"), &due_date, &cid, &10u32, &None,
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn test_freeze_sme_invoices_single_call_freezes_all() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let ids = mint_n_for_sme(&env, &client, &sme, 3);
+
+        let frozen = client.freeze_sme_invoices(&admin, &sme, &10u32);
+        assert_eq!(frozen, 3);
+        for id in ids.iter() {
+            assert!(client.is_invoice_frozen(&id));
+        }
+    }
+
+    #[test]
+    fn test_freeze_sme_invoices_multi_call_chunked_processing() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let ids = mint_n_for_sme(&env, &client, &sme, 5);
+
+        assert_eq!(client.freeze_sme_invoices(&admin, &sme, &2u32), 2);
+        assert_eq!(client.freeze_sme_invoices(&admin, &sme, &2u32), 2);
+        assert_eq!(client.freeze_sme_invoices(&admin, &sme, &2u32), 1);
+        // Fully frozen now — idempotent no-op on further calls.
+        assert_eq!(client.freeze_sme_invoices(&admin, &sme, &2u32), 0);
+
+        for id in ids.iter() {
+            assert!(client.is_invoice_frozen(&id));
+        }
+    }
+
+    #[test]
+    fn test_unfreeze_sme_invoices_symmetric() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let ids = mint_n_for_sme(&env, &client, &sme, 4);
+
+        client.freeze_sme_invoices(&admin, &sme, &10u32);
+        for id in ids.iter() {
+            assert!(client.is_invoice_frozen(&id));
+        }
+
+        assert_eq!(client.unfreeze_sme_invoices(&admin, &sme, &2u32), 2);
+        assert_eq!(client.unfreeze_sme_invoices(&admin, &sme, &2u32), 2);
+        assert_eq!(client.unfreeze_sme_invoices(&admin, &sme, &2u32), 0);
+
+        for id in ids.iter() {
+            assert!(!client.is_invoice_frozen(&id));
+        }
+    }
+
+    #[test]
+    fn test_freeze_sme_invoices_skips_terminal_status() {
+        let (env, admin, client) = setup();
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        let sme = Address::generate(&env);
+        let ids = mint_n_for_sme(&env, &client, &sme, 2);
+        let repaid_id = ids.get(0).unwrap();
+        client.set_listed(&marketplace, &repaid_id);
+        client.set_funded(&pool, &repaid_id);
+        client.set_repaid(&pool, &repaid_id);
+
+        let frozen = client.freeze_sme_invoices(&admin, &sme, &10u32);
+        // Only the non-terminal (still Created) invoice is frozen.
+        assert_eq!(frozen, 1);
+        assert!(!client.is_invoice_frozen(&repaid_id));
+        assert!(client.is_invoice_frozen(&ids.get(1).unwrap()));
+    }
+
+    #[test]
+    fn test_freeze_sme_invoices_non_admin_rejected() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        mint_n_for_sme(&env, &client, &sme, 1);
+        let stranger = Address::generate(&env);
+        let err = client
+            .try_freeze_sme_invoices(&stranger, &sme, &10u32)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::NotAdmin);
+    }
+
+    // ── #430: risk score refresh/sync mechanism ─────────────────────────────────
+
+    /// Returns (env, admin, invoice_nft client, risk_registry client, verifier, sme, pool, funded invoice id).
+    fn setup_funded_invoice_with_risk_registry(
+        initial_score: u32,
+    ) -> (
+        Env,
+        Address,
+        InvoiceNftContractClient<'static>,
+        kora_risk_registry::RiskRegistryContractClient<'static>,
+        Address,
+        Address,
+        Address,
+        u64,
+    ) {
+        let (env, admin, client) = setup();
+        // Needed because add_verifier's token transfer requires the verifier's
+        // (non-root) auth in addition to the admin's root auth.
+        env.mock_all_auths_allowing_non_root_auth();
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        let rr_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
+        let rr_client = kora_risk_registry::RiskRegistryContractClient::new(&env, &rr_id);
+        let staking_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        rr_client.initialize(&admin, &client.address, &staking_token, &1_000_000i128, &5_000u32);
+        client.set_risk_registry(&admin, &rr_id);
+
+        let verifier = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token)
+            .mint(&verifier, &1_000_000i128);
+        rr_client.add_verifier(&admin, &verifier, &1_000_000i128);
+
+        let sme = Address::generate(&env);
+        rr_client.register_sme(&verifier, &sme, &initial_score, &true);
+
+        let debtor_hash = Bytes::from_slice(&env, &[3u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &initial_score, &None,
+        );
+        client.set_listed(&marketplace, &id);
+        client.set_funded(&pool, &id);
+
+        (env, admin, client, rr_client, verifier, sme, pool, id)
+    }
+
+    #[test]
+    fn test_refresh_risk_score_updates_funded_invoice() {
+        let (env, admin, client, rr_client, verifier, sme, _pool, id) =
+            setup_funded_invoice_with_risk_registry(10u32);
+        let before = client.get_invoice(&id);
+        assert_eq!(before.risk_score, 10u32);
+        assert_eq!(before.risk_tier, RiskTier::AAA);
+
+        rr_client.update_sme_score(&verifier, &sme, &75u32);
+        client.refresh_risk_score(&admin, &id);
+
+        let after = client.get_invoice(&id);
+        assert_eq!(after.risk_score, 75u32);
+        assert_eq!(after.risk_tier, RiskTier::B);
+        // Immutable fields are unaffected by the refresh.
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.funded_at, before.funded_at);
+        assert_eq!(after.id, before.id);
+
+        let (actor, ev_invoice_id, old_score, new_score, _old_tier, _new_tier, _ts): (
+            Address,
+            u64,
+            u32,
+            u32,
+            RiskTier,
+            RiskTier,
+            u64,
+        ) = {
+            let (_c, _t, data) = env.events().all().last().unwrap();
+            soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap()
+        };
+        assert_eq!(actor, admin);
+        assert_eq!(ev_invoice_id, id);
+        assert_eq!(old_score, 10u32);
+        assert_eq!(new_score, 75u32);
+    }
+
+    #[test]
+    fn test_refresh_risk_score_rejects_created_status() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let err = client.try_refresh_risk_score(&admin, &id).unwrap_err().unwrap();
+        assert_eq!(err, KoraError::InvalidInvoiceStatus);
+    }
+
+    #[test]
+    fn test_refresh_risk_score_rejects_repaid_status() {
+        let (_env, admin, client, _rr_client, _verifier, _sme, pool, id) =
+            setup_funded_invoice_with_risk_registry(10u32);
+        client.set_repaid(&pool, &id);
+        let err = client.try_refresh_risk_score(&admin, &id).unwrap_err().unwrap();
+        assert_eq!(err, KoraError::InvalidInvoiceStatus);
+    }
+
+    #[test]
+    fn test_refresh_risk_score_non_admin_rejected() {
+        let (env, _admin, client, _rr_client, _verifier, _sme, _pool, id) =
+            setup_funded_invoice_with_risk_registry(10u32);
+        let stranger = Address::generate(&env);
+        let err = client
+            .try_refresh_risk_score(&stranger, &id)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::NotAdmin);
         let id = client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
