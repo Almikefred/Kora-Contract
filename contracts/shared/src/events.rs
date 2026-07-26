@@ -22,18 +22,18 @@ fn emit(env: &Env, topic: Symbol, data: impl soroban_sdk::IntoVal<Env, soroban_s
 
 // ── Invoice Events ────────────────────────────────────────────────────────────
 
-/// Schema: (actor=sme, invoice_id, amount, timestamp)
-pub fn invoice_created(env: &Env, invoice_id: u64, sme: &Address, amount: i128) {
+/// Schema: (actor=sme, invoice_id, amount, currency, timestamp)
+pub fn invoice_created(env: &Env, invoice_id: u64, sme: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_CRT"),
-        (sme.clone(), invoice_id, amount, env.ledger().timestamp()),
+        (sme.clone(), invoice_id, amount, currency, env.ledger().timestamp()),
     );
 }
 
 /// Standardized marketplace event: invoice listed for financing.
-/// Schema: (actor=seller, invoice_id, asking_price, timestamp)
-pub fn invoice_listed(env: &Env, invoice_id: u64, seller: &Address, asking_price: i128) {
+/// Schema: (actor=seller, invoice_id, asking_price, currency, timestamp)
+pub fn invoice_listed(env: &Env, invoice_id: u64, seller: &Address, asking_price: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_LIST"),
@@ -42,14 +42,15 @@ pub fn invoice_listed(env: &Env, invoice_id: u64, seller: &Address, asking_price
             seller.clone(),
             invoice_id,
             asking_price,
+            currency,
             env.ledger().timestamp(),
         ),
     );
 }
 
 /// Standardized marketplace event: investor funded a listing.
-/// Schema: (actor=investor, invoice_id, funded_amount, timestamp)
-pub fn invoice_funded(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
+/// Schema: (actor=investor, invoice_id, funded_amount, currency, timestamp)
+pub fn invoice_funded(env: &Env, invoice_id: u64, investor: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_FUND"),
@@ -58,43 +59,46 @@ pub fn invoice_funded(env: &Env, invoice_id: u64, investor: &Address, amount: i1
             investor.clone(),
             invoice_id,
             amount,
+            currency,
             env.ledger().timestamp(),
         ),
     );
 }
 
-/// Schema: (actor=sme, invoice_id, amount, timestamp)
-pub fn invoice_repaid(env: &Env, invoice_id: u64, sme: &Address, amount: i128) {
+/// Schema: (actor=sme, invoice_id, amount, currency, timestamp)
+pub fn invoice_repaid(env: &Env, invoice_id: u64, sme: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_RPD"),
-        (sme.clone(), invoice_id, amount, env.ledger().timestamp()),
+        (sme.clone(), invoice_id, amount, currency, env.ledger().timestamp()),
     );
 }
 
-/// Schema: (actor, invoice_id, timestamp)
+/// Schema: (actor, invoice_id, amount, currency, timestamp)
 /// actor is the admin marking the default (or the SME address in invoice_nft context)
-pub fn invoice_defaulted(env: &Env, invoice_id: u64, actor: &Address) {
+pub fn invoice_defaulted(env: &Env, invoice_id: u64, actor: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_DFT"),
-        (actor.clone(), invoice_id, env.ledger().timestamp()),
+        (actor.clone(), invoice_id, amount, currency, env.ledger().timestamp()),
     );
 }
 
-pub fn invoice_amended(env: &Env, invoice_id: u64, sme: &Address) {
+/// Schema: (invoice_id, sme, currency, timestamp)
+pub fn invoice_amended(env: &Env, invoice_id: u64, sme: &Address, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_AMD"),
-        (invoice_id, sme.clone(), env.ledger().timestamp()),
+        (invoice_id, sme.clone(), currency, env.ledger().timestamp()),
     );
 }
 
-pub fn invoice_withdrawn(env: &Env, invoice_id: u64, sme: &Address) {
+/// Schema: (invoice_id, sme, currency, timestamp)
+pub fn invoice_withdrawn(env: &Env, invoice_id: u64, sme: &Address, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_WTH"),
-        (invoice_id, sme.clone(), env.ledger().timestamp()),
+        (invoice_id, sme.clone(), currency, env.ledger().timestamp()),
     );
 }
 
