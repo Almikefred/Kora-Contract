@@ -5,10 +5,13 @@ use kora_shared::{
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
-    types::{Listing, RiskTier},
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+    types::{Listing, ParameterKey, RiskTier},
+    validation::{
+        bps_of_normalized, require_non_zero_amount, require_valid_fee_bps,
+        require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY,
+    },
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 
 // ~30 days in ledgers at ~5 s/ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -27,6 +30,10 @@ pub enum DataKey {
     FeeBps,
     Listing(u64),
     WhitelistedToken(Address),
+    /// Enumerable index of all currently-whitelisted tokens (#443)
+    WhitelistedTokenList,
+    /// Pending token-whitelist proposal: token -> proposed_at (#444)
+    TokenWhitelistProposal(Address),
     UpgradeProposal,
     /// Per-risk-tier fee override: TierFeeBps(ordinal) where AAA=0, AA=1, A=2, B=3, C=4 (#210)
     TierFeeBps(u32),
@@ -34,6 +41,25 @@ pub enum DataKey {
     Contribution(u64, Address),
     /// Refund claimed flag
     RefundClaimed(u64, Address),
+    /// Referrer credited on a listing, if any
+    Referrer(u64),
+    /// Pending two-phase cancellation request: invoice_id -> requester (#263)
+    CancellationRequest(u64),
+    /// Whether a two-phase cancellation was confirmed by the admin (#263)
+    CancellationConfirmed(u64),
+    /// Pending dependency-address update: DependencyUpdateProposal(field_ordinal) -> (new_address, proposed_at) (#445)
+    DependencyUpdateProposal(u32),
+}
+
+/// The five cross-contract dependency addresses marketplace relies on. (#445)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DependencyField {
+    InvoiceNft,
+    FinancingPool,
+    Treasury,
+    AccessControl,
+    RiskRegistry,
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -69,6 +95,7 @@ impl MarketplaceContract {
         access_control: Address,
         risk_registry: Address,
         fee_bps: u32,
+        referrer_split_bps: u32,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(KoraError::AlreadyInitialized);
@@ -108,7 +135,13 @@ impl MarketplaceContract {
         Ok(())
     }
 
-    /// Update the marketplace fee. Admin only.
+    /// Update the marketplace's local fallback fee. Admin only.
+    ///
+    /// NOTE: This is a fallback lever only. Once `access_control` has an executed
+    /// governance proposal for `ParameterKey::FeeBps`, that value takes precedence
+    /// over this one everywhere fees are computed (`get_fee_bps`, `fund_invoice`) — see
+    /// `base_fee_bps`. This setter remains useful before any governance value has been
+    /// set, or as an emergency lever if governance is unavailable. (#446)
     pub fn set_fee_bps(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
         admin.require_auth();
         let mut config = Self::load_config(&env)?;
@@ -128,9 +161,12 @@ impl MarketplaceContract {
         Self::set_fee_bps(env, admin, fee_bps)
     }
 
-    /// Returns the current fee in basis points.
+    /// Returns the current fee in basis points: the governance-approved
+    /// `access_control` value if one has been executed, otherwise the local
+    /// `config.fee_bps` fallback. (#446)
     pub fn get_fee_bps(env: Env) -> Result<u32, KoraError> {
-        Ok(Self::load_config(&env)?.fee_bps)
+        let config = Self::load_config(&env)?;
+        Self::base_fee_bps(&env, &config)
     }
 
     /// Set a per-risk-tier fee override. Admin only. (#210)
@@ -150,12 +186,15 @@ impl MarketplaceContract {
         Ok(())
     }
 
-    /// Get the fee for a specific risk tier (falls back to flat fee if no override). (#210)
+    /// Get the fee for a specific risk tier (falls back to the flat/governance fee if no
+    /// override is set). (#210, #446)
     pub fn get_tier_fee_bps(env: Env, tier: RiskTier) -> Result<u32, KoraError> {
         let ordinal = Self::tier_ordinal(&tier);
-        Ok(env.storage().instance()
-            .get(&DataKey::TierFeeBps(ordinal))
-            .unwrap_or_else(|| Self::load_config(&env).map(|c| c.fee_bps).unwrap_or(50)))
+        if let Some(tier_fee) = env.storage().instance().get(&DataKey::TierFeeBps(ordinal)) {
+            return Ok(tier_fee);
+        }
+        let config = Self::load_config(&env)?;
+        Self::base_fee_bps(&env, &config)
     }
 
     /// Returns the full config struct.
@@ -168,22 +207,58 @@ impl MarketplaceContract {
         Ok(Self::load_config(&env)?.admin)
     }
 
-    /// Whitelist a stablecoin token. Admin only.
-    pub fn whitelist_token(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
+    /// Propose whitelisting a stablecoin token. Admin only. Must be followed by
+    /// `execute_token_whitelist` no earlier than `UPGRADE_TIMELOCK_DELAY` later.
+    ///
+    /// Timelocked (unlike the old instant `whitelist_token`) so a compromised or
+    /// careless admin key cannot make a malicious token immediately usable in
+    /// `fund_invoice` — see THREAT_MODEL.md's "Malicious Third-Party Contract"
+    /// threat actor. (#444)
+    pub fn propose_token_whitelist(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
         admin.require_auth();
         let config = Self::load_config(&env)?;
         if config.admin != admin {
             return Err(KoraError::NotAdmin);
         }
+        env.storage().instance().set(
+            &DataKey::TokenWhitelistProposal(token.clone()),
+            &env.ledger().timestamp(),
+        );
+        events::token_whitelist_proposed(&env, &admin, &token);
+        Ok(())
+    }
+
+    /// Execute a pending token-whitelist proposal once the timelock has elapsed. Admin only.
+    /// (#444)
+    pub fn execute_token_whitelist(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        let proposed_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelistProposal(token.clone()))
+            .ok_or(KoraError::NoTokenWhitelistProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::TokenWhitelistTimelockNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::TokenWhitelistProposal(token.clone()));
+
         env.storage()
             .persistent()
             .set(&DataKey::WhitelistedToken(token.clone()), &true);
         Self::bump_persistent(&env, &DataKey::WhitelistedToken(token.clone()));
+        Self::add_to_whitelist_registry(&env, &token);
         events::token_whitelisted(&env, &admin, &token);
         Ok(())
     }
 
-    /// Remove a token from the whitelist. Admin only.
+    /// Remove a token from the whitelist. Admin only. Takes effect immediately —
+    /// no timelock — since removal can only reduce risk, unlike adding a new token. (#444)
     pub fn remove_token_whitelist(
         env: Env,
         admin: Address,
@@ -204,7 +279,8 @@ impl MarketplaceContract {
         }
         env.storage()
             .persistent()
-            .remove(&DataKey::WhitelistedToken(token));
+            .remove(&DataKey::WhitelistedToken(token.clone()));
+        Self::remove_from_whitelist_registry(&env, &token);
         Ok(())
     }
 
@@ -214,6 +290,54 @@ impl MarketplaceContract {
             .persistent()
             .get(&DataKey::WhitelistedToken(token))
             .unwrap_or(false)
+    }
+
+    /// Returns a page of the currently-whitelisted tokens, exact and on-chain
+    /// (no off-chain event replay required). `page` is 0-indexed; `page_size` is
+    /// clamped to 1–50. (#443)
+    pub fn get_whitelisted_tokens(env: Env, page: u32, page_size: u32) -> Vec<Address> {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistedTokenList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let page_size = (page_size.max(1).min(50)) as u64;
+        let start = (page as u64).saturating_mul(page_size);
+        let end = start.saturating_add(page_size).min(list.len() as u64);
+        let mut results = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            results.push_back(list.get(i as u32).unwrap());
+            i += 1;
+        }
+        results
+    }
+
+    /// One-time admin reconciliation for tokens that were whitelisted before the
+    /// enumerable `WhitelistedTokenList` registry existed. For each token already
+    /// flagged via `WhitelistedToken`, adds it to the registry if not already
+    /// present; tokens that aren't actually whitelisted are skipped. (#443)
+    pub fn resync_whitelist_registry(
+        env: Env,
+        admin: Address,
+        tokens: Vec<Address>,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        for token in tokens.iter() {
+            let is_whitelisted: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::WhitelistedToken(token.clone()))
+                .unwrap_or(false);
+            if is_whitelisted {
+                Self::add_to_whitelist_registry(&env, &token);
+            }
+        }
+        Ok(())
     }
 
     /// SME lists an invoice NFT for financing.
@@ -341,11 +465,17 @@ impl MarketplaceContract {
         let token_client = token::Client::new(&env, &listing.token);
         let token_decimals = token_client.decimals();
 
-        // Fetch the invoice's risk tier and apply tier-specific fee (#210)
+        // Fetch the invoice's risk tier and apply tier-specific fee (#210),
+        // falling back to the governance/local flat fee (#446)
         let invoice = nft_client.get_invoice(&invoice_id);
-        let effective_fee_bps: u32 = env.storage().instance()
+        let effective_fee_bps: u32 = match env
+            .storage()
+            .instance()
             .get(&DataKey::TierFeeBps(Self::tier_ordinal(&invoice.risk_tier)))
-            .unwrap_or(config.fee_bps);
+        {
+            Some(tier_fee) => tier_fee,
+            None => Self::base_fee_bps(&env, &config)?,
+        };
 
         let fee = bps_of_normalized(amount, effective_fee_bps, token_decimals)?;
         let net = amount
@@ -700,6 +830,81 @@ impl MarketplaceContract {
         Ok(())
     }
 
+    // ── Dependency address migration (#445) ─────────────────────────────────────
+
+    /// Propose an update to one of the five cross-contract dependency addresses
+    /// (`invoice_nft`, `financing_pool`, `treasury`, `access_control`, `risk_registry`).
+    /// Admin only. Must be followed by `execute_dependency_update` no earlier than
+    /// `UPGRADE_TIMELOCK_DELAY` later, mirroring `propose_upgrade`/`execute_upgrade`.
+    pub fn propose_dependency_update(
+        env: Env,
+        admin: Address,
+        field: DependencyField,
+        new_address: Address,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        let ordinal = Self::dependency_field_ordinal(&field);
+        env.storage().instance().set(
+            &DataKey::DependencyUpdateProposal(ordinal),
+            &(new_address.clone(), env.ledger().timestamp()),
+        );
+        events::dependency_update_proposed(&env, &admin, ordinal, &new_address);
+        Ok(())
+    }
+
+    /// Execute a pending dependency-address update once the timelock has elapsed. Admin only.
+    /// Lets an operational migration (e.g. a redeployed `treasury`) re-point marketplace
+    /// without abandoning the contract instance and its accumulated listings.
+    pub fn execute_dependency_update(
+        env: Env,
+        admin: Address,
+        field: DependencyField,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let mut config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        let ordinal = Self::dependency_field_ordinal(&field);
+        let (new_address, proposed_at): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::DependencyUpdateProposal(ordinal))
+            .ok_or(KoraError::NoDependencyUpdateProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::DependencyUpdateTimelockNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::DependencyUpdateProposal(ordinal));
+
+        let old_address = match field {
+            DependencyField::InvoiceNft => {
+                core::mem::replace(&mut config.invoice_nft, new_address.clone())
+            }
+            DependencyField::FinancingPool => {
+                core::mem::replace(&mut config.financing_pool, new_address.clone())
+            }
+            DependencyField::Treasury => {
+                core::mem::replace(&mut config.treasury, new_address.clone())
+            }
+            DependencyField::AccessControl => {
+                core::mem::replace(&mut config.access_control, new_address.clone())
+            }
+            DependencyField::RiskRegistry => {
+                core::mem::replace(&mut config.risk_registry, new_address.clone())
+            }
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
+
+        events::dependency_updated(&env, &admin, ordinal, &old_address, &new_address);
+        Ok(())
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn load_config(env: &Env) -> Result<MarketplaceConfig, KoraError> {
@@ -800,6 +1005,73 @@ impl MarketplaceContract {
             RiskTier::C   => 4,
         }
     }
+
+    /// Map DependencyField to a stable u32 ordinal for storage keying. (#445)
+    #[inline]
+    fn dependency_field_ordinal(field: &DependencyField) -> u32 {
+        match field {
+            DependencyField::InvoiceNft => 0,
+            DependencyField::FinancingPool => 1,
+            DependencyField::Treasury => 2,
+            DependencyField::AccessControl => 3,
+            DependencyField::RiskRegistry => 4,
+        }
+    }
+
+    /// Resolve the governance-approved fee (if any), falling back to the locally
+    /// configured `fee_bps` when `access_control` has no executed `FeeBps` proposal.
+    /// Makes access_control's parameter-governance workflow the source of truth for
+    /// the flat fee once a value has been executed there. (#446)
+    fn base_fee_bps(env: &Env, config: &MarketplaceConfig) -> Result<u32, KoraError> {
+        let ac = kora_access_control::AccessControlContractClient::new(env, &config.access_control);
+        match ac.get_parameter(&ParameterKey::FeeBps) {
+            Some(gov_fee) => {
+                require_valid_fee_bps(gov_fee)?;
+                Ok(gov_fee)
+            }
+            None => Ok(config.fee_bps),
+        }
+    }
+
+    /// Add `token` to the enumerable whitelist registry if not already present. (#443)
+    fn add_to_whitelist_registry(env: &Env, token: &Address) {
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistedTokenList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut found = false;
+        for existing in list.iter() {
+            if &existing == token {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            list.push_back(token.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::WhitelistedTokenList, &list);
+        }
+    }
+
+    /// Remove `token` from the enumerable whitelist registry, if present. (#443)
+    fn remove_from_whitelist_registry(env: &Env, token: &Address) {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistedTokenList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_list = Vec::new(env);
+        for existing in list.iter() {
+            if &existing != token {
+                new_list.push_back(existing);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistedTokenList, &new_list);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -866,13 +1138,24 @@ mod tests {
         let mp_ac = Address::generate(&env);
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &registry, &50u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &registry, &50u32, &0u32);
 
         // Register marketplace and pool as authorized callers on the NFT contract (#209)
         nft.set_authorized_callers(&admin, &mp_id, &pool_id);
 
         let token = Address::generate(&env);
-        mp.whitelist_token(&admin, &token);
+        mp.propose_token_whitelist(&admin, &token);
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_700_000_000 + UPGRADE_TIMELOCK_DELAY + 1,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+        mp.execute_token_whitelist(&admin, &token);
 
         let seller = Address::generate(&env);
 
@@ -927,6 +1210,7 @@ mod tests {
             &Address::generate(&t.env),
             &Address::generate(&t.env),
             &50u32,
+            &0u32,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::AlreadyInitialized);
     }
@@ -945,6 +1229,7 @@ mod tests {
             &Address::generate(&env),
             &Address::generate(&env),
             &10_001u32,
+            &0u32,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
     }
@@ -963,6 +1248,7 @@ mod tests {
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
+                &0u32,
                 &0u32,
             )
             .is_ok());
@@ -983,6 +1269,7 @@ mod tests {
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &10_000u32,
+                &0u32,
             )
             .is_ok());
     }
@@ -1055,7 +1342,19 @@ mod tests {
         let t = deploy();
         let new_token = Address::generate(&t.env);
         assert!(!t.mp.is_token_whitelisted(&new_token));
-        t.mp.whitelist_token(&t.admin, &new_token);
+        t.mp.propose_token_whitelist(&t.admin, &new_token);
+        let now = t.env.ledger().timestamp();
+        t.env.ledger().set(LedgerInfo {
+            timestamp: now + UPGRADE_TIMELOCK_DELAY + 1,
+            protocol_version: 21,
+            sequence_number: 3,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+        t.mp.execute_token_whitelist(&t.admin, &new_token);
         assert!(t.mp.is_token_whitelisted(&new_token));
     }
 
@@ -1064,7 +1363,7 @@ mod tests {
         let t = deploy();
         let stranger = Address::generate(&t.env);
         let new_token = Address::generate(&t.env);
-        let result = t.mp.try_whitelist_token(&stranger, &new_token);
+        let result = t.mp.try_propose_token_whitelist(&stranger, &new_token);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
     }
 

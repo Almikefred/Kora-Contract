@@ -94,4 +94,10 @@ pub enum KoraError {
     // Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+    // Marketplace dependency-address migration
+    NoDependencyUpdateProposed = 120,
+    DependencyUpdateTimelockNotElapsed = 121,
+    // Marketplace token-whitelist timelock
+    NoTokenWhitelistProposed = 122,
+    TokenWhitelistTimelockNotElapsed = 123,
 }

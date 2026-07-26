@@ -245,6 +245,45 @@ pub fn token_whitelisted(env: &Env, actor: &Address, token: &Address) {
     );
 }
 
+/// Schema: (actor=admin, token, timestamp)
+pub fn token_whitelist_proposed(env: &Env, actor: &Address, token: &Address) {
+    emit(
+        env,
+        symbol_short!("TOK_WLP"),
+        (actor.clone(), token.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, field_tag, new_address, timestamp)
+pub fn dependency_update_proposed(env: &Env, actor: &Address, field_tag: u32, new_address: &Address) {
+    emit(
+        env,
+        symbol_short!("DEP_PROP"),
+        (actor.clone(), field_tag, new_address.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, field_tag, old_address, new_address, timestamp)
+pub fn dependency_updated(
+    env: &Env,
+    actor: &Address,
+    field_tag: u32,
+    old_address: &Address,
+    new_address: &Address,
+) {
+    emit(
+        env,
+        symbol_short!("DEP_EXEC"),
+        (
+            actor.clone(),
+            field_tag,
+            old_address.clone(),
+            new_address.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 /// Schema: (actor=current_admin, new_admin, timestamp)
 pub fn admin_transferred(env: &Env, actor: &Address, new_admin: &Address) {
     emit(
