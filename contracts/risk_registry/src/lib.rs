@@ -2,13 +2,69 @@
 
 use kora_shared::{
     audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
-    errors::KoraError,
+    errors::CommonError,
     events,
     reentrancy::ReentrancyGuard,
     types::SmeProfile,
-    validation::{require_exact_length, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
+    validation::{require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec,
+};
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RiskRegistryError {
+    AlreadyInitialized = 1,
+    ArithmeticOverflow = 2,
+    ArithmeticUnderflow = 3,
+    DebtorNotRegistered = 4,
+    InsufficientFunds = 5,
+    InvalidAddress = 6,
+    InvalidAmount = 7,
+    InvalidLength = 8,
+    InvalidRiskScore = 9,
+    NoUpgradeProposed = 10,
+    NotAdmin = 11,
+    NotInitialized = 12,
+    NotVerifier = 13,
+    Reentrancy = 14,
+    SMENotRegistered = 15,
+    ScoreUpdateCooldownNotElapsed = 16,
+    Unauthorized = 17,
+    UpgradeTimelockNotElapsed = 18,
+}
+
+impl From<CommonError> for RiskRegistryError {
+    fn from(e: CommonError) -> Self {
+        match e {
+            CommonError::InvalidAmount => RiskRegistryError::InvalidAmount,
+            CommonError::InvalidAddress => RiskRegistryError::InvalidAddress,
+            CommonError::InvalidRiskScore => RiskRegistryError::InvalidRiskScore,
+            CommonError::ArithmeticOverflow => RiskRegistryError::ArithmeticOverflow,
+            CommonError::ArithmeticUnderflow => RiskRegistryError::ArithmeticUnderflow,
+            CommonError::Reentrancy => RiskRegistryError::Reentrancy,
+            // Remaining CommonError variants are not currently reachable via `?`
+            // in this crate; map conservatively rather than panicking.
+            _ => RiskRegistryError::InvalidAmount,
+        }
+    }
+}
+
+/// Validates that `bytes` is exactly `len` bytes long.
+///
+/// This used to live in `kora_shared::validation`; it was local-only there
+/// and has since been removed from the shared crate, so it's reimplemented
+/// here for `set_debtor_score`'s 32-byte SHA-256 hash requirement.
+fn require_exact_length(bytes: &Bytes, len: u32) -> Result<(), RiskRegistryError> {
+    if bytes.len() != len {
+        return Err(RiskRegistryError::InvalidLength);
+    }
+    Ok(())
+}
 
 // ── TTL constants (in ledgers; ~5s per ledger on Stellar) ────────────────────
 /// ~30 days worth of ledgers for persistent SME/verifier data
@@ -65,8 +121,8 @@ impl RiskRegistryContract {
     /// - `slash_percentage_bps` — Basis points of stake to slash on each SME default (0–10 000).
     ///
     /// **Errors:**
-    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
-    /// - `KoraError::InvalidAddress` — `admin` is the contract's own address.
+    /// - `RiskRegistryError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `RiskRegistryError::InvalidAddress` — `admin` is the contract's own address.
     ///
     /// **Security:** No auth required on first call. Subsequent calls revert immediately.
     pub fn initialize(
@@ -76,9 +132,9 @@ impl RiskRegistryContract {
         staking_token: Address,
         minimum_stake: i128,
         slash_percentage_bps: u32,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         if env.storage().persistent().has(&DataKey::Admin) {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(RiskRegistryError::AlreadyInitialized);
         }
         kora_shared::validation::require_not_self(&env, &admin)?;
         env.storage().persistent().set(&DataKey::Admin, &admin);
@@ -106,10 +162,10 @@ impl RiskRegistryContract {
     /// - `new_admin` — The address to transfer admin rights to.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
     ///
     /// **Security:** Requires `admin.require_auth()`. Emits `admin_transferred` event.
-    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), KoraError> {
+    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), RiskRegistryError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage().persistent().set(&DataKey::Admin, &new_admin);
@@ -158,14 +214,14 @@ impl RiskRegistryContract {
     /// - `stake_amount` — Amount of staking token to deposit (must be ≥ `minimum_stake`).
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::InvalidAddress` — `verifier` is the contract's own address.
-    /// - `KoraError::InsufficientFunds` — `stake_amount` < `minimum_stake`.
-    /// - `KoraError::NotInitialized` — Staking token or minimum stake not configured.
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::InvalidAddress` — `verifier` is the contract's own address.
+    /// - `RiskRegistryError::InsufficientFunds` — `stake_amount` < `minimum_stake`.
+    /// - `RiskRegistryError::NotInitialized` — Staking token or minimum stake not configured.
     ///
     /// **Security:** Requires `admin.require_auth()`. Transfers stake from `verifier` to
     /// this contract via the staking token. Emits `verifier_added` event.
-    pub fn add_verifier(env: Env, admin: Address, verifier: Address, stake_amount: i128) -> Result<(), KoraError> {
+    pub fn add_verifier(env: Env, admin: Address, verifier: Address, stake_amount: i128) -> Result<(), RiskRegistryError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &verifier)?;
@@ -174,17 +230,17 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&DataKey::MinimumStake)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(RiskRegistryError::NotInitialized)?;
 
         if stake_amount < minimum_stake {
-            return Err(KoraError::InsufficientFunds);
+            return Err(RiskRegistryError::InsufficientFunds);
         }
 
         let token_addr: Address = env
             .storage()
             .persistent()
             .get(&DataKey::StakingToken)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(RiskRegistryError::NotInitialized)?;
 
         let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
         token_client.transfer(&verifier, &env.current_contract_address(), &stake_amount);
@@ -213,13 +269,13 @@ impl RiskRegistryContract {
     /// - `verifier` — The verifier address to remove.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::NotVerifier` — Address is not a registered verifier.
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::NotVerifier` — Address is not a registered verifier.
     ///
     /// **Security:** Requires `admin.require_auth()`. Returns any remaining (unslashed) stake to
     /// the verifier. Removes all three verifier records (flag, stake, reputation). Emits
     /// `verifier_removed` event.
-    pub fn remove_verifier(env: Env, admin: Address, verifier: Address) -> Result<(), KoraError> {
+    pub fn remove_verifier(env: Env, admin: Address, verifier: Address) -> Result<(), RiskRegistryError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         // Only remove if it actually exists — avoids a no-op silently succeeding
@@ -229,7 +285,7 @@ impl RiskRegistryContract {
             .get::<_, bool>(&DataKey::Verifier(verifier.clone()))
             .unwrap_or(false)
         {
-            return Err(KoraError::NotVerifier);
+            return Err(RiskRegistryError::NotVerifier);
         }
 
         let stake: i128 = env
@@ -243,7 +299,7 @@ impl RiskRegistryContract {
                 .storage()
                 .persistent()
                 .get(&DataKey::StakingToken)
-                .ok_or(KoraError::NotInitialized)?;
+                .ok_or(RiskRegistryError::NotInitialized)?;
             let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
             token_client.transfer(&env.current_contract_address(), &verifier, &stake);
         }
@@ -272,7 +328,7 @@ impl RiskRegistryContract {
         env: Env,
         primary: Address,
         sub_account: Address,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         primary.require_auth();
         Self::require_verifier_primary(&env, &primary)?;
 
@@ -283,7 +339,7 @@ impl RiskRegistryContract {
             .get::<_, bool>(&DataKey::Verifier(sub_account.clone()))
             .unwrap_or(false)
         {
-            return Err(KoraError::InvalidAddress);
+            return Err(RiskRegistryError::InvalidAddress);
         }
 
         // sub_account must not already be registered under another primary
@@ -292,7 +348,7 @@ impl RiskRegistryContract {
             .persistent()
             .has(&DataKey::SubAccount(sub_account.clone()))
         {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(RiskRegistryError::AlreadyInitialized);
         }
 
         env.storage()
@@ -308,7 +364,7 @@ impl RiskRegistryContract {
         env: Env,
         primary: Address,
         sub_account: Address,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         primary.require_auth();
         Self::require_verifier_primary(&env, &primary)?;
 
@@ -316,10 +372,10 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&DataKey::SubAccount(sub_account.clone()))
-            .ok_or(KoraError::NotVerifier)?;
+            .ok_or(RiskRegistryError::NotVerifier)?;
 
         if stored_primary != primary {
-            return Err(KoraError::Unauthorized);
+            return Err(RiskRegistryError::Unauthorized);
         }
 
         env.storage()
@@ -340,9 +396,9 @@ impl RiskRegistryContract {
     /// - `compliance_attested` — Whether the verifier attests the SME is KYC/AML compliant.
     ///
     /// **Errors:**
-    /// - `KoraError::NotVerifier` — Caller is not a registered verifier.
-    /// - `KoraError::InvalidRiskScore` — `risk_score` > 100.
-    /// - `KoraError::AlreadyInitialized` — SME is already registered (prevents silent re-registration
+    /// - `RiskRegistryError::NotVerifier` — Caller is not a registered verifier.
+    /// - `RiskRegistryError::InvalidRiskScore` — `risk_score` > 100.
+    /// - `RiskRegistryError::AlreadyInitialized` — SME is already registered (prevents silent re-registration
     ///   that would reset `defaults` and `total_invoices` counters).
     ///
     /// **Security:** Requires `verifier.require_auth()`. Emits `sme_registered` event.
@@ -352,7 +408,7 @@ impl RiskRegistryContract {
         sme: Address,
         risk_score: u32,
         compliance_attested: bool,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         verifier.require_auth();
         // Resolve to primary verifier so sub-accounts attribute registration correctly.
         let primary = Self::resolve_verifier(&env, &verifier)?;
@@ -364,7 +420,7 @@ impl RiskRegistryContract {
             .persistent()
             .has(&DataKey::SmeProfile(sme.clone()))
         {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(RiskRegistryError::AlreadyInitialized);
         }
 
         let profile = SmeProfile {
@@ -395,10 +451,10 @@ impl RiskRegistryContract {
     /// - `new_score` — The new risk score (0–100).
     ///
     /// **Errors:**
-    /// - `KoraError::NotVerifier` — Caller is not a registered verifier.
-    /// - `KoraError::InvalidRiskScore` — `new_score` > 100.
-    /// - `KoraError::SMENotRegistered` — SME has not been registered.
-    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    /// - `RiskRegistryError::NotVerifier` — Caller is not a registered verifier.
+    /// - `RiskRegistryError::InvalidRiskScore` — `new_score` > 100.
+    /// - `RiskRegistryError::SMENotRegistered` — SME has not been registered.
+    /// - `RiskRegistryError::Reentrancy` — Reentrancy guard triggered.
     ///
     /// **Security:** Requires `verifier.require_auth()`. Emits `sme_score_updated` event.
     pub fn update_sme_score(
@@ -406,7 +462,7 @@ impl RiskRegistryContract {
         verifier: Address,
         sme: Address,
         new_score: u32,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
         require_valid_risk_score(new_score)?;
@@ -417,7 +473,7 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&DataKey::SmeProfile(sme.clone()))
-            .ok_or(KoraError::SMENotRegistered)?;
+            .ok_or(RiskRegistryError::SMENotRegistered)?;
 
         profile.risk_score = new_score;
         env.storage()
@@ -439,9 +495,9 @@ impl RiskRegistryContract {
     /// - `credit_limit` — The new limit in stroops (≥ 0). 0 means uncapped.
     ///
     /// **Errors:**
-    /// - `KoraError::NotVerifier` — Caller is not a registered verifier.
-    /// - `KoraError::InvalidAmount` — `credit_limit` is negative.
-    /// - `KoraError::SMENotRegistered` — SME has not been registered.
+    /// - `RiskRegistryError::NotVerifier` — Caller is not a registered verifier.
+    /// - `RiskRegistryError::InvalidAmount` — `credit_limit` is negative.
+    /// - `RiskRegistryError::SMENotRegistered` — SME has not been registered.
     ///
     /// **Security:** Requires `verifier.require_auth()`. Emits `sme_credit_limit_set` event.
     pub fn set_credit_limit(
@@ -449,18 +505,18 @@ impl RiskRegistryContract {
         verifier: Address,
         sme: Address,
         credit_limit: i128,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
         if credit_limit < 0 {
-            return Err(KoraError::InvalidAmount);
+            return Err(RiskRegistryError::InvalidAmount);
         }
 
         let mut profile: SmeProfile = env
             .storage()
             .persistent()
             .get(&DataKey::SmeProfile(sme.clone()))
-            .ok_or(KoraError::SMENotRegistered)?;
+            .ok_or(RiskRegistryError::SMENotRegistered)?;
 
         profile.credit_limit = credit_limit;
         env.storage()
@@ -481,16 +537,16 @@ impl RiskRegistryContract {
     /// - `sme` — The SME whose invoice count is being incremented.
     ///
     /// **Errors:**
-    /// - `KoraError::Unauthorized` — Caller is not the authorized `invoice_nft` contract.
-    /// - `KoraError::SMENotRegistered` — SME has not been registered.
-    /// - `KoraError::ArithmeticOverflow` — Invoice count overflowed (extremely unlikely).
+    /// - `RiskRegistryError::Unauthorized` — Caller is not the authorized `invoice_nft` contract.
+    /// - `RiskRegistryError::SMENotRegistered` — SME has not been registered.
+    /// - `RiskRegistryError::ArithmeticOverflow` — Invoice count overflowed (extremely unlikely).
     ///
     /// **Security:** Requires `caller.require_auth()`. Only `invoice_nft` may call this.
     pub fn increment_invoice_count(
         env: Env,
         caller: Address,
         sme: Address,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         caller.require_auth();
         Self::require_invoice_nft(&env, &caller)?;
 
@@ -498,12 +554,12 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&DataKey::SmeProfile(sme.clone()))
-            .ok_or(KoraError::SMENotRegistered)?;
+            .ok_or(RiskRegistryError::SMENotRegistered)?;
 
         profile.total_invoices = profile
             .total_invoices
             .checked_add(1)
-            .ok_or(KoraError::ArithmeticOverflow)?;
+            .ok_or(RiskRegistryError::ArithmeticOverflow)?;
 
         env.storage()
             .persistent()
@@ -521,17 +577,17 @@ impl RiskRegistryContract {
     /// - `sme` — The SME address that defaulted on an invoice.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::SMENotRegistered` — SME has not been registered.
-    /// - `KoraError::NotInitialized` — `SlashPercentage` was not set during initialization.
-    /// - `KoraError::ArithmeticOverflow` — Default counter overflow (extremely unlikely).
-    /// - `KoraError::ArithmeticUnderflow` — Slash computation underflowed.
-    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::SMENotRegistered` — SME has not been registered.
+    /// - `RiskRegistryError::NotInitialized` — `SlashPercentage` was not set during initialization.
+    /// - `RiskRegistryError::ArithmeticOverflow` — Default counter overflow (extremely unlikely).
+    /// - `RiskRegistryError::ArithmeticUnderflow` — Slash computation underflowed.
+    /// - `RiskRegistryError::Reentrancy` — Reentrancy guard triggered.
     ///
     /// **Security:** Requires `admin.require_auth()`. Verifier's stake is reduced by
     /// `current_stake * slash_percentage_bps / 10_000`. Reputation floors at 0.
     /// Emits `sme_default_recorded` event.
-    pub fn record_default(env: Env, admin: Address, sme: Address) -> Result<(), KoraError> {
+    pub fn record_default(env: Env, admin: Address, sme: Address) -> Result<(), RiskRegistryError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         let _guard = ReentrancyGuard::new(&env)?;
@@ -540,19 +596,19 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&DataKey::SmeProfile(sme.clone()))
-            .ok_or(KoraError::SMENotRegistered)?;
+            .ok_or(RiskRegistryError::SMENotRegistered)?;
 
         profile.defaults = profile
             .defaults
             .checked_add(1)
-            .ok_or(KoraError::ArithmeticOverflow)?;
+            .ok_or(RiskRegistryError::ArithmeticOverflow)?;
 
         let verifier = profile.verifier.clone();
         let slash_percentage: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::SlashPercentage)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(RiskRegistryError::NotInitialized)?;
 
         let current_stake: i128 = env
             .storage()
@@ -563,7 +619,7 @@ impl RiskRegistryContract {
         if current_stake > 0 {
             let slash_amount = (current_stake as u128 * slash_percentage as u128 / 10_000) as i128;
             let remaining_stake = current_stake.checked_sub(slash_amount)
-                .ok_or(KoraError::ArithmeticUnderflow)?;
+                .ok_or(RiskRegistryError::ArithmeticUnderflow)?;
 
             env.storage()
                 .persistent()
@@ -602,7 +658,7 @@ impl RiskRegistryContract {
         verifier: Address,
         debtor_hash: Bytes,
         score: u32,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
         // Validate exact 32-byte SHA-256 length before score
@@ -615,9 +671,9 @@ impl RiskRegistryContract {
         if let Some(last_update) = env.storage().persistent().get::<_, u64>(&cooldown_key) {
             let next_allowed = last_update
                 .checked_add(MIN_SCORE_UPDATE_INTERVAL)
-                .ok_or(KoraError::ArithmeticOverflow)?;
+                .ok_or(RiskRegistryError::ArithmeticOverflow)?;
             if env.ledger().timestamp() < next_allowed {
-                return Err(KoraError::ScoreUpdateCooldownNotElapsed);
+                return Err(RiskRegistryError::ScoreUpdateCooldownNotElapsed);
             }
         }
 
@@ -645,16 +701,16 @@ impl RiskRegistryContract {
     /// **Returns:** The `SmeProfile` struct.
     ///
     /// **Errors:**
-    /// - `KoraError::SMENotRegistered` — SME has not been registered.
+    /// - `RiskRegistryError::SMENotRegistered` — SME has not been registered.
     ///
     /// **Security:** Read-only view. No authorization required. Bumps the profile's TTL.
-    pub fn get_sme_profile(env: Env, sme: Address) -> Result<SmeProfile, KoraError> {
+    pub fn get_sme_profile(env: Env, sme: Address) -> Result<SmeProfile, RiskRegistryError> {
         let key = DataKey::SmeProfile(sme);
         let profile: SmeProfile = env
             .storage()
             .persistent()
             .get(&key)
-            .ok_or(KoraError::SMENotRegistered)?;
+            .ok_or(RiskRegistryError::SMENotRegistered)?;
         Self::bump_persistent(&env, &key);
         Ok(profile)
     }
@@ -756,14 +812,14 @@ impl RiskRegistryContract {
             .has(&DataKey::SubAccount(addr))
     }
 
-    /// Returns the debtor score or `KoraError::DebtorNotRegistered` if not found.
-    pub fn get_debtor_score(env: Env, debtor_hash: Bytes) -> Result<u32, KoraError> {
+    /// Returns the debtor score or `RiskRegistryError::DebtorNotRegistered` if not found.
+    pub fn get_debtor_score(env: Env, debtor_hash: Bytes) -> Result<u32, RiskRegistryError> {
         let key = DataKey::DebtorScore(debtor_hash);
         let score: u32 = env
             .storage()
             .persistent()
             .get(&key)
-            .ok_or(KoraError::DebtorNotRegistered)?;
+            .ok_or(RiskRegistryError::DebtorNotRegistered)?;
         Self::bump_persistent(&env, &key);
         Ok(score)
     }
@@ -773,14 +829,14 @@ impl RiskRegistryContract {
     /// **Returns:** The admin `Address`.
     ///
     /// **Errors:**
-    /// - `KoraError::NotInitialized` — Contract has not been initialized.
+    /// - `RiskRegistryError::NotInitialized` — Contract has not been initialized.
     ///
     /// **Security:** Read-only view. No authorization required.
-    pub fn get_admin(env: Env) -> Result<Address, KoraError> {
+    pub fn get_admin(env: Env) -> Result<Address, RiskRegistryError> {
         env.storage()
             .persistent()
             .get(&DataKey::Admin)
-            .ok_or(KoraError::NotInitialized)
+            .ok_or(RiskRegistryError::NotInitialized)
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
@@ -792,7 +848,7 @@ impl RiskRegistryContract {
     /// - `new_wasm_hash` — SHA-256 hash of the new WASM binary (32 bytes).
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
     ///
     /// **Security:** Requires `admin.require_auth()`. Apply with `execute_upgrade` after
     /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed. Emits `upgrade_proposed` event.
@@ -800,7 +856,7 @@ impl RiskRegistryContract {
         env: Env,
         admin: Address,
         new_wasm_hash: BytesN<32>,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), RiskRegistryError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -817,22 +873,22 @@ impl RiskRegistryContract {
     /// - `admin` — Must be the current admin address.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
-    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `RiskRegistryError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
     ///
     /// **Security:** Requires `admin.require_auth()`. Clears the proposal atomically before
     /// executing. Emits `upgrade_executed` event.
-    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), RiskRegistryError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
             .storage()
             .instance()
             .get(&DataKey::UpgradeProposal)
-            .ok_or(KoraError::NoUpgradeProposed)?;
+            .ok_or(RiskRegistryError::NoUpgradeProposed)?;
         if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
-            return Err(KoraError::UpgradeTimelockNotElapsed);
+            return Err(RiskRegistryError::UpgradeTimelockNotElapsed);
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         events::upgrade_executed(&env, &admin, &wasm_hash);
@@ -884,14 +940,14 @@ impl RiskRegistryContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), RiskRegistryError> {
         let admin: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Admin)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(RiskRegistryError::NotInitialized)?;
         if &admin != caller {
-            return Err(KoraError::NotAdmin);
+            return Err(RiskRegistryError::NotAdmin);
         }
         Ok(())
     }
@@ -899,7 +955,7 @@ impl RiskRegistryContract {
     /// Returns `Ok(primary)` when `caller` is an active verifier (primary or sub-account).
     /// Sub-accounts resolve to their primary verifier so that reputation and staking
     /// are always attributed to the primary.
-    fn resolve_verifier(env: &Env, caller: &Address) -> Result<Address, KoraError> {
+    fn resolve_verifier(env: &Env, caller: &Address) -> Result<Address, RiskRegistryError> {
         // Direct primary check first (fast path).
         if env
             .storage()
@@ -925,35 +981,35 @@ impl RiskRegistryContract {
                 return Ok(primary);
             }
         }
-        Err(KoraError::NotVerifier)
+        Err(RiskRegistryError::NotVerifier)
     }
 
-    fn require_verifier(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_verifier(env: &Env, caller: &Address) -> Result<(), RiskRegistryError> {
         Self::resolve_verifier(env, caller).map(|_| ())
     }
 
     /// Require `caller` to be a **primary** verifier (not a sub-account).
     /// Used for delegation management so only the primary can add/remove sub-accounts.
-    fn require_verifier_primary(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_verifier_primary(env: &Env, caller: &Address) -> Result<(), RiskRegistryError> {
         let ok: bool = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier(caller.clone()))
             .unwrap_or(false);
         if !ok {
-            return Err(KoraError::NotVerifier);
+            return Err(RiskRegistryError::NotVerifier);
         }
         Ok(())
     }
 
-    fn require_invoice_nft(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_invoice_nft(env: &Env, caller: &Address) -> Result<(), RiskRegistryError> {
         let invoice_nft: Address = env
             .storage()
             .persistent()
             .get(&DataKey::InvoiceNft)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(RiskRegistryError::NotInitialized)?;
         if &invoice_nft != caller {
-            return Err(KoraError::Unauthorized);
+            return Err(RiskRegistryError::Unauthorized);
         }
         Ok(())
     }
@@ -1008,6 +1064,23 @@ impl RiskRegistryContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger, LedgerInfo},
+        Bytes, Env,
+    };
+
+    /// Returns (env, admin, invoice_nft, staking_token, client)
+    ///
+    /// `staking_token` is a real deployed Stellar Asset Contract (not just a
+    /// generated address) so that `add_verifier`'s internal `token::Client::transfer`
+    /// call has a real contract instance to invoke against. Use `mint_stake` to
+    /// fund a verifier address before calling `add_verifier`/`try_add_verifier`.
+    fn setup() -> (Env, Address, Address, Address, RiskRegistryContractClient<'static>) {
+        let env = Env::default();
+        // `add_verifier` internally calls the staking token's `transfer`, which
+        // requires `verifier.require_auth()` in a *nested* invocation (not the
+        // root `add_verifier` call). Plain `mock_all_auths()` only auto-satisfies
+        // auth requirements tied to the root invocation, so this test setup
+        // needs the non-root variant.
         testutils::{Address as _, Events as _, Ledger, LedgerInfo},
         Bytes, Env,
     };
@@ -1025,10 +1098,17 @@ mod tests {
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let invoice_nft = Address::generate(&env);
+        let staking_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
         let token_admin = Address::generate(&env);
         let staking_token = env.register_stellar_asset_contract_v2(token_admin).address();
         client.initialize(&admin, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32);
         (env, admin, invoice_nft, staking_token, client)
+    }
+
+    /// Mints `amount` of `token` to `to`. The Stellar Asset Contract's admin
+    /// auth requirement is satisfied automatically via `env.mock_all_auths()`.
+    fn mint_stake(env: &Env, token: &Address, to: &Address, amount: i128) {
+        soroban_sdk::token::StellarAssetClient::new(env, token).mint(to, &amount);
     }
 
     // ── initialize ────────────────────────────────────────────────────────────
@@ -1075,6 +1155,8 @@ mod tests {
     fn test_add_verifier_success() {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        assert!(client.try_add_verifier(&admin, &verifier, &1_000_000i128).is_ok());
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.is_verifier(&verifier));
@@ -1085,6 +1167,7 @@ mod tests {
         let (env, _, _, staking_token, client) = setup();
         let stranger = Address::generate(&env);
         let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         assert!(client.try_add_verifier(&stranger, &verifier, &1_000_000i128).is_err());
     }
@@ -1093,6 +1176,7 @@ mod tests {
     fn test_remove_verifier_success() {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.is_verifier(&verifier));
@@ -1105,6 +1189,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let stranger = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.try_remove_verifier(&stranger, &verifier).is_err());
@@ -1124,6 +1209,9 @@ mod tests {
         let v2 = Address::generate(&env);
         let sme1 = Address::generate(&env);
         let sme2 = Address::generate(&env);
+        mint_stake(&env, &staking_token, &v1, 1_000_000i128);
+        client.add_verifier(&admin, &v1, &1_000_000i128);
+        mint_stake(&env, &staking_token, &v2, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&v1, &1_000_000i128);
         client.add_verifier(&admin, &v1, &1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&v2, &1_000_000i128);
@@ -1143,6 +1231,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1161,6 +1250,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1180,6 +1270,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.try_register_sme(&verifier, &sme, &101u32, &true).is_err());
@@ -1190,6 +1281,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1203,6 +1295,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &true);
@@ -1216,6 +1309,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &false);
@@ -1231,6 +1325,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1243,6 +1338,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
@@ -1255,6 +1351,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1268,6 +1365,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &true);
@@ -1284,6 +1382,7 @@ mod tests {
         let (env, admin, invoice_nft, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1297,6 +1396,7 @@ mod tests {
         let (env, admin, invoice_nft, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1312,6 +1412,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         let stranger = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1334,6 +1435,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1348,6 +1450,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         let stranger = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1366,6 +1469,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1382,6 +1486,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.set_debtor_score(&verifier, &debtor_hash, &45u32);
@@ -1393,6 +1498,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
@@ -1405,6 +1511,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let empty_hash = Bytes::from_slice(&env, &[]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
@@ -1417,6 +1524,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.try_set_debtor_score(&verifier, &hash, &50u32).is_ok());
@@ -1427,10 +1535,11 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let hash = Bytes::from_slice(&env, &[0xABu8; 31]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
+        assert_eq!(result.unwrap_err().unwrap(), RiskRegistryError::InvalidLength);
     }
 
     #[test]
@@ -1438,10 +1547,11 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let hash = Bytes::from_slice(&env, &[0xABu8; 33]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
+        assert_eq!(result.unwrap_err().unwrap(), RiskRegistryError::InvalidLength);
     }
 
     #[test]
@@ -1465,6 +1575,7 @@ mod tests {
     fn test_debtor_score_boundary_values() {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let hash0 = Bytes::from_slice(&env, &[0x01u8; 32]);
@@ -1501,6 +1612,7 @@ mod tests {
     fn test_risk_score_boundary_values() {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let sme0 = Address::generate(&env);
@@ -1521,6 +1633,7 @@ mod tests {
     fn test_add_verifier_emits_event() {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(!env.events().all().is_empty());
@@ -1542,6 +1655,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let events_before = env.events().all().len();
@@ -1554,6 +1668,7 @@ mod tests {
         let (env, admin, invoice_nft, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
@@ -1568,6 +1683,10 @@ mod tests {
         let (env, _, _, staking_token, client) = setup();
         let stranger = Address::generate(&env);
         let verifier = Address::generate(&env);
+        // `add_verifier` fails at the `NotAdmin` check (before ever touching the
+        // staking token), so no funding is required here — but mint first anyway
+        // so `events_before` is captured only after unrelated setup activity.
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         let events_before = env.events().all().len();
         let _ = client.try_add_verifier(&stranger, &verifier, &1_000_000i128);
@@ -1581,6 +1700,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &80u32, &true);
@@ -1600,6 +1720,7 @@ mod tests {
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let invoice_nft = Address::generate(&env);
         let staking_token = Address::generate(&env);
+        let result = client.try_initialize(&contract_id, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32);
         let result = client.try_initialize(
             &contract_id,
             &invoice_nft,
@@ -1614,6 +1735,7 @@ mod tests {
     fn test_add_verifier_self_as_verifier_rejected() {
         let (env, admin, _, staking_token, client) = setup();
         let contract_id = client.address.clone();
+        mint_stake(&env, &staking_token, &contract_id, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&contract_id, &1_000_000i128);
         let result = client.try_add_verifier(&admin, &contract_id, &1_000_000i128);
         assert!(result.is_err());
@@ -1637,6 +1759,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &true);
@@ -1654,6 +1777,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xAAu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.set_debtor_score(&verifier, &debtor_hash, &30u32);
@@ -1678,6 +1802,7 @@ mod tests {
         // current design. This test documents the current behaviour.
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         // A verifier registering themselves as an SME is permitted (no rule
@@ -1695,6 +1820,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &40u32, &true);
@@ -1712,6 +1838,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         // Score 0 is valid: AAA tier.
@@ -1738,6 +1865,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xBBu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
@@ -1752,6 +1880,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xCCu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.set_debtor_score(&verifier, &debtor_hash, &40u32);
@@ -1764,7 +1893,7 @@ mod tests {
             .try_set_debtor_score(&verifier, &debtor_hash, &60u32)
             .unwrap_err()
             .unwrap();
-        assert_eq!(err, KoraError::ScoreUpdateCooldownNotElapsed);
+        assert_eq!(err, RiskRegistryError::ScoreUpdateCooldownNotElapsed);
     }
 
     #[test]
@@ -1774,6 +1903,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xDDu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         // First update at t=0.
@@ -1796,6 +1926,9 @@ mod tests {
         let verifier_a = Address::generate(&env);
         let verifier_b = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xEEu8; 32]);
+        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
+        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier_a, &1_000_000i128);
         client.add_verifier(&admin, &verifier_a, &1_000_000i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier_b, &1_000_000i128);

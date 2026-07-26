@@ -1,5 +1,5 @@
 use soroban_sdk::{Address, Bytes, Env, String};
-use crate::errors::KoraError;
+use crate::errors::CommonError;
 
 /// Minimum timelock delay for upgrade proposals (24 hours in seconds).
 pub const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
@@ -13,9 +13,9 @@ pub const MAX_AMOUNT: i128 = i128::MAX / 2;
 
 /// Reject amounts that exceed the overflow-safety ceiling.
 #[inline]
-pub fn require_within_max_amount(amount: i128) -> Result<(), KoraError> {
+pub fn require_within_max_amount(amount: i128) -> Result<(), CommonError> {
     if amount > MAX_AMOUNT {
-        return Err(KoraError::InvalidAmount);
+        return Err(CommonError::InvalidAmount);
     }
     Ok(())
 }
@@ -29,9 +29,9 @@ pub fn require_within_max_amount(amount: i128) -> Result<(), KoraError> {
 /// assert!(require_non_zero_amount(0).is_err());
 /// assert!(require_non_zero_amount(-50).is_err());
 /// ```
-pub fn require_non_zero_amount(amount: i128) -> Result<(), KoraError> {
+pub fn require_non_zero_amount(amount: i128) -> Result<(), CommonError> {
     if amount <= 0 {
-        return Err(KoraError::InvalidAmount);
+        return Err(CommonError::InvalidAmount);
     }
     Ok(())
 }
@@ -45,9 +45,9 @@ pub fn require_non_zero_amount(amount: i128) -> Result<(), KoraError> {
 /// assert!(require_non_negative_amount(0).is_ok());
 /// assert!(require_non_negative_amount(-50).is_err());
 /// ```
-pub fn require_non_negative_amount(amount: i128) -> Result<(), KoraError> {
+pub fn require_non_negative_amount(amount: i128) -> Result<(), CommonError> {
     if amount < 0 {
-        return Err(KoraError::InvalidAmount);
+        return Err(CommonError::InvalidAmount);
     }
     Ok(())
 }
@@ -62,9 +62,9 @@ pub fn require_non_negative_amount(amount: i128) -> Result<(), KoraError> {
 /// assert!(require_amount_within_bounds(101, 100).is_err());
 /// assert!(require_amount_within_bounds(-1, 100).is_err());
 /// ```
-pub fn require_amount_within_bounds(amount: i128, max: i128) -> Result<(), KoraError> {
+pub fn require_amount_within_bounds(amount: i128, max: i128) -> Result<(), CommonError> {
     if amount < 0 || amount > max {
-        return Err(KoraError::InvalidAmount);
+        return Err(CommonError::InvalidAmount);
     }
     Ok(())
 }
@@ -86,9 +86,9 @@ pub fn require_amount_within_bounds(amount: i128, max: i128) -> Result<(), KoraE
 /// assert!(require_future_timestamp(&env, 1000).is_err()); // equal
 /// assert!(require_future_timestamp(&env, 999).is_err());  // past
 /// ```
-pub fn require_future_timestamp(env: &Env, ts: u64) -> Result<(), KoraError> {
+pub fn require_future_timestamp(env: &Env, ts: u64) -> Result<(), CommonError> {
     if ts <= env.ledger().timestamp() {
-        return Err(KoraError::InvalidDueDate);
+        return Err(CommonError::InvalidDueDate);
     }
     Ok(())
 }
@@ -104,9 +104,9 @@ pub fn require_future_timestamp(env: &Env, ts: u64) -> Result<(), KoraError> {
 /// assert!(require_valid_risk_score(100).is_ok());
 /// assert!(require_valid_risk_score(101).is_err());
 /// ```
-pub fn require_valid_risk_score(score: u32) -> Result<(), KoraError> {
+pub fn require_valid_risk_score(score: u32) -> Result<(), CommonError> {
     if score > 100 {
-        return Err(KoraError::InvalidRiskScore);
+        return Err(CommonError::InvalidRiskScore);
     }
     Ok(())
 }
@@ -120,9 +120,9 @@ pub fn require_valid_risk_score(score: u32) -> Result<(), KoraError> {
 /// assert!(require_valid_fee_bps(10000).is_ok());   // 100%
 /// assert!(require_valid_fee_bps(10001).is_err());  // > 100%
 /// ```
-pub fn require_valid_fee_bps(bps: u32) -> Result<(), KoraError> {
+pub fn require_valid_fee_bps(bps: u32) -> Result<(), CommonError> {
     if bps > 10_000 {
-        return Err(KoraError::InvalidFeeRate);
+        return Err(CommonError::InvalidFeeRate);
     }
     Ok(())
 }
@@ -137,9 +137,9 @@ pub fn require_valid_fee_bps(bps: u32) -> Result<(), KoraError> {
 /// assert!(require_valid_bps_range(100, 0, 100).is_ok());
 /// assert!(require_valid_bps_range(101, 0, 100).is_err());
 /// ```
-pub fn require_valid_bps_range(bps: u32, min_bps: u32, max_bps: u32) -> Result<(), KoraError> {
+pub fn require_valid_bps_range(bps: u32, min_bps: u32, max_bps: u32) -> Result<(), CommonError> {
     if bps < min_bps || bps > max_bps {
-        return Err(KoraError::InvalidFeeRate);
+        return Err(CommonError::InvalidFeeRate);
     }
     Ok(())
 }
@@ -159,9 +159,9 @@ pub fn require_valid_bps_range(bps: u32, min_bps: u32, max_bps: u32) -> Result<(
 /// assert!(require_non_empty_string(&empty).is_err());
 /// assert!(require_non_empty_string(&non_empty).is_ok());
 /// ```
-pub fn require_non_empty_string(s: &String) -> Result<(), KoraError> {
+pub fn require_non_empty_string(s: &String) -> Result<(), CommonError> {
     if s.len() == 0 {
-        return Err(KoraError::EmptyString);
+        return Err(CommonError::EmptyString);
     }
     Ok(())
 }
@@ -174,10 +174,10 @@ const CID_MAX_LEN: u32 = 128;
 /// CIDv0: exactly 46 base58btc characters, "Qm" prefix.
 /// CIDv1: multibase-prefixed ('b'/'B' base32, 'z' base58, 'f'/'F' base16,
 ///        'u'/'U' base64url, 'k'/'K' base36), minimum 10 characters.
-pub fn require_valid_ipfs_cid(cid: &String) -> Result<(), KoraError> {
+pub fn require_valid_ipfs_cid(cid: &String) -> Result<(), CommonError> {
     let len = cid.len();
     if len < 2 || len > CID_MAX_LEN {
-        return Err(KoraError::InvalidCid);
+        return Err(CommonError::InvalidCid);
     }
     let mut buf = [0u8; CID_MAX_LEN as usize];
     cid.copy_into_slice(&mut buf[..len as usize]);
@@ -186,11 +186,11 @@ pub fn require_valid_ipfs_cid(cid: &String) -> Result<(), KoraError> {
     // CIDv0: "Qm" prefix, exactly 46 chars, base58btc alphabet
     if first == b'Q' && second == b'm' {
         if len != 46 {
-            return Err(KoraError::InvalidCid);
+            return Err(CommonError::InvalidCid);
         }
         for &c in &buf[..46] {
             if !is_base58_char(c) {
-                return Err(KoraError::InvalidCid);
+                return Err(CommonError::InvalidCid);
             }
         }
         return Ok(());
@@ -198,11 +198,11 @@ pub fn require_valid_ipfs_cid(cid: &String) -> Result<(), KoraError> {
     // CIDv1: multibase prefix — common encodings only
     if matches!(first, b'b' | b'B' | b'z' | b'f' | b'F' | b'u' | b'U' | b'k' | b'K') {
         if len < 10 {
-            return Err(KoraError::InvalidCid);
+            return Err(CommonError::InvalidCid);
         }
         return Ok(());
     }
-    Err(KoraError::InvalidCid)
+    Err(CommonError::InvalidCid)
 }
 
 /// Returns true for characters in the base58btc alphabet.
@@ -232,27 +232,27 @@ fn is_base58_char(c: u8) -> bool {
 /// assert!(require_non_empty_bytes(&non_empty).is_ok());
 /// ```
 #[inline]
-pub fn require_non_empty_bytes(b: &Bytes) -> Result<(), KoraError> {
+pub fn require_non_empty_bytes(b: &Bytes) -> Result<(), CommonError> {
     if b.len() == 0 {
-        return Err(KoraError::EmptyBytes);
+        return Err(CommonError::EmptyBytes);
     }
     Ok(())
 }
 
 /// Reject strings whose length exceeds `max_bytes`.
 #[inline]
-pub fn require_max_length_string(s: &String, max_bytes: u32) -> Result<(), KoraError> {
+pub fn require_max_length_string(s: &String, max_bytes: u32) -> Result<(), CommonError> {
     if s.len() > max_bytes {
-        return Err(KoraError::FieldTooLong);
+        return Err(CommonError::FieldTooLong);
     }
     Ok(())
 }
 
 /// Reject byte slices whose length exceeds `max_bytes`.
 #[inline]
-pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), KoraError> {
+pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), CommonError> {
     if b.len() > max_bytes {
-        return Err(KoraError::FieldTooLong);
+        return Err(CommonError::FieldTooLong);
     }
     Ok(())
 }
@@ -285,14 +285,14 @@ pub const MAX_DEBTOR_HASH_LEN: u32 = 64;
 /// assert!(bps_of(-1_000, 50).is_err());  // negative amount rejected
 /// ```
 #[inline]
-pub fn bps_of(amount: i128, bps: u32) -> Result<i128, KoraError> {
+pub fn bps_of(amount: i128, bps: u32) -> Result<i128, CommonError> {
     if amount < 0 {
-        return Err(KoraError::InvalidAmount);
+        return Err(CommonError::InvalidAmount);
     }
     amount
         .checked_mul(bps as i128)
         .and_then(|v| v.checked_div(10_000))
-        .ok_or(KoraError::ArithmeticOverflow)
+        .ok_or(CommonError::ArithmeticOverflow)
 }
 
 /// Safe addition — returns `ArithmeticOverflow` on overflow.
@@ -303,8 +303,8 @@ pub fn bps_of(amount: i128, bps: u32) -> Result<i128, KoraError> {
 /// assert_eq!(safe_add(100, 200).unwrap(), 300);
 /// assert!(safe_add(i128::MAX, 1).is_err());
 /// ```
-pub fn safe_add(a: i128, b: i128) -> Result<i128, KoraError> {
-    a.checked_add(b).ok_or(KoraError::ArithmeticOverflow)
+pub fn safe_add(a: i128, b: i128) -> Result<i128, CommonError> {
+    a.checked_add(b).ok_or(CommonError::ArithmeticOverflow)
 }
 
 /// Safe subtraction — returns `ArithmeticUnderflow` when result would underflow.
@@ -315,8 +315,8 @@ pub fn safe_add(a: i128, b: i128) -> Result<i128, KoraError> {
 /// assert_eq!(safe_sub(300, 100).unwrap(), 200);
 /// assert!(safe_sub(100, 200).is_err());  // underflow
 /// ```
-pub fn safe_sub(a: i128, b: i128) -> Result<i128, KoraError> {
-    a.checked_sub(b).ok_or(KoraError::ArithmeticUnderflow)
+pub fn safe_sub(a: i128, b: i128) -> Result<i128, CommonError> {
+    a.checked_sub(b).ok_or(CommonError::ArithmeticUnderflow)
 }
 
 /// Reject the contract's own address being passed as a counterparty or admin.
@@ -333,9 +333,9 @@ pub fn safe_sub(a: i128, b: i128) -> Result<i128, KoraError> {
 /// assert!(require_not_self(&env, &contract_addr).is_err());
 /// assert!(require_not_self(&env, &other_addr).is_ok());
 /// ```
-pub fn require_not_self(env: &Env, addr: &Address) -> Result<(), KoraError> {
+pub fn require_not_self(env: &Env, addr: &Address) -> Result<(), CommonError> {
     if addr == &env.current_contract_address() {
-        return Err(KoraError::InvalidAddress);
+        return Err(CommonError::InvalidAddress);
     }
     Ok(())
 }
@@ -354,9 +354,9 @@ pub fn require_not_self(env: &Env, addr: &Address) -> Result<(), KoraError> {
 /// assert!(require_distinct(&addr1, &addr2).is_ok());
 /// assert!(require_distinct(&addr1, &addr1).is_err());
 /// ```
-pub fn require_distinct(a: &Address, b: &Address) -> Result<(), KoraError> {
+pub fn require_distinct(a: &Address, b: &Address) -> Result<(), CommonError> {
     if a == b {
-        return Err(KoraError::InvalidAddress);
+        return Err(CommonError::InvalidAddress);
     }
     Ok(())
 }
@@ -369,8 +369,8 @@ pub fn require_distinct(a: &Address, b: &Address) -> Result<(), KoraError> {
 /// assert_eq!(safe_mul(10, 20).unwrap(), 200);
 /// assert!(safe_mul(i128::MAX, 2).is_err());
 /// ```
-pub fn safe_mul(a: i128, b: i128) -> Result<i128, KoraError> {
-    a.checked_mul(b).ok_or(KoraError::ArithmeticOverflow)
+pub fn safe_mul(a: i128, b: i128) -> Result<i128, CommonError> {
+    a.checked_mul(b).ok_or(CommonError::ArithmeticOverflow)
 }
 
 /// Safe division — returns `InvalidAmount` on divide-by-zero, `ArithmeticOverflow` otherwise.
@@ -381,11 +381,11 @@ pub fn safe_mul(a: i128, b: i128) -> Result<i128, KoraError> {
 /// assert_eq!(safe_div(200, 4).unwrap(), 50);
 /// assert!(safe_div(100, 0).is_err());  // divide by zero
 /// ```
-pub fn safe_div(a: i128, b: i128) -> Result<i128, KoraError> {
+pub fn safe_div(a: i128, b: i128) -> Result<i128, CommonError> {
     if b == 0 {
-        return Err(KoraError::InvalidAmount);
+        return Err(CommonError::InvalidAmount);
     }
-    a.checked_div(b).ok_or(KoraError::ArithmeticOverflow)
+    a.checked_div(b).ok_or(CommonError::ArithmeticOverflow)
 }
 
 // ── Decimal normalization ────────────────────────────────────────────────────
@@ -408,20 +408,20 @@ pub const STANDARD_DECIMALS: u32 = 7;
 /// // 8 decimals: scale down
 /// assert_eq!(normalize_amount(100_000_000, 8).unwrap(), 10_000_000);
 /// ```
-pub fn normalize_amount(amount: i128, token_decimals: u32) -> Result<i128, KoraError> {
+pub fn normalize_amount(amount: i128, token_decimals: u32) -> Result<i128, CommonError> {
     if token_decimals == STANDARD_DECIMALS {
         return Ok(amount);
     }
     if token_decimals < STANDARD_DECIMALS {
         let scale = 10i128
             .checked_pow(STANDARD_DECIMALS - token_decimals)
-            .ok_or(KoraError::ArithmeticOverflow)?;
-        amount.checked_mul(scale).ok_or(KoraError::ArithmeticOverflow)
+            .ok_or(CommonError::ArithmeticOverflow)?;
+        amount.checked_mul(scale).ok_or(CommonError::ArithmeticOverflow)
     } else {
         let scale = 10i128
             .checked_pow(token_decimals - STANDARD_DECIMALS)
-            .ok_or(KoraError::ArithmeticOverflow)?;
-        amount.checked_div(scale).ok_or(KoraError::ArithmeticOverflow)
+            .ok_or(CommonError::ArithmeticOverflow)?;
+        amount.checked_div(scale).ok_or(CommonError::ArithmeticOverflow)
     }
 }
 
@@ -435,20 +435,20 @@ pub fn normalize_amount(amount: i128, token_decimals: u32) -> Result<i128, KoraE
 /// let restored = denormalize_amount(normalized, 6).unwrap();
 /// assert_eq!(restored, original);
 /// ```
-pub fn denormalize_amount(amount: i128, token_decimals: u32) -> Result<i128, KoraError> {
+pub fn denormalize_amount(amount: i128, token_decimals: u32) -> Result<i128, CommonError> {
     if token_decimals == STANDARD_DECIMALS {
         return Ok(amount);
     }
     if token_decimals < STANDARD_DECIMALS {
         let scale = 10i128
             .checked_pow(STANDARD_DECIMALS - token_decimals)
-            .ok_or(KoraError::ArithmeticOverflow)?;
-        amount.checked_div(scale).ok_or(KoraError::ArithmeticOverflow)
+            .ok_or(CommonError::ArithmeticOverflow)?;
+        amount.checked_div(scale).ok_or(CommonError::ArithmeticOverflow)
     } else {
         let scale = 10i128
             .checked_pow(token_decimals - STANDARD_DECIMALS)
-            .ok_or(KoraError::ArithmeticOverflow)?;
-        amount.checked_mul(scale).ok_or(KoraError::ArithmeticOverflow)
+            .ok_or(CommonError::ArithmeticOverflow)?;
+        amount.checked_mul(scale).ok_or(CommonError::ArithmeticOverflow)
     }
 }
 
@@ -468,15 +468,15 @@ pub fn bps_of_normalized(
     amount: i128,
     bps: u32,
     token_decimals: u32,
-) -> Result<i128, KoraError> {
+) -> Result<i128, CommonError> {
     if amount < 0 {
-        return Err(KoraError::InvalidAmount);
+        return Err(CommonError::InvalidAmount);
     }
     let normalized = normalize_amount(amount, token_decimals)?;
     let result = normalized
         .checked_mul(bps as i128)
         .and_then(|v| v.checked_div(10_000))
-        .ok_or(KoraError::ArithmeticOverflow)?;
+        .ok_or(CommonError::ArithmeticOverflow)?;
     denormalize_amount(result, token_decimals)
 }
 
@@ -621,14 +621,14 @@ mod tests {
     fn test_require_valid_ipfs_cid_single_char_rejected() {
         let env = Env::default();
         let cid = SorobanString::from_str(&env, "x");
-        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), CommonError::InvalidCid);
     }
 
     #[test]
     fn test_require_valid_ipfs_cid_garbage_rejected() {
         let env = Env::default();
         let cid = SorobanString::from_str(&env, "not-a-valid-cid-string");
-        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), CommonError::InvalidCid);
     }
 
     #[test]
@@ -636,7 +636,7 @@ mod tests {
         let env = Env::default();
         // "Qm" prefix but only 10 chars (not 46)
         let cid = SorobanString::from_str(&env, "QmShortXxx");
-        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), CommonError::InvalidCid);
     }
 
     #[test]
@@ -644,7 +644,7 @@ mod tests {
         let env = Env::default();
         // 46 chars, Qm prefix, but contains '0' (excluded from base58)
         let cid = SorobanString::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnP000");
-        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), CommonError::InvalidCid);
     }
 
     #[test]
@@ -652,7 +652,7 @@ mod tests {
         let env = Env::default();
         // CIDv1 multibase prefix but too short (< 10 chars)
         let cid = SorobanString::from_str(&env, "bafy");
-        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), KoraError::InvalidCid);
+        assert_eq!(require_valid_ipfs_cid(&cid).unwrap_err(), CommonError::InvalidCid);
     }
 
     #[test]
@@ -665,7 +665,7 @@ mod tests {
         assert!(empty_result.is_err());
         assert_eq!(
             empty_result.unwrap_err(),
-            KoraError::EmptyBytes,
+            CommonError::EmptyBytes,
             "Empty bytes should return EmptyBytes error"
         );
 
@@ -700,9 +700,10 @@ mod tests {
     #[test]
     fn test_safe_sub() {
         assert_eq!(safe_sub(300, 100).unwrap(), 200);
+        assert_eq!(safe_sub(100, 200).unwrap(), -100);
         // Underflow returns ArithmeticUnderflow
-        let err = safe_sub(100, 200).unwrap_err();
-        assert_eq!(err, KoraError::ArithmeticUnderflow);
+        let err = safe_sub(i128::MIN, 1).unwrap_err();
+        assert_eq!(err, CommonError::ArithmeticUnderflow);
     }
 
     #[test]
@@ -736,7 +737,7 @@ mod tests {
     #[test]
     fn test_safe_sub_underflow() {
         let err = safe_sub(i128::MIN, 1).unwrap_err();
-        assert_eq!(err, KoraError::ArithmeticUnderflow);
+        assert_eq!(err, CommonError::ArithmeticUnderflow);
     }
 
     #[test]
