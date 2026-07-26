@@ -220,6 +220,7 @@ System events (where there is no single initiating actor — e.g. `late_penalty_
 | `PAUSED` | `protocol_paused` | `(admin, timestamp)` | `access_control` |
 | `UNPAUSED` | `protocol_unpaused` | `(admin, timestamp)` | `access_control` |
 | `TOK_WL` | `token_whitelisted` | `(admin, token, timestamp)` | `marketplace`, `treasury` |
+| `TOK_UNWL` | `token_whitelist_removed` | `(admin, token, timestamp)` | `marketplace` |
 | `ADM_TRF` | `admin_transferred` | `(current_admin, new_admin, timestamp)` | `access_control`, `risk_registry` |
 | `ROL_GRT` | `role_granted` | `(admin, target, timestamp)` | `access_control` |
 | `ROL_RVK` | `role_revoked` | `(admin, target, timestamp)` | `access_control` |
