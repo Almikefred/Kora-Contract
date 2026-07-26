@@ -2260,4 +2260,99 @@ mod tests {
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.try_top_up_stake(&admin, &verifier, &0i128).is_err());
     }
+
+    // ── verifier-of-record & reassignment tests ───────────────────────────────
+
+    #[test]
+    fn test_unrelated_verifier_cannot_update_sme_score_or_credit_limit() {
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier_a = Address::generate(&env);
+        let verifier_b = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
+
+        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_b, &1_000_000i128);
+
+        // Register SME under verifier_a
+        client.register_sme(&verifier_a, &sme, &35u32, &true);
+
+        // Verifier_b tries to update score - should fail
+        let res_score = client.try_update_sme_score(&verifier_b, &sme, &50u32);
+        assert_eq!(res_score.unwrap_err().unwrap(), RiskRegistryError::NotSmeVerifier);
+
+        // Verifier_b tries to set credit limit - should fail
+        let res_limit = client.try_set_credit_limit(&verifier_b, &sme, &5_000_000i128);
+        assert_eq!(res_limit.unwrap_err().unwrap(), RiskRegistryError::NotSmeVerifier);
+    }
+
+    #[test]
+    fn test_reassign_sme_verifier_success() {
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier_a = Address::generate(&env);
+        let verifier_b = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
+
+        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_b, &1_000_000i128);
+
+        client.register_sme(&verifier_a, &sme, &35u32, &true);
+
+        // Reassign to verifier_b
+        assert!(client.try_reassign_sme_verifier(&admin, &sme, &verifier_b).is_ok());
+
+        // Now verifier_b updates score and credit limit successfully
+        assert!(client.try_update_sme_score(&verifier_b, &sme, &50u32).is_ok());
+        assert!(client.try_set_credit_limit(&verifier_b, &sme, &5_000_000i128).is_ok());
+
+        let profile = client.get_sme_profile(&sme);
+        assert_eq!(profile.risk_score, 50);
+        assert_eq!(profile.credit_limit, 5_000_000i128);
+        assert_eq!(profile.verifier, verifier_b);
+
+        // verifier_a is now unrelated and should be blocked
+        let res_a_score = client.try_update_sme_score(&verifier_a, &sme, &60u32);
+        assert_eq!(res_a_score.unwrap_err().unwrap(), RiskRegistryError::NotSmeVerifier);
+    }
+
+    #[test]
+    fn test_reassign_sme_verifier_not_admin() {
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier_a = Address::generate(&env);
+        let verifier_b = Address::generate(&env);
+        let sme = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
+
+        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_b, &1_000_000i128);
+
+        client.register_sme(&verifier_a, &sme, &35u32, &true);
+
+        let res = client.try_reassign_sme_verifier(&stranger, &sme, &verifier_b);
+        assert_eq!(res.unwrap_err().unwrap(), RiskRegistryError::NotAdmin);
+    }
+
+    #[test]
+    fn test_reassign_sme_verifier_invalid_verifier() {
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier_a = Address::generate(&env);
+        let unregistered_verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
+
+        client.register_sme(&verifier_a, &sme, &35u32, &true);
+
+        let res = client.try_reassign_sme_verifier(&admin, &sme, &unregistered_verifier);
+        assert_eq!(res.unwrap_err().unwrap(), RiskRegistryError::NotVerifier);
+    }
 }
