@@ -124,6 +124,8 @@ pub fn mint_invoice(
 **Errors:**
 - `KoraError::ArithmeticOverflow` if amount > i128::MAX / 2 or ID counter overflows
 - `KoraError::ProtocolPaused` if the protocol is paused
+- `KoraError::SMENotVerified` if a risk_registry is configured and `sme` is not verified — see [Minting Rules](#minting-rules)
+- `KoraError::ComplianceNotAttested` if a risk_registry is configured and `sme` lacks a compliance attestation — see [Minting Rules](#minting-rules)
 - `KoraError::InvalidInput` if:
   - `amount <= 0`
   - `due_date <= current_time` (must be in the future)
@@ -425,9 +427,55 @@ pub fn invoice_count(env: Env) -> u64
    - Due date must be in the future (> current block timestamp)
    - Risk score must be 0–100 (typically assigned by a verifier)
    - Debtor hash must be non-empty (32-byte SHA-256 hash)
-   - IPFS CID must be non-empty (pointer to encrypted invoice metadata)
+   - IPFS CID must be non-empty, ≤128 bytes, and **structurally valid** — either a CIDv0
+     (`Qm` prefix, exactly 46 base58btc characters) or a CIDv1 (multibase-prefixed with
+     `b`/`B`/`z`/`f`/`F`/`u`/`U`/`k`/`K`, ≥10 characters). A garbage string such as
+     `"not-a-cid"` is rejected with `KoraError::InvalidCid` — this is enforced structurally
+     on-chain (see `kora_shared::validation::require_valid_ipfs_cid`), not merely a length
+     check, at `mint_invoice`, `mint_invoices_batch` (per item), and `amend_invoice`. This
+     is **not retroactive**: invoices minted before this validation was wired in and whose
+     CID happens not to conform are left as-is; the check only gates new mints and amends
+     going forward.
+   - If a `risk_registry` is wired up (`set_risk_registry`) and the SME has a non-zero
+     `credit_limit` on their `SmeProfile`, the mint (or batch, or amend) is rejected with
+     `KoraError::CreditLimitExceeded` whenever it would push the SME's aggregate
+     `OutstandingExposure` — the sum of `amount` across all of that SME's non-terminal
+     (not `Repaid`/`Defaulted`) invoices — over `credit_limit`. `OutstandingExposure` itself
+     is tracked for every SME regardless of whether a registry is wired up (it is
+     incremented on mint and decremented on withdraw/repay/default), and adjusted by the
+     delta when `amend_invoice` changes `amount`. `mint_invoices_batch` checks the whole
+     batch's cumulative amount against a single running total before writing anything, so a
+     batch that individually fits per item but collectively exceeds `credit_limit` is
+     rejected in its entirety (atomic-abort).
 
-3. **NFT Immutability**
+3. **Verification and compliance gating.** When `set_risk_registry()` has been
+   called (admin-only, post-deployment), `mint_invoice()` and
+   `mint_invoices_batch()` additionally require, *before any storage write*:
+   - `sme` is `verified` in the risk_registry's `SmeProfile` — otherwise
+     `KoraError::SMENotVerified`. In practice this means `sme` must have been
+     registered via `risk_registry.register_sme()` by a verifier; there is
+     currently no code path that registers an SME as unverified.
+   - `sme.compliance_attested == true` — otherwise `KoraError::ComplianceNotAttested`.
+
+   **This is enforced at two lifecycle stages, intentionally (defense in depth):**
+   - **Mint time** (`invoice_nft.mint_invoice` / `mint_invoices_batch`) — closes the
+     window where a non-compliant or unverified SME could otherwise mint an
+     on-chain invoice (with real metadata, notes, and `invoice_created` events)
+     that only gets rejected much later, at listing.
+   - **Listing time** (`marketplace.list_invoice`, via `require_compliance_attested`)
+     — kept as an independent, second gate. It protects against `invoice_nft` and
+     `marketplace` being wired to *different* `risk_registry` deployments, and
+     against invoices minted before `invoice_nft.set_risk_registry()` was ever
+     called (mint-time gating is a no-op with no registry configured). Note
+     marketplace only re-checks `compliance_attested`, not `verified` — `verified`
+     is invoice_nft-only, mint-time-only enforcement.
+
+   If no risk_registry has been configured on `invoice_nft`, the verified/compliance
+   checks are skipped entirely — an explicit backward-compatibility no-op, not a
+   silent bypass. Production deployments **must** call `set_risk_registry` for
+   these checks to be enforced.
+
+4. **NFT Immutability**
    - Once minted, the following fields **never change:**
      - `id`, `sme`, `debtor_hash`, `amount`, `currency`, `due_date`, `ipfs_cid`, `risk_score`, `risk_tier`, `created_at`
    - Only the following fields can change:

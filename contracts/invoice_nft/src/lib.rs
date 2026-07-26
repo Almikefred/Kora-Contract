@@ -13,7 +13,7 @@
 //! See [Invoice NFT Model](../../../docs/invoice-nft.md) for detailed architecture.
 
 use kora_shared::{
-    errors::KoraError,
+    errors::CommonError,
     events,
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, RiskTier},
@@ -22,9 +22,65 @@ use kora_shared::{
         require_max_length_string, require_non_empty_bytes, require_non_empty_string,
         require_non_zero_amount, require_valid_risk_score, MAX_DEBTOR_HASH_LEN, MAX_IPFS_CID_LEN,
         UPGRADE_TIMELOCK_DELAY,
+        require_future_timestamp, require_max_length_bytes, require_max_length_string,
+        require_non_empty_bytes, require_non_empty_string, require_non_zero_amount,
+        require_valid_ipfs_cid, require_valid_risk_score, safe_sub, MAX_DEBTOR_HASH_LEN,
+        MAX_IPFS_CID_LEN, UPGRADE_TIMELOCK_DELAY,
     },
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+
+/// Local error enum for the invoice_nft contract.
+///
+/// `kora_shared::errors::KoraError` was split apart because Soroban's
+/// `#[contracterror]` macro caps an error enum at 50 variants — each contract
+/// now owns its own local error type, with `From<CommonError>` bridging the
+/// small set of shared validation/reentrancy errors.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum InvoiceNftError {
+    AlreadyInitialized = 1,
+    ArithmeticOverflow = 2,
+    CreditLimitExceeded = 3,
+    CurrencyNotAllowed = 4,
+    EmptyBytes = 5,
+    EmptyString = 6,
+    FieldTooLong = 7,
+    InvalidAddress = 8,
+    InvalidAmount = 9,
+    InvalidDueDate = 10,
+    InvalidInvoiceStatus = 11,
+    InvalidRiskScore = 12,
+    InvoiceNotFound = 13,
+    NoUpgradeProposed = 14,
+    NotAdmin = 15,
+    NotInitialized = 16,
+    NotInvoiceOwner = 17,
+    ProtocolPaused = 18,
+    Reentrancy = 19,
+    Unauthorized = 20,
+    UpgradeTimelockNotElapsed = 21,
+}
+
+impl From<CommonError> for InvoiceNftError {
+    fn from(e: CommonError) -> Self {
+        match e {
+            CommonError::InvalidAmount => InvoiceNftError::InvalidAmount,
+            CommonError::InvalidDueDate => InvoiceNftError::InvalidDueDate,
+            CommonError::InvalidRiskScore => InvoiceNftError::InvalidRiskScore,
+            CommonError::InvalidAddress => InvoiceNftError::InvalidAddress,
+            CommonError::EmptyString => InvoiceNftError::EmptyString,
+            CommonError::EmptyBytes => InvoiceNftError::EmptyBytes,
+            CommonError::FieldTooLong => InvoiceNftError::FieldTooLong,
+            CommonError::ArithmeticOverflow => InvoiceNftError::ArithmeticOverflow,
+            CommonError::Reentrancy => InvoiceNftError::Reentrancy,
+            // InvalidCid / ArithmeticUnderflow / InvalidFeeRate aren't raised by any call
+            // this crate makes into kora_shared::validation.
+            _ => InvoiceNftError::InvalidAmount,
+        }
+    }
+}
 
 // ── TTL constants (~30 days at ~5s/ledger) ───────────────────────────────────
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -33,7 +89,7 @@ const PERSISTENT_TTL_BUMP: u32 = 518_400;
 // ── Storage Keys ────────────────────────────────────────────────────────────
 //
 // Storage versioning: The contract uses a MigrationVersion key to track schema changes.
-// Current version: 1
+// Current version: 2 (Invoice includes `metadata_hash` and `notes`)
 //
 // Variants:
 // - Invoice(u64): Stores individual Invoice structs by ID (persistent)
@@ -142,13 +198,13 @@ impl InvoiceNftContract {
     /// - `access_control` — The deployed `access_control` contract address used for pause checks.
     ///
     /// **Errors:**
-    /// - `KoraError::AlreadyInitialized` — Contract has already been initialized.
-    /// - `KoraError::InvalidAddress` — `admin` or `access_control` is the contract's own address.
+    /// - `InvoiceNftError::AlreadyInitialized` — Contract has already been initialized.
+    /// - `InvoiceNftError::InvalidAddress` — `admin` or `access_control` is the contract's own address.
     ///
     /// **Security:** No auth required on first call. Subsequent calls revert immediately.
-    pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), KoraError> {
+    pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), InvoiceNftError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(InvoiceNftError::AlreadyInitialized);
         }
         kora_shared::validation::require_not_self(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &access_control)?;
@@ -158,10 +214,18 @@ impl InvoiceNftContract {
             .instance()
             .set(&DataKey::AccessControl, &access_control);
         env.storage().instance().set(&DataKey::NextId, &1u64);
-        // Initialize migration version to 1 (current schema version)
+        // A freshly initialized contract already stores every field of the
+        // current Invoice schema (v2 — includes `metadata_hash` and `notes`).
+        // Start at the current version so migrate()'s v1 -> v2 backfill pass
+        // (which decodes records as the legacy InvoiceV1 shape) is never run
+        // against records that were never written in the old format.
+        // A fresh deployment mints Invoice records with the current struct shape
+        // (schema v2, which already includes `notes`) from the very first mint —
+        // there is no legacy v1 data to backfill, so the baseline starts at the
+        // current version rather than v1.
         env.storage()
             .instance()
-            .set(&DataKey::MigrationVersion, &1u32);
+            .set(&DataKey::MigrationVersion, &2u32);
         Ok(())
     }
 
@@ -173,12 +237,12 @@ impl InvoiceNftContract {
     /// - `risk_registry` — The deployed `risk_registry` contract address.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::InvalidAddress` — `risk_registry` is the contract's own address.
+    /// - `InvoiceNftError::NotAdmin` — Caller is not the admin.
+    /// - `InvoiceNftError::InvalidAddress` — `risk_registry` is the contract's own address.
     ///
     /// **Security:** Requires `admin.require_auth()`. Idempotent — safe to call again if
     /// the risk registry is redeployed.
-    pub fn set_risk_registry(env: Env, admin: Address, risk_registry: Address) -> Result<(), KoraError> {
+    pub fn set_risk_registry(env: Env, admin: Address, risk_registry: Address) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &risk_registry)?;
@@ -195,7 +259,7 @@ impl InvoiceNftContract {
     ///
     /// See docs/MIGRATIONS.md for the full runbook and a description of each
     /// version's changes.
-    pub fn migrate(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn migrate(env: Env, admin: Address) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
@@ -246,6 +310,7 @@ impl InvoiceNftContract {
                         currency: old.currency,
                         due_date: old.due_date,
                         ipfs_cid: old.ipfs_cid,
+                        metadata_hash: Bytes::new(&env),
                         risk_score: old.risk_score,
                         risk_tier: old.risk_tier,
                         status: old.status,
@@ -274,7 +339,7 @@ impl InvoiceNftContract {
         admin: Address,
         marketplace: Address,
         financing_pool: Address,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Marketplace, &marketplace);
@@ -297,19 +362,34 @@ impl InvoiceNftContract {
     /// **Returns:** The allocated invoice ID (monotonically increasing from 1).
     ///
     /// **Errors:**
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvalidAmount` — `amount` is zero, negative, or exceeds `credit_limit`.
+    /// - `InvoiceNftError::InvalidDueDate` — `due_date` is not in the future.
+    /// - `InvoiceNftError::InvalidRiskScore` — `risk_score` > 100.
+    /// - `InvoiceNftError::EmptyBytes` — `debtor_hash` is empty.
+    /// - `InvoiceNftError::EmptyString` — `ipfs_cid` is empty.
+    /// - `InvoiceNftError::FieldTooLong` — `debtor_hash` or `ipfs_cid` exceed their max lengths.
+    /// - `InvoiceNftError::CreditLimitExceeded` — Adding this invoice would exceed the SME's credit limit.
+    /// - `InvoiceNftError::Reentrancy` — Reentrancy guard triggered.
     /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::SMENotVerified` — `sme` is not `verified` in the risk_registry (only when one is wired up).
+    /// - `KoraError::ComplianceNotAttested` — `sme` lacks a compliance attestation (only when a risk_registry is wired up).
     /// - `KoraError::InvalidAmount` — `amount` is zero, negative, or exceeds `credit_limit`.
     /// - `KoraError::InvalidDueDate` — `due_date` is not in the future.
     /// - `KoraError::InvalidRiskScore` — `risk_score` > 100.
     /// - `KoraError::EmptyBytes` — `debtor_hash` is empty.
     /// - `KoraError::EmptyString` — `ipfs_cid` is empty.
     /// - `KoraError::FieldTooLong` — `debtor_hash` or `ipfs_cid` exceed their max lengths.
+    /// - `KoraError::InvalidCid` — `ipfs_cid` is not a structurally valid CIDv0/CIDv1.
     /// - `KoraError::CreditLimitExceeded` — Adding this invoice would exceed the SME's credit limit.
     /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
     ///
     /// **Security:** Requires `sme.require_auth()`. The protocol must not be paused.
-    /// If a `risk_registry` is wired up, the SME's outstanding exposure is checked against
-    /// their pre-approved credit limit before minting.
+    /// `OutstandingExposure` for the SME is incremented by `amount` on every successful
+    /// mint (and decremented on withdraw/repay/default), regardless of whether a
+    /// `risk_registry` is wired up. If a `risk_registry` *is* wired up and the SME has a
+    /// non-zero `credit_limit`, the mint is rejected before any state is written whenever
+    /// it would push aggregate exposure over that limit.
     pub fn mint_invoice(
         env: Env,
         sme: Address,
@@ -320,9 +400,11 @@ impl InvoiceNftContract {
         ipfs_cid: String,
         risk_score: u32,
         notes: Option<String>,
-    ) -> Result<u64, KoraError> {
+    ) -> Result<u64, InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_verified_sme(&env, &sme)?;
+        Self::require_compliance_attested(&env, &sme)?;
         let _guard = ReentrancyGuard::new(&env)?;
 
         require_non_zero_amount(amount)?;
@@ -332,15 +414,19 @@ impl InvoiceNftContract {
         require_max_length_bytes(&debtor_hash, MAX_DEBTOR_HASH_LEN)?;
         require_non_empty_string(&ipfs_cid)?;
         require_max_length_string(&ipfs_cid, MAX_IPFS_CID_LEN)?;
+        require_valid_ipfs_cid(&ipfs_cid)?;
+
+        // Risk registry integration is optional — a contract deployed before
+        // set_risk_registry() is called must still be able to mint.
+        let rr_addr = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::Address>(&DataKey::RiskRegistry);
 
         // Credit-limit enforcement: if a risk_registry is wired up, check the
         // SME's pre-approved credit limit against their current outstanding exposure.
-        if let Some(rr_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, soroban_sdk::Address>(&DataKey::RiskRegistry)
-        {
-            let rr = kora_risk_registry::RiskRegistryContractClient::new(&env, &rr_addr);
+        if let Some(rr_addr) = &rr_addr {
+            let rr = kora_risk_registry::RiskRegistryContractClient::new(&env, rr_addr);
             if let Ok(profile) = rr.try_get_sme_profile(&sme) {
                 if let Ok(profile) = profile {
                     if profile.credit_limit > 0 {
@@ -351,14 +437,26 @@ impl InvoiceNftContract {
                             .unwrap_or(0i128);
                         let new_exposure = outstanding
                             .checked_add(amount)
-                            .ok_or(KoraError::ArithmeticOverflow)?;
+                            .ok_or(InvoiceNftError::ArithmeticOverflow)?;
                         if new_exposure > profile.credit_limit {
-                            return Err(KoraError::CreditLimitExceeded);
+                            return Err(InvoiceNftError::CreditLimitExceeded);
                         }
                     }
                 }
             }
         }
+        // Outstanding exposure is tracked for every SME regardless of whether a
+        // risk_registry is wired up (withdraw/repaid/defaulted always decrement it);
+        // the credit_limit *check* below only applies once a registry is wired.
+        let outstanding: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutstandingExposure(sme.clone()))
+            .unwrap_or(0i128);
+        let new_exposure = outstanding
+            .checked_add(amount)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        Self::check_credit_limit(&env, &sme, new_exposure)?;
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
 
@@ -386,8 +484,47 @@ impl InvoiceNftContract {
         Self::bump_invoice_ttl(&env, id);
         env.storage().instance().set(
             &DataKey::NextId,
-            &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
+            &(id.checked_add(1).ok_or(InvoiceNftError::ArithmeticOverflow)?),
         );
+
+        // Track outstanding exposure so credit-limit checks and get_outstanding_exposure
+        // stay accurate; released again on withdraw/repaid/defaulted.
+        let outstanding: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutstandingExposure(sme.clone()))
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &DataKey::OutstandingExposure(sme.clone()),
+            &outstanding
+                .checked_add(amount)
+                .ok_or(InvoiceNftError::ArithmeticOverflow)?,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutstandingExposure(sme.clone()), &new_exposure);
+
+        // Track outstanding exposure so the credit-limit check above (and any
+        // other invoice minted for this SME) sees an up-to-date total.
+        let outstanding: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutstandingExposure(sme.clone()))
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &DataKey::OutstandingExposure(sme.clone()),
+            &outstanding
+                .checked_add(amount)
+                .ok_or(KoraError::ArithmeticOverflow)?,
+        );
+
+        // Report the new invoice to risk_registry so SmeProfile.total_invoices stays
+        // accurate. Best-effort: an unwired registry or an unregistered SME must not
+        // block a mint that already succeeded.
+        if let Some(rr_addr) = &rr_addr {
+            let rr = kora_risk_registry::RiskRegistryContractClient::new(&env, rr_addr);
+            let _ = rr.try_increment_invoice_count(&env.current_contract_address(), &sme);
+        }
 
         events::invoice_created(&env, id, &sme, invoice.amount);
         Ok(id)
@@ -396,23 +533,45 @@ impl InvoiceNftContract {
     /// Mint multiple invoice NFTs atomically for a single SME.
     ///
     /// All inputs are validated before any invoice is stored — if any entry
-    /// fails validation the entire batch is aborted (atomic-abort semantics).
-    /// A single `require_auth` covers the whole batch.
+    /// fails validation, or the batch's cumulative amount would push the SME's
+    /// aggregate `OutstandingExposure` over their `risk_registry` `credit_limit`,
+    /// the entire batch is aborted with no partial state written (atomic-abort
+    /// semantics). A single `require_auth` covers the whole batch.
+    ///
+    /// **Errors:**
+    /// - `KoraError::CreditLimitExceeded` — the batch's cumulative amount, added to
+    ///   the SME's pre-batch outstanding exposure, would exceed `credit_limit`, even
+    ///   if no single entry exceeds it alone.
     ///
     /// Returns a `Vec<u64>` of the newly allocated invoice IDs in order.
+    ///
+    /// **Errors (in addition to per-entry field validation):**
+    /// - `KoraError::ProtocolPaused` — Protocol is paused.
+    /// - `KoraError::SMENotVerified` — `sme` is not `verified` in the risk_registry (only when one is wired up).
+    /// - `KoraError::ComplianceNotAttested` — `sme` lacks a compliance attestation (only when a risk_registry is wired up).
     pub fn mint_invoices_batch(
         env: Env,
         sme: Address,
         invoices: Vec<BatchInvoiceInput>,
-    ) -> Result<Vec<u64>, KoraError> {
+    ) -> Result<Vec<u64>, InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_verified_sme(&env, &sme)?;
+        Self::require_compliance_attested(&env, &sme)?;
         let _guard = ReentrancyGuard::new(&env)?;
 
         // ── Check batch size before any validation/minting ────────────────────
         require_batch_size_within_limit(invoices.len() as u32)?;
 
         // ── Phase 1: validate ALL inputs before touching storage ──────────────
+        // Track a running cumulative exposure so items that each individually fit
+        // under credit_limit can't jointly exceed it against the same stale baseline.
+        let outstanding: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutstandingExposure(sme.clone()))
+            .unwrap_or(0i128);
+        let mut running_exposure = outstanding;
         for i in 0..invoices.len() {
             let entry = invoices.get(i).unwrap();
             require_non_zero_amount(entry.amount)?;
@@ -422,11 +581,27 @@ impl InvoiceNftContract {
             require_max_length_bytes(&entry.debtor_hash, MAX_DEBTOR_HASH_LEN)?;
             require_non_empty_string(&entry.ipfs_cid)?;
             require_max_length_string(&entry.ipfs_cid, MAX_IPFS_CID_LEN)?;
+            require_valid_ipfs_cid(&entry.ipfs_cid)?;
+
+            running_exposure = running_exposure
+                .checked_add(entry.amount)
+                .ok_or(KoraError::ArithmeticOverflow)?;
         }
+        Self::check_credit_limit(&env, &sme, running_exposure)?;
 
         // ── Phase 2: mint each invoice ────────────────────────────────────────
         let mut ids: Vec<u64> = Vec::new(&env);
         let mut next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
+
+        // Risk registry integration is optional — a contract deployed before
+        // set_risk_registry() is called must still be able to mint.
+        let rr_addr = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::Address>(&DataKey::RiskRegistry);
+        let rr_client = rr_addr
+            .as_ref()
+            .map(|addr| kora_risk_registry::RiskRegistryContractClient::new(&env, addr));
 
         for i in 0..invoices.len() {
             let entry = invoices.get(i).unwrap();
@@ -452,13 +627,39 @@ impl InvoiceNftContract {
 
             env.storage().persistent().set(&DataKey::Invoice(id), &invoice);
             Self::bump_invoice_ttl(&env, id);
+
+            let outstanding: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OutstandingExposure(sme.clone()))
+                .unwrap_or(0i128);
+            env.storage().persistent().set(
+                &DataKey::OutstandingExposure(sme.clone()),
+                &outstanding
+                    .checked_add(invoice.amount)
+                    .ok_or(InvoiceNftError::ArithmeticOverflow)?,
+            );
+
+                    .ok_or(KoraError::ArithmeticOverflow)?,
+            );
+
+            // Report each minted invoice to risk_registry individually so
+            // SmeProfile.total_invoices reflects the exact count, not one per batch.
+            // Best-effort: failure must not revert an otherwise-successful mint.
+            if let Some(rr) = &rr_client {
+                let _ = rr.try_increment_invoice_count(&env.current_contract_address(), &sme);
+            }
+
             events::invoice_created(&env, id, &sme, invoice.amount);
             ids.push_back(id);
 
-            next_id = next_id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?;
+            next_id = next_id.checked_add(1).ok_or(InvoiceNftError::ArithmeticOverflow)?;
         }
 
         env.storage().instance().set(&DataKey::NextId, &next_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutstandingExposure(sme.clone()), &running_exposure);
         Ok(ids)
     }
 
@@ -478,14 +679,24 @@ impl InvoiceNftContract {
     /// - `risk_score` — Updated risk score (0–100); also recalculates `risk_tier`.
     ///
     /// **Errors:**
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvoiceNotFound` — Invoice does not exist.
+    /// - `InvoiceNftError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
+    /// - `InvoiceNftError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    /// - `InvoiceNftError::InvalidAmount` / `InvoiceNftError::InvalidDueDate` / `InvoiceNftError::InvalidRiskScore` — Validation failures.
     /// - `KoraError::ProtocolPaused` — Protocol is paused.
     /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
     /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
     /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
     /// - `KoraError::InvalidAmount` / `KoraError::InvalidDueDate` / `KoraError::InvalidRiskScore` — Validation failures.
+    /// - `KoraError::InvalidCid` — `ipfs_cid` is not a structurally valid CIDv0/CIDv1.
+    /// - `KoraError::CreditLimitExceeded` — Increasing `amount` would push the SME's
+    ///   aggregate `OutstandingExposure` over their `credit_limit`.
     ///
     /// **Security:** Requires `sme.require_auth()`. Rejected once the invoice is listed
-    /// or further along in the lifecycle.
+    /// or further along in the lifecycle. `OutstandingExposure` is adjusted by the delta
+    /// between the old and new `amount` (old removed, new added) and re-checked against
+    /// `credit_limit` the same way `mint_invoice` is.
     pub fn amend_invoice(
         env: Env,
         sme: Address,
@@ -495,7 +706,7 @@ impl InvoiceNftContract {
         due_date: u64,
         ipfs_cid: String,
         risk_score: u32,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -504,14 +715,26 @@ impl InvoiceNftContract {
         require_valid_risk_score(risk_score)?;
         require_non_empty_bytes(&debtor_hash)?;
         require_non_empty_string(&ipfs_cid)?;
+        require_valid_ipfs_cid(&ipfs_cid)?;
 
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         if invoice.sme != sme {
-            return Err(KoraError::NotInvoiceOwner);
+            return Err(InvoiceNftError::NotInvoiceOwner);
         }
+
+        let outstanding: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutstandingExposure(sme.clone()))
+            .unwrap_or(0i128);
+        let outstanding_without_old = safe_sub(outstanding, invoice.amount)?;
+        let new_exposure = outstanding_without_old
+            .checked_add(amount)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        Self::check_credit_limit(&env, &sme, new_exposure)?;
 
         invoice.debtor_hash = debtor_hash;
         invoice.amount = amount;
@@ -524,6 +747,9 @@ impl InvoiceNftContract {
             .persistent()
             .set(&DataKey::Invoice(invoice_id), &invoice);
         Self::bump_invoice_ttl(&env, invoice_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutstandingExposure(sme.clone()), &new_exposure);
         events::invoice_amended(&env, invoice_id, &sme);
         Ok(())
     }
@@ -538,10 +764,10 @@ impl InvoiceNftContract {
     /// - `invoice_id` — The ID of the invoice to void.
     ///
     /// **Errors:**
-    /// - `KoraError::ProtocolPaused` — Protocol is paused.
-    /// - `KoraError::InvoiceNotFound` — Invoice does not exist.
-    /// - `KoraError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
-    /// - `KoraError::NotInvoiceOwner` — Caller is not the invoice's SME.
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvoiceNotFound` — Invoice does not exist.
+    /// - `InvoiceNftError::InvalidInvoiceStatus` — Invoice is not in `Created` status.
+    /// - `InvoiceNftError::NotInvoiceOwner` — Caller is not the invoice's SME.
     ///
     /// **Security:** Requires `sme.require_auth()`. Irreversible — the invoice is deleted
     /// from on-chain storage and cannot be recovered. Outstanding exposure is decremented.
@@ -549,16 +775,16 @@ impl InvoiceNftContract {
         env: Env,
         sme: Address,
         invoice_id: u64,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
 
         let invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         if invoice.sme != sme {
-            return Err(KoraError::NotInvoiceOwner);
+            return Err(InvoiceNftError::NotInvoiceOwner);
         }
 
         env.storage().persistent().remove(&DataKey::Invoice(invoice_id));
@@ -580,17 +806,17 @@ impl InvoiceNftContract {
     /// - `caller` — The marketplace contract address.
     /// - `invoice_id` — The ID of the invoice to list.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Created` status.
-    pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_authorized_caller(&env, &caller, &[DataKey::Marketplace])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Listed;
         env.storage()
@@ -601,23 +827,59 @@ impl InvoiceNftContract {
         Ok(())
     }
 
+    /// Revert a Listed invoice back to Created status. Called by the Marketplace
+    /// contract when a listing is cancelled before any funding has been released.
+    ///
+    /// This allows the SME to re-list the same invoice after cancellation.
+    ///
+    /// **Parameters:**
+    /// - `caller` — The marketplace contract address (must be the authorised marketplace).
+    /// - `invoice_id` — The ID of the invoice to revert.
+    ///
+    /// **Errors:**
+    /// - `InvoiceNftError::Unauthorized` — Caller is not the authorised marketplace.
+    /// - `InvoiceNftError::ProtocolPaused` — Protocol is paused.
+    /// - `InvoiceNftError::InvalidInvoiceStatus` — Invoice is not in `Listed` status
+    ///   (already `Funded`, `Repaid`, or `Defaulted`).
+    /// - `InvoiceNftError::InvoiceNotFound` — Invoice does not exist.
+    ///
+    /// **Security:** Requires auth from the caller. Only the authorised marketplace
+    /// address may call this function — unauthorised callers cannot revert status.
+    pub fn set_created(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
+        caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::Marketplace])?;
+        Self::require_not_paused(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
+        let mut invoice = Self::load_invoice(&env, invoice_id)?;
+        if invoice.status != InvoiceStatus::Listed {
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
+        }
+        invoice.status = InvoiceStatus::Created;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id), &invoice);
+        Self::bump_invoice_ttl(&env, invoice_id);
+        events::invoice_created(&env, invoice_id, &invoice.sme, invoice.amount);
+        Ok(())
+    }
+
     /// Transition invoice to Funded. Called by Financing Pool contract.
     ///
     /// **Parameters:**
     /// - `caller` — The investor or financing pool contract address.
     /// - `invoice_id` — The ID of the invoice to fund.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Listed` status.
-    pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Listed {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Funded;
         invoice.funded_at = Some(env.ledger().timestamp());
@@ -635,16 +897,16 @@ impl InvoiceNftContract {
     /// - `caller` — The financing pool contract address.
     /// - `invoice_id` — The ID of the invoice to repay.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Funded` status.
-    pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Repaid;
         invoice.repaid_at = Some(env.ledger().timestamp());
@@ -669,20 +931,20 @@ impl InvoiceNftContract {
     /// - `caller` — The admin address.
     /// - `invoice_id` — The ID of the invoice to mark as defaulted.
     ///
-    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    /// **Returns:** `Ok(())` on success, or an appropriate `InvoiceNftError`.
     ///
     /// **Security:** Requires admin auth. Validates that the invoice is `Funded` and the due date has passed.
-    pub fn set_defaulted(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn set_defaulted(env: Env, caller: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         let current_time = env.ledger().timestamp();
         if current_time <= invoice.due_date {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         invoice.status = InvoiceStatus::Defaulted;
         env.storage()
@@ -708,10 +970,10 @@ impl InvoiceNftContract {
     /// **Parameters:**
     /// - `invoice_id` — The ID of the invoice to retrieve.
     ///
-    /// **Returns:** The complete `Invoice` struct, or `KoraError::InvoiceNotFound` if not found.
+    /// **Returns:** The complete `Invoice` struct, or `InvoiceNftError::InvoiceNotFound` if not found.
     ///
     /// **Security:** This is a read-only view with no authorization check.
-    pub fn get_invoice(env: Env, invoice_id: u64) -> Result<Invoice, KoraError> {
+    pub fn get_invoice(env: Env, invoice_id: u64) -> Result<Invoice, InvoiceNftError> {
         Self::load_invoice(&env, invoice_id)
     }
 
@@ -734,7 +996,7 @@ impl InvoiceNftContract {
         sme: Address,
         invoice_id: u64,
         metadata_hash: Bytes,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
@@ -743,13 +1005,13 @@ impl InvoiceNftContract {
 
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.sme != sme {
-            return Err(KoraError::Unauthorized);
+            return Err(InvoiceNftError::Unauthorized);
         }
         if invoice.status != InvoiceStatus::Created {
-            return Err(KoraError::InvalidInvoiceStatus);
+            return Err(InvoiceNftError::InvalidInvoiceStatus);
         }
         if invoice.metadata_hash.len() != 0 {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(InvoiceNftError::AlreadyInitialized);
         }
 
         invoice.metadata_hash = metadata_hash;
@@ -807,7 +1069,7 @@ impl InvoiceNftContract {
     // is_invoice_frozen before executing any state-changing logic.
 
     /// Freeze a specific invoice, blocking fund_invoice and repay for it.
-    pub fn freeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn freeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         // Verify the invoice exists before freezing.
@@ -820,7 +1082,7 @@ impl InvoiceNftContract {
     }
 
     /// Unfreeze a previously frozen invoice, restoring normal fund/repay access.
-    pub fn unfreeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+    pub fn unfreeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         // Verify the invoice exists before unfreezing.
@@ -848,7 +1110,7 @@ impl InvoiceNftContract {
     /// - `new_wasm_hash` — SHA-256 hash of the new WASM binary (32 bytes).
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `InvoiceNftError::NotAdmin` — Caller is not the admin.
     ///
     /// **Security:** Requires `admin.require_auth()`. The upgrade cannot be applied until
     /// `UPGRADE_TIMELOCK_DELAY` (24 h) has elapsed via `execute_upgrade`.
@@ -856,7 +1118,7 @@ impl InvoiceNftContract {
         env: Env,
         admin: Address,
         new_wasm_hash: BytesN<32>,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -872,23 +1134,23 @@ impl InvoiceNftContract {
     /// - `admin` — Must be the current admin address.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::NoUpgradeProposed` — No upgrade proposal is pending.
-    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    /// - `InvoiceNftError::NotAdmin` — Caller is not the admin.
+    /// - `InvoiceNftError::NoUpgradeProposed` — No upgrade proposal is pending.
+    /// - `InvoiceNftError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
     ///
     /// **Security:** Requires `admin.require_auth()`. Clears the proposal before executing
     /// to prevent re-entry. Note: `migrate()` must be called by admin immediately after
     /// any upgrade that changes a `#[contracttype]` struct schema.
-    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
             .storage()
             .instance()
             .get(&DataKey::UpgradeProposal)
-            .ok_or(KoraError::NoUpgradeProposed)?;
+            .ok_or(InvoiceNftError::NoUpgradeProposed)?;
         if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
-            return Err(KoraError::UpgradeTimelockNotElapsed);
+            return Err(InvoiceNftError::UpgradeTimelockNotElapsed);
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         events::upgrade_executed(&env, &admin, &wasm_hash);
@@ -899,7 +1161,7 @@ impl InvoiceNftContract {
     // ── Currency Allowlist ────────────────────────────────────────────────────
 
     /// Add a currency symbol to the allowlist. Admin only.
-    pub fn add_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), KoraError> {
+    pub fn add_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -914,7 +1176,7 @@ impl InvoiceNftContract {
     }
 
     /// Remove a currency symbol from the allowlist. Admin only.
-    pub fn remove_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), KoraError> {
+    pub fn remove_allowed_currency(env: Env, admin: Address, currency: Symbol) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -933,7 +1195,7 @@ impl InvoiceNftContract {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), KoraError> {
+    fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), InvoiceNftError> {
         for key in allowed {
             if let Some(addr) = env.storage().instance().get::<DataKey, Address>(key) {
                 if &addr == caller {
@@ -941,49 +1203,104 @@ impl InvoiceNftContract {
                 }
             }
         }
-        Err(KoraError::Unauthorized)
+        Err(InvoiceNftError::Unauthorized)
     }
 
-    fn load_invoice(env: &Env, id: u64) -> Result<Invoice, KoraError> {
+    fn load_invoice(env: &Env, id: u64) -> Result<Invoice, InvoiceNftError> {
         env.storage()
             .persistent()
             .get(&DataKey::Invoice(id))
-            .ok_or(KoraError::InvoiceNotFound)
+            .ok_or(InvoiceNftError::InvoiceNotFound)
     }
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), InvoiceNftError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(InvoiceNftError::NotInitialized)?;
         if &admin != caller {
-            return Err(KoraError::NotAdmin);
+            return Err(InvoiceNftError::NotAdmin);
         }
         Ok(())
     }
 
-    fn require_allowed_currency(env: &Env, currency: &Symbol) -> Result<(), KoraError> {
+    fn require_allowed_currency(env: &Env, currency: &Symbol) -> Result<(), InvoiceNftError> {
         let allowed: bool = env
             .storage()
             .persistent()
             .get(&DataKey::CurrencyAllowlist(currency.clone()))
             .unwrap_or(false);
         if !allowed {
-            return Err(KoraError::CurrencyNotAllowed);
+            return Err(InvoiceNftError::CurrencyNotAllowed);
         }
         Ok(())
     }
 
-    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+    fn require_not_paused(env: &Env) -> Result<(), InvoiceNftError> {
         let ac: Address = env
             .storage()
             .instance()
             .get(&DataKey::AccessControl)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(InvoiceNftError::NotInitialized)?;
         let client = kora_access_control::AccessControlContractClient::new(env, &ac);
         if client.is_paused() {
-            return Err(KoraError::ProtocolPaused);
+            return Err(InvoiceNftError::ProtocolPaused);
+        }
+        Ok(())
+    }
+
+    /// Extend the TTL of an arbitrary persistent storage entry to prevent expiry.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+    /// If a `risk_registry` is wired up, require `sme` to be a verified SME
+    /// (`SmeProfile.verified == true`). A no-op when no registry is configured,
+    /// for backward compatibility with deployments that haven't wired one up yet —
+    /// production deployments MUST call `set_risk_registry` for this to be enforced.
+    fn require_verified_sme(env: &Env, sme: &Address) -> Result<(), KoraError> {
+    /// Reject `new_exposure` if it would exceed the SME's risk_registry-assigned
+    /// credit limit. A no-op (always `Ok`) when no risk_registry is wired up, the
+    /// SME has no profile, or `credit_limit == 0` (unlimited).
+    fn check_credit_limit(env: &Env, sme: &Address, new_exposure: i128) -> Result<(), KoraError> {
+        if let Some(rr_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RiskRegistry)
+        {
+            let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &rr_addr);
+            if !rr.is_verified_sme(sme) {
+                return Err(KoraError::SMENotVerified);
+            }
+        }
+        Ok(())
+    }
+
+    /// If a `risk_registry` is wired up, require `sme` to have a compliance
+    /// attestation (`SmeProfile.compliance_attested == true`). A no-op when no
+    /// registry is configured, for backward compatibility with deployments that
+    /// haven't wired one up yet — production deployments MUST call
+    /// `set_risk_registry` for this to be enforced.
+    ///
+    /// This duplicates `marketplace::require_compliance_attested` intentionally:
+    /// enforcing the gate at mint time (in addition to marketplace's listing-time
+    /// check) prevents non-compliant SMEs from accumulating on-chain invoice
+    /// metadata and events before ever being blocked. See docs/invoice-nft.md.
+    fn require_compliance_attested(env: &Env, sme: &Address) -> Result<(), KoraError> {
+        if let Some(rr_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RiskRegistry)
+        {
+            let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &rr_addr);
+            if !rr.is_compliance_attested(sme) {
+                return Err(KoraError::ComplianceNotAttested);
+            if let Ok(Ok(profile)) = rr.try_get_sme_profile(sme) {
+                if profile.credit_limit > 0 && new_exposure > profile.credit_limit {
+                    return Err(KoraError::CreditLimitExceeded);
+                }
+            }
         }
         Ok(())
     }
@@ -996,6 +1313,13 @@ impl InvoiceNftContract {
             PERSISTENT_TTL_BUMP,
         );
     }
+
+    /// Extend the TTL of an arbitrary persistent entry to prevent expiry.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1003,7 +1327,6 @@ impl InvoiceNftContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kora_shared::errors::KoraError;
     use soroban_sdk::{
         testutils::{Address as _, Ledger, LedgerInfo},
         Bytes, Env, String, Symbol,
@@ -1057,6 +1380,49 @@ mod tests {
         String::from_str(env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
     }
 
+    /// Valid CIDv0 fixture ("Qm" prefix, 46 base58btc chars).
+    fn ipfs_cid_v0(env: &Env) -> String {
+        String::from_str(env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")
+    }
+
+    /// Structurally invalid CID fixture — should always be rejected.
+    fn garbage_cid(env: &Env) -> String {
+        String::from_str(env, "not-a-cid")
+    }
+
+    /// Deploys and wires a `risk_registry` behind `client`, registers `verifier` with
+    /// enough stake, registers `sme` through it, and sets `sme`'s `credit_limit`.
+    /// Returns the risk_registry client for further use in the test.
+    fn setup_with_credit_limit(
+        env: &Env,
+        admin: &Address,
+        client: &InvoiceNftContractClient,
+        sme: &Address,
+        credit_limit: i128,
+    ) -> kora_risk_registry::RiskRegistryContractClient<'static> {
+        use soroban_sdk::token::StellarAssetClient;
+
+        let nft_id = client.address.clone();
+        let rr_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
+        let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &rr_id);
+
+        let token_admin = Address::generate(env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_client = StellarAssetClient::new(env, &token_id);
+
+        let minimum_stake = 1_000_000i128;
+        rr.initialize(admin, &nft_id, &token_id, &minimum_stake, &500u32);
+
+        let verifier = Address::generate(env);
+        token_client.mint(&verifier, &minimum_stake);
+        rr.add_verifier(admin, &verifier, &minimum_stake);
+        rr.register_sme(&verifier, sme, &30u32, &true);
+        rr.set_credit_limit(&verifier, sme, &credit_limit);
+
+        client.set_risk_registry(admin, &rr_id);
+        rr
+    }
+
     // ── initialize ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1077,7 +1443,7 @@ mod tests {
         let (env, admin, client) = setup();
         let access_control = Address::generate(&env);
         let result = client.try_initialize(&admin, &access_control);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::AlreadyInitialized);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::AlreadyInitialized);
     }
 
     #[test]
@@ -1142,7 +1508,7 @@ mod tests {
             &sme, &debtor_hash, &0i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidAmount);
     }
 
     #[test]
@@ -1156,7 +1522,7 @@ mod tests {
             &sme, &debtor_hash, &-1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidAmount);
     }
 
     #[test]
@@ -1170,7 +1536,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidDueDate);
     }
 
     #[test]
@@ -1184,7 +1550,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidDueDate);
     }
 
     #[test]
@@ -1198,7 +1564,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &101u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidRiskScore);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidRiskScore);
     }
 
     #[test]
@@ -1212,7 +1578,49 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyBytes);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::EmptyBytes);
+    }
+
+    #[test]
+    fn test_mint_invoice_garbage_cid_rejected() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = garbage_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 2;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidCid);
+    }
+
+    #[test]
+    fn test_mint_invoice_valid_cidv0_accepted() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid_v0(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 2;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mint_invoice_valid_cidv1_accepted() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 2;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1258,6 +1666,171 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &cid, &50u32, &None,
         );
         assert_eq!(client.get_invoice(&id).amount, large_amount);
+    }
+
+    // ── mint_invoice / mint_invoices_batch — risk_registry gating ────────────────
+
+    /// Deploy a minimal Soroban token contract and mint `amount` to `recipient`.
+    fn deploy_token(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_client = soroban_sdk::token::StellarAssetClient::new(env, &token_id);
+        token_client.mint(recipient, &amount);
+        token_id
+    }
+
+    /// Registers a risk_registry, wires it up to `client`, and returns a client
+    /// plus a funded, added verifier ready to call `register_sme`.
+    fn setup_with_registry(
+        env: &Env,
+        admin: &Address,
+        client: &InvoiceNftContractClient,
+    ) -> (kora_risk_registry::RiskRegistryContractClient<'static>, Address) {
+        let registry_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
+        let registry_client = kora_risk_registry::RiskRegistryContractClient::new(env, &registry_id);
+        let verifier = Address::generate(env);
+        let staking_token = deploy_token(env, admin, &verifier, 1_000_000i128);
+        registry_client
+            .initialize(admin, &Address::generate(env), &staking_token, &1_000_000i128, &5_000u32);
+        registry_client.add_verifier(admin, &verifier, &1_000_000i128);
+        client.set_risk_registry(admin, &registry_id);
+        (registry_client, verifier)
+    }
+
+    #[test]
+    fn test_mint_invoice_unattested_sme_rejected() {
+        let (env, admin, client) = setup();
+        let (registry, verifier) = setup_with_registry(&env, &admin, &client);
+
+        let sme = Address::generate(&env);
+        registry.register_sme(&verifier, &sme, &50u32, &false); // compliance_attested = false
+
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &25u32, &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::ComplianceNotAttested);
+    }
+
+    #[test]
+    fn test_mint_invoice_compliant_sme_succeeds() {
+        let (env, admin, client) = setup();
+        let (registry, verifier) = setup_with_registry(&env, &admin, &client);
+
+        let sme = Address::generate(&env);
+        registry.register_sme(&verifier, &sme, &50u32, &true); // compliance_attested = true
+
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &25u32, &None,
+        );
+        assert_eq!(id, 1);
+        assert_eq!(client.get_invoice(&id).sme, sme);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_unattested_sme_rejected() {
+        let (env, admin, client) = setup();
+        let (registry, verifier) = setup_with_registry(&env, &admin, &client);
+
+        let sme = Address::generate(&env);
+        registry.register_sme(&verifier, &sme, &50u32, &false); // compliance_attested = false
+
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let mut batch = Vec::new(&env);
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(&env, &[1u8; 32]),
+            amount: 1_000_000_000i128,
+            currency: Symbol::new(&env, "USDC"),
+            due_date,
+            ipfs_cid: ipfs_cid(&env),
+            risk_score: 25u32,
+            notes: None,
+        });
+        let result = client.try_mint_invoices_batch(&sme, &batch);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::ComplianceNotAttested);
+    }
+
+    #[test]
+    fn test_mint_invoice_unverified_sme_rejected() {
+        let (env, admin, client) = setup();
+        let (_registry, _verifier) = setup_with_registry(&env, &admin, &client);
+
+        // sme was never registered with the risk_registry — not verified.
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &25u32, &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::SMENotVerified);
+    }
+
+    #[test]
+    fn test_mint_invoice_no_registry_configured_bypasses_gating() {
+        // Backward compatibility: when set_risk_registry was never called,
+        // an arbitrary (unregistered, unverified) address may still mint.
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &25u32, &None,
+        );
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_unverified_sme_rejected() {
+        let (env, admin, client) = setup();
+        let (_registry, _verifier) = setup_with_registry(&env, &admin, &client);
+
+        let sme = Address::generate(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let mut batch = Vec::new(&env);
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(&env, &[1u8; 32]),
+            amount: 1_000_000_000i128,
+            currency: Symbol::new(&env, "USDC"),
+            due_date,
+            ipfs_cid: ipfs_cid(&env),
+            risk_score: 25u32,
+            notes: None,
+        });
+        let result = client.try_mint_invoices_batch(&sme, &batch);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::SMENotVerified);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_verified_attested_sme_succeeds() {
+        let (env, admin, client) = setup();
+        let (registry, verifier) = setup_with_registry(&env, &admin, &client);
+
+        let sme = Address::generate(&env);
+        registry.register_sme(&verifier, &sme, &50u32, &true);
+
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let mut batch = Vec::new(&env);
+        batch.push_back(BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(&env, &[1u8; 32]),
+            amount: 1_000_000_000i128,
+            currency: Symbol::new(&env, "USDC"),
+            due_date,
+            ipfs_cid: ipfs_cid(&env),
+            risk_score: 25u32,
+            notes: None,
+        });
+        let ids = client.mint_invoices_batch(&sme, &batch);
+        assert_eq!(ids.len(), 1);
     }
 
     #[test]
@@ -1324,19 +1897,143 @@ mod tests {
         assert_eq!(client.get_invoice(&id81).risk_tier, RiskTier::C);
     }
 
+    // ── mint_invoices_batch ───────────────────────────────────────────────────
+
+    fn batch_input(env: &Env, amount: i128, cid: String) -> BatchInvoiceInput {
+        BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(env, &[1u8; 32]),
+            amount,
+            currency: Symbol::new(env, "USDC"),
+            due_date: env.ledger().timestamp() + 86_400 * 30,
+            ipfs_cid: cid,
+            risk_score: 10u32,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_success() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let cid = ipfs_cid(&env);
+        let inputs = Vec::from_array(
+            &env,
+            [
+                batch_input(&env, 1_000_000_000i128, cid.clone()),
+                batch_input(&env, 2_000_000_000i128, cid),
+            ],
+        );
+        let ids = client.mint_invoices_batch(&sme, &inputs);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(client.get_outstanding_exposure(&sme), 3_000_000_000i128);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_garbage_cid_rejects_whole_batch() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let inputs = Vec::from_array(
+            &env,
+            [
+                batch_input(&env, 1_000_000_000i128, ipfs_cid(&env)),
+                batch_input(&env, 1_000_000_000i128, garbage_cid(&env)),
+            ],
+        );
+        let result = client.try_mint_invoices_batch(&sme, &inputs);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidCid);
+        // Atomic-abort: nothing from the batch should be persisted.
+        assert_eq!(client.get_outstanding_exposure(&sme), 0i128);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_valid_cidv0_and_cidv1_accepted() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let inputs = Vec::from_array(
+            &env,
+            [
+                batch_input(&env, 1_000_000_000i128, ipfs_cid_v0(&env)),
+                batch_input(&env, 1_000_000_000i128, ipfs_cid(&env)),
+            ],
+        );
+        let result = client.try_mint_invoices_batch(&sme, &inputs);
+        assert!(result.is_ok());
+    }
+
+    /// Each item individually fits under credit_limit, but their sum doesn't — proves
+    /// the batch checks a running cumulative total against the SME's pre-batch exposure
+    /// rather than checking each item independently against a stale baseline. Regression
+    /// for #404.
+    #[test]
+    fn test_mint_invoices_batch_rejects_cumulative_over_credit_limit() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let cid = ipfs_cid(&env);
+
+        // credit_limit covers only 2.5 invoices of 1_000_000_000 each.
+        setup_with_credit_limit(&env, &admin, &client, &sme, 2_500_000_000i128);
+
+        // Three items of 1_000_000_000 each — none individually exceeds the limit,
+        // but their sum (3_000_000_000) does.
+        let inputs = Vec::from_array(
+            &env,
+            [
+                batch_input(&env, 1_000_000_000i128, cid.clone()),
+                batch_input(&env, 1_000_000_000i128, cid.clone()),
+                batch_input(&env, 1_000_000_000i128, cid),
+            ],
+        );
+        let result = client.try_mint_invoices_batch(&sme, &inputs);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::CreditLimitExceeded);
+        // Nothing from the rejected batch should be persisted: exposure is untouched,
+        // and NextId wasn't advanced (a fresh mint still gets id 1).
+        assert_eq!(client.get_outstanding_exposure(&sme), 0i128);
+        let id = client.mint_invoice(
+            &sme, &Bytes::from_slice(&env, &[1u8; 32]), &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &(env.ledger().timestamp() + 86_400 * 30),
+            &ipfs_cid(&env), &10u32, &None,
+        );
+        assert_eq!(id, 1u64);
+    }
+
+    /// Cumulative exposure across a batch must equal pre-batch exposure plus the sum
+    /// of all batch amounts once the batch succeeds.
+    #[test]
+    fn test_mint_invoices_batch_accepts_cumulative_within_credit_limit() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let cid = ipfs_cid(&env);
+
+        setup_with_credit_limit(&env, &admin, &client, &sme, 3_000_000_000i128);
+
+        let inputs = Vec::from_array(
+            &env,
+            [
+                batch_input(&env, 1_000_000_000i128, cid.clone()),
+                batch_input(&env, 1_000_000_000i128, cid.clone()),
+                batch_input(&env, 1_000_000_000i128, cid),
+            ],
+        );
+        let ids = client.mint_invoices_batch(&sme, &inputs);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(client.get_outstanding_exposure(&sme), 3_000_000_000i128);
+    }
+
     // ── status transitions ────────────────────────────────────────────────────
 
     #[test]
     fn test_status_transitions_full_lifecycle() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Created);
 
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
         client.set_listed(&marketplace, &id);
         assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
 
-        let pool = Address::generate(&env);
         client.set_funded(&pool, &id);
         assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Funded);
         assert!(client.get_invoice(&id).funded_at.is_some());
@@ -1348,39 +2045,123 @@ mod tests {
 
     #[test]
     fn test_set_listed_invalid_status_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id); // succeeds: Created → Listed
         let result = client.try_set_listed(&marketplace, &id); // fails: already Listed
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
+    }
+
+    // ── set_created ───────────────────────────────────────────────────────────
+
+    /// Marketplace can revert a Listed invoice back to Created.
+    #[test]
+    fn test_set_created_reverts_listed_to_created() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        client.set_listed(&marketplace, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
+
+        client.set_created(&marketplace, &id);
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Created);
+    }
+
+    /// set_created on a Created invoice must fail (wrong source status).
+    #[test]
+    fn test_set_created_on_created_invoice_fails() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        let result = client.try_set_created(&marketplace, &id);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
+    }
+
+    /// set_created on a Funded invoice must fail.
+    #[test]
+    fn test_set_created_on_funded_invoice_fails() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
+        client.set_funded(&pool, &id);
+
+        let result = client.try_set_created(&marketplace, &id);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
+    }
+
+    /// Unauthorized address cannot call set_created.
+    #[test]
+    fn test_set_created_unauthorized_rejected() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
+
+        let stranger = Address::generate(&env);
+        let result = client.try_set_created(&stranger, &id);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::Unauthorized);
+    }
+
+    /// After set_created the invoice can be re-listed via set_listed.
+    #[test]
+    fn test_set_created_then_relist_succeeds() {
+        let (env, admin, client) = setup();
+        let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+
+        // List → revert → re-list
+        client.set_listed(&marketplace, &id);
+        client.set_created(&marketplace, &id);
+        assert!(client.try_set_listed(&marketplace, &id).is_ok());
+        assert_eq!(client.get_invoice(&id).status, InvoiceStatus::Listed);
     }
 
     #[test]
     fn test_set_funded_invalid_status_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         let result = client.try_set_funded(&pool, &id); // Created → Funded skips Listed
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
     fn test_set_repaid_invalid_status_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         let result = client.try_set_repaid(&pool, &id); // Created → Repaid skips Listed/Funded
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
     fn test_set_funded_idempotent_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         let result = client.try_set_funded(&pool, &id);
         assert!(result.is_err());
@@ -1388,11 +2169,12 @@ mod tests {
 
     #[test]
     fn test_set_repaid_idempotent_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         client.set_repaid(&pool, &id);
         let result = client.try_set_repaid(&pool, &id);
@@ -1425,14 +2207,15 @@ mod tests {
 
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
 
         ac_client.pause(&admin);
 
         let result = client.try_set_repaid(&pool, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::ProtocolPaused);
     }
 
     // ── set_defaulted ─────────────────────────────────────────────────────────
@@ -1442,11 +2225,12 @@ mod tests {
         let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         let result = client.try_set_defaulted(&admin, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
@@ -1466,12 +2250,13 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         env.ledger().set(LedgerInfo { timestamp: due_date, ..env.ledger().get() });
         let result = client.try_set_defaulted(&admin, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
@@ -1491,8 +2276,9 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         env.ledger().set(LedgerInfo { timestamp: due_date + 1, ..env.ledger().get() });
         client.set_defaulted(&admin, &id);
@@ -1501,7 +2287,7 @@ mod tests {
 
     #[test]
     fn test_set_defaulted_requires_admin() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let cid = ipfs_cid(&env);
@@ -1516,13 +2302,14 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         client.set_funded(&pool, &id);
         env.ledger().set(LedgerInfo { timestamp: due_date + 1, ..env.ledger().get() });
         let non_admin = Address::generate(&env);
         let result = client.try_set_defaulted(&non_admin, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::NotAdmin);
     }
 
     #[test]
@@ -1634,14 +2421,14 @@ mod tests {
     fn test_get_nonexistent_invoice_fails() {
         let (_env, _admin, client) = setup();
         let result = client.try_get_invoice(&9999u64);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvoiceNotFound);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvoiceNotFound);
     }
 
     // ── timestamps ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_invoice_timestamps_recorded() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let cid = ipfs_cid(&env);
@@ -1656,9 +2443,10 @@ mod tests {
             &10u32, &None,
         );
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id);
 
-        let pool = Address::generate(&env);
         let funded_ts = env.ledger().timestamp();
         client.set_funded(&pool, &id);
         assert_eq!(client.get_invoice(&id).funded_at, Some(funded_ts));
@@ -1705,22 +2493,25 @@ mod tests {
 
     #[test]
     fn test_invalid_status_transition_created_to_funded_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
+        let marketplace = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         let result = client.try_set_funded(&pool, &id); // Created → Funded skips Listed
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
     fn test_invalid_status_transition_listed_to_repaid_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let id = mint_default(&env, &client, 10u32);
         let marketplace = Address::generate(&env);
-        client.set_listed(&marketplace, &id);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+        client.set_listed(&marketplace, &id);
         let result = client.try_set_repaid(&pool, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     #[test]
@@ -1847,11 +2638,15 @@ mod tests {
             funded_at: None,
             repaid_at: None,
         };
-        env.storage().persistent().set(&DataKey::Invoice(1u64), &old_record);
-        // Advance NextId so migrate() knows to scan ID 1.
-        env.storage().instance().set(&DataKey::NextId, &2u64);
-        // Force stored version back to 1 so migrate() re-runs the v1→v2 step.
-        env.storage().instance().set(&DataKey::MigrationVersion, &1u32);
+        env.as_contract(&client.address, || {
+        let contract_id = client.address.clone();
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Invoice(1u64), &old_record);
+            // Advance NextId so migrate() knows to scan ID 1.
+            env.storage().instance().set(&DataKey::NextId, &2u64);
+            // Force stored version back to 1 so migrate() re-runs the v1→v2 step.
+            env.storage().instance().set(&DataKey::MigrationVersion, &1u32);
+        });
 
         // Run migration — should rewrite the record with notes = None.
         client.migrate(&admin);
@@ -1890,6 +2685,8 @@ mod tests {
         assert_eq!(invoice.status, InvoiceStatus::Created);
 
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &invoice_id);
         assert_eq!(client.get_invoice(&invoice_id).status, InvoiceStatus::Listed);
     }
@@ -1915,9 +2712,65 @@ mod tests {
         assert_eq!(client.get_outstanding_exposure(&sme), 1_000_000_000i128);
     }
 
+    /// Proves OutstandingExposure accumulates across multiple mints for the same SME,
+    /// not just a single mint's own amount (regression for #403).
     #[test]
     fn test_outstanding_exposure_released_on_repaid() {
+        let (env, admin, client) = setup();
+    fn test_outstanding_exposure_accumulates_across_mints() {
         let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+
+        for _ in 0..3 {
+            client.mint_invoice(
+                &sme, &debtor_hash, &1_000_000_000i128,
+                &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+            );
+        }
+        assert_eq!(client.get_outstanding_exposure(&sme), 3_000_000_000i128);
+    }
+
+    /// A risk_registry-enforced credit_limit rejects a mint that would push
+    /// aggregate exposure over the limit, even though each individual mint's own
+    /// amount is well under it. Regression for #403.
+    #[test]
+    fn test_credit_limit_rejects_mint_exceeding_aggregate_exposure() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+
+        // credit_limit covers exactly 3 invoices of 1_000_000_000 each.
+        setup_with_credit_limit(&env, &admin, &client, &sme, 3_000_000_000i128);
+
+        for _ in 0..3 {
+            client.mint_invoice(
+                &sme, &debtor_hash, &1_000_000_000i128,
+                &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+            );
+        }
+        assert_eq!(client.get_outstanding_exposure(&sme), 3_000_000_000i128);
+
+        // A 4th invoice would push aggregate exposure to 4_000_000_000, over the limit.
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::CreditLimitExceeded
+        );
+        // Rejected mint must not have written any exposure.
+        assert_eq!(client.get_outstanding_exposure(&sme), 3_000_000_000i128);
+    }
+
+    #[test]
+    fn test_outstanding_exposure_released_on_repaid() {
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let ipfs_cid = String::from_str(
@@ -1931,6 +2784,7 @@ mod tests {
         );
         let mp = Address::generate(&env);
         let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &mp, &pool);
         client.set_listed(&mp, &id);
         client.set_funded(&pool, &id);
         client.set_repaid(&pool, &id);
@@ -2003,12 +2857,12 @@ mod tests {
         let result = client.try_amend_invoice(
             &other, &id, &debtor_hash, &1_000_000_000i128, &due_date, &ipfs_cid, &10u32,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotInvoiceOwner);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::NotInvoiceOwner);
     }
 
     #[test]
     fn test_amend_invoice_after_listing_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let ipfs_cid = String::from_str(
@@ -2021,11 +2875,80 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id);
         let result = client.try_amend_invoice(
             &sme, &id, &debtor_hash, &1_000_000_000i128, &due_date, &ipfs_cid, &10u32,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
+    }
+
+    #[test]
+    fn test_amend_invoice_garbage_cid_rejected() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        let result = client.try_amend_invoice(
+            &sme, &id, &debtor_hash, &1_000_000_000i128, &due_date, &garbage_cid(&env), &10u32,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidCid);
+        // Invoice must be unchanged after the rejected amend.
+        assert_eq!(client.get_invoice(&id).ipfs_cid, cid);
+    }
+
+    #[test]
+    fn test_amend_invoice_valid_cidv0_accepted() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let id = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid(&env), &10u32, &None,
+        );
+        let cid_v0 = ipfs_cid_v0(&env);
+        client.amend_invoice(&sme, &id, &debtor_hash, &1_000_000_000i128, &due_date, &cid_v0, &10u32);
+        assert_eq!(client.get_invoice(&id).ipfs_cid, cid_v0);
+    }
+
+    /// amend_invoice adjusts OutstandingExposure by the amount delta and re-checks
+    /// credit_limit; increasing amount beyond remaining headroom is rejected.
+    /// Regression for #403.
+    #[test]
+    fn test_amend_invoice_exceeding_credit_limit_rejected() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+
+        setup_with_credit_limit(&env, &admin, &client, &sme, 1_500_000_000i128);
+
+        let id = client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert_eq!(client.get_outstanding_exposure(&sme), 1_000_000_000i128);
+
+        // Increasing to 2_000_000_000 would push exposure to 2_000_000_000, over the
+        // 1_500_000_000 limit.
+        let result = client.try_amend_invoice(
+            &sme, &id, &debtor_hash, &2_000_000_000i128, &due_date, &cid, &10u32,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::CreditLimitExceeded);
+        assert_eq!(client.get_outstanding_exposure(&sme), 1_000_000_000i128);
+        assert_eq!(client.get_invoice(&id).amount, 1_000_000_000i128);
+
+        // A decrease within headroom succeeds and exposure reflects the new amount.
+        client.amend_invoice(&sme, &id, &debtor_hash, &500_000_000i128, &due_date, &cid, &10u32);
+        assert_eq!(client.get_outstanding_exposure(&sme), 500_000_000i128);
     }
 
     // ── withdraw_invoice ──────────────────────────────────────────────────────
@@ -2046,7 +2969,7 @@ mod tests {
         );
         client.withdraw_invoice(&sme, &id);
         let result = client.try_get_invoice(&id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvoiceNotFound);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvoiceNotFound);
     }
 
     #[test]
@@ -2065,12 +2988,12 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let result = client.try_withdraw_invoice(&other, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotInvoiceOwner);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::NotInvoiceOwner);
     }
 
     #[test]
     fn test_withdraw_invoice_after_listing_fails() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
         let ipfs_cid = String::from_str(
@@ -2083,9 +3006,11 @@ mod tests {
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
         client.set_listed(&marketplace, &id);
         let result = client.try_withdraw_invoice(&sme, &id);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+        assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::InvalidInvoiceStatus);
     }
 
     // ── Per-invoice emergency freeze ──────────────────────────────────────────
@@ -2100,7 +3025,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         client.mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         )
     }
 
@@ -2116,7 +3041,7 @@ mod tests {
         let (env, admin, client) = setup();
         let id = mint_one(&env, &client);
         assert!(!client.is_invoice_frozen(&id));
-        client.freeze_invoice(&admin, &id).unwrap();
+        client.freeze_invoice(&admin, &id);
         assert!(client.is_invoice_frozen(&id));
     }
 
@@ -2124,9 +3049,9 @@ mod tests {
     fn test_unfreeze_invoice_clears_frozen_flag() {
         let (env, admin, client) = setup();
         let id = mint_one(&env, &client);
-        client.freeze_invoice(&admin, &id).unwrap();
+        client.freeze_invoice(&admin, &id);
         assert!(client.is_invoice_frozen(&id));
-        client.unfreeze_invoice(&admin, &id).unwrap();
+        client.unfreeze_invoice(&admin, &id);
         assert!(!client.is_invoice_frozen(&id));
     }
 
@@ -2139,7 +3064,7 @@ mod tests {
             .try_freeze_invoice(&stranger, &id)
             .unwrap_err()
             .unwrap();
-        assert_eq!(err, KoraError::NotAdmin);
+        assert_eq!(err, InvoiceNftError::NotAdmin);
     }
 
     #[test]
@@ -2149,6 +3074,105 @@ mod tests {
             .try_freeze_invoice(&admin, &9999u64)
             .unwrap_err()
             .unwrap();
-        assert_eq!(err, KoraError::InvoiceNotFound);
+        assert_eq!(err, InvoiceNftError::InvoiceNotFound);
+    }
+
+    // ── risk_registry.increment_invoice_count wiring ──────────────────────────
+
+    /// Deploys and initializes a risk_registry contract, registers `sme` as a
+    /// verified SME under a freshly-added verifier, and wires the registry into
+    /// `client` via `set_risk_registry`. Returns the registry client so tests
+    /// can query `get_sme_profile`.
+    fn wire_risk_registry(
+        env: &Env,
+        admin: &Address,
+        client: &InvoiceNftContractClient,
+        sme: &Address,
+    ) -> kora_risk_registry::RiskRegistryContractClient<'static> {
+        // add_verifier's stake transfer requires verifier.require_auth() from
+        // inside a nested call (risk_registry -> token), which isn't tied to
+        // the root invocation — plain mock_all_auths() rejects that.
+        env.mock_all_auths_allowing_non_root_auth();
+        let rr_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
+        let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &rr_id);
+        let rr_admin = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let staking_token = env.register_stellar_asset_contract_v2(token_admin).address();
+        rr.initialize(&rr_admin, &client.address, &staking_token, &1_000_000i128, &5_000u32);
+
+        let verifier = Address::generate(env);
+        soroban_sdk::token::StellarAssetClient::new(env, &staking_token)
+            .mint(&verifier, &1_000_000i128);
+        rr.add_verifier(&rr_admin, &verifier, &1_000_000i128);
+        rr.register_sme(&verifier, sme, &50u32, &true);
+
+        client.set_risk_registry(admin, &rr_id);
+        rr
+    }
+
+    #[test]
+    fn test_mint_invoice_increments_risk_registry_total_invoices() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let rr = wire_risk_registry(&env, &admin, &client, &sme);
+        assert_eq!(rr.get_sme_profile(&sme).total_invoices, 0);
+
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert_eq!(rr.get_sme_profile(&sme).total_invoices, 1);
+
+        client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert_eq!(rr.get_sme_profile(&sme).total_invoices, 2);
+    }
+
+    #[test]
+    fn test_mint_invoices_batch_increments_risk_registry_total_invoices_per_invoice() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let rr = wire_risk_registry(&env, &admin, &client, &sme);
+
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&env);
+        for _ in 0..5 {
+            batch.push_back(BatchInvoiceInput {
+                debtor_hash: debtor_hash.clone(),
+                amount: 1_000_000_000i128,
+                currency: Symbol::new(&env, "USDC"),
+                due_date,
+                ipfs_cid: cid.clone(),
+                risk_score: 10u32,
+                notes: None,
+            });
+        }
+        let ids = client.mint_invoices_batch(&sme, &batch);
+        assert_eq!(ids.len(), 5);
+        // One increment per invoice in the batch, not one per batch call.
+        assert_eq!(rr.get_sme_profile(&sme).total_invoices, 5);
+    }
+
+    #[test]
+    fn test_mint_invoice_succeeds_without_risk_registry_configured() {
+        // No set_risk_registry() call — minting must still succeed as a no-op
+        // with respect to the registry integration (backward compatible).
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let cid = ipfs_cid(&env);
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &cid, &10u32, &None,
+        );
+        assert!(result.is_ok());
     }
 }

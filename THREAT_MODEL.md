@@ -52,6 +52,7 @@ This document outlines the key threat actors, their capabilities, and the protoc
 | `invoice_nft` | Mint invoices with false metadata | Metadata lives off-chain (IPFS); off-chain verification by verifiers via risk scoring |
 | `invoice_nft` | Mint invoices with false due date | Timestamp validation: `due_date` must be in the future; verified at mint time |
 | `invoice_nft` | Mint invoices with zero/negative amount | Check: `amount > 0`; revert if invalid |
+| `invoice_nft` | Mint as an unverified or non-compliant SME | When `set_risk_registry()` is configured, `mint_invoice`/`mint_invoices_batch` reject the SME (`SMENotVerified` / `ComplianceNotAttested`) *before* any invoice is stored. `marketplace.list_invoice` independently re-checks `compliance_attested` (not `verified`) at listing time — see [docs/invoice-nft.md § Minting Rules](docs/invoice-nft.md#minting-rules) for why both are enforced |
 | `marketplace` | List the same invoice multiple times | Invariant: one listing per invoice ID; second list attempt fails with `InvoiceAlreadyExists` |
 | `marketplace` | Cancel a listing after partial funding | `cancel_listing()` allowed but marketplace tracks state; investors can still claim repayment if repaid |
 | `financing_pool` | Repay with insufficient funds | Explicit transfer requirement; if sender lacks balance, token transfer fails |
@@ -71,6 +72,7 @@ This document outlines the key threat actors, their capabilities, and the protoc
 3. **Explicit amount enforcement** — all financial amounts validated before state changes
 4. **Immutable listings** — once listed, key parameters (asking price, funding deadline) cannot be changed
 5. **Investor claim on repayment** — repayment is tracked and yield distributed proportionally
+6. **Mint-time compliance gating** — `invoice_nft` enforces `verified`/`compliance_attested` at mint time (not just at `marketplace.list_invoice`), so an unverified or non-compliant SME cannot accumulate on-chain invoice metadata and events before being blocked
 
 ---
 
