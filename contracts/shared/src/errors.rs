@@ -23,6 +23,7 @@ pub enum KoraError {
     InvalidRiskScore = 16,
     InvalidCid = 17,
     InvoiceFrozen = 18,
+    NotInvoiceOwner = 19,
 
     // Marketplace
     ListingNotFound = 20,
@@ -70,8 +71,6 @@ pub enum KoraError {
     NotInitialized = 96,
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
-    // Field value exceeds the allowed maximum length
-    FieldTooLong = 102,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
@@ -94,4 +93,18 @@ pub enum KoraError {
     // Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+    // Minting/amending an invoice would push the SME's aggregate OutstandingExposure
+    // above their risk_registry-assigned SmeProfile.credit_limit
+    CreditLimitExceeded = 120,
+    // A currency symbol is not on the invoice_nft CurrencyAllowlist
+    CurrencyNotAllowed = 121,
+    // Access-control admin-action multisig
+    InvalidThreshold = 122,
+    ProposalNotFound = 123,
+    ProposalAlreadyExecuted = 124,
+    ProposalExpired = 125,
+    AlreadyApproved = 126,
+    ThresholdNotMet = 127,
+    MultisigNotConfigured = 128,
+    SignerNotFound = 129,
 }

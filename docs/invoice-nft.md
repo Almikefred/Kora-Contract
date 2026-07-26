@@ -344,7 +344,26 @@ pub fn invoice_count(env: Env) -> u64
    - Due date must be in the future (> current block timestamp)
    - Risk score must be 0–100 (typically assigned by a verifier)
    - Debtor hash must be non-empty (32-byte SHA-256 hash)
-   - IPFS CID must be non-empty (pointer to encrypted invoice metadata)
+   - IPFS CID must be non-empty, ≤128 bytes, and **structurally valid** — either a CIDv0
+     (`Qm` prefix, exactly 46 base58btc characters) or a CIDv1 (multibase-prefixed with
+     `b`/`B`/`z`/`f`/`F`/`u`/`U`/`k`/`K`, ≥10 characters). A garbage string such as
+     `"not-a-cid"` is rejected with `KoraError::InvalidCid` — this is enforced structurally
+     on-chain (see `kora_shared::validation::require_valid_ipfs_cid`), not merely a length
+     check, at `mint_invoice`, `mint_invoices_batch` (per item), and `amend_invoice`. This
+     is **not retroactive**: invoices minted before this validation was wired in and whose
+     CID happens not to conform are left as-is; the check only gates new mints and amends
+     going forward.
+   - If a `risk_registry` is wired up (`set_risk_registry`) and the SME has a non-zero
+     `credit_limit` on their `SmeProfile`, the mint (or batch, or amend) is rejected with
+     `KoraError::CreditLimitExceeded` whenever it would push the SME's aggregate
+     `OutstandingExposure` — the sum of `amount` across all of that SME's non-terminal
+     (not `Repaid`/`Defaulted`) invoices — over `credit_limit`. `OutstandingExposure` itself
+     is tracked for every SME regardless of whether a registry is wired up (it is
+     incremented on mint and decremented on withdraw/repay/default), and adjusted by the
+     delta when `amend_invoice` changes `amount`. `mint_invoices_batch` checks the whole
+     batch's cumulative amount against a single running total before writing anything, so a
+     batch that individually fits per item but collectively exceeds `credit_limit` is
+     rejected in its entirety (atomic-abort).
 
 3. **NFT Immutability**
    - Once minted, the following fields **never change:**
