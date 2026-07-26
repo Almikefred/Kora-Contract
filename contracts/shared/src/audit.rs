@@ -49,6 +49,16 @@ pub enum AdminActionType {
     RegistryExecuteUpgrade,
     // ── InvoiceNft ───────────────────────────────────────────────────────────
     CorrectMetadataHash,
+    InvoiceNftSetRiskRegistry,
+    InvoiceNftSetAuthorizedCallers,
+    InvoiceNftSetDefaulted,
+    InvoiceNftFreezeInvoice,
+    InvoiceNftUnfreezeInvoice,
+    InvoiceNftAddAllowedCurrency,
+    InvoiceNftRemoveAllowedCurrency,
+    InvoiceNftProposeUpgrade,
+    InvoiceNftExecuteUpgrade,
+    InvoiceNftMigrate,
 }
 
 /// A single entry in the on-chain admin audit log.

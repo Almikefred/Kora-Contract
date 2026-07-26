@@ -1,5 +1,6 @@
 use crate::audit::AdminAuditEntry;
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol};
+use crate::types::RiskTier;
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 
 // ── Canonical Event Schema ────────────────────────────────────────────────────
 //
@@ -22,77 +23,127 @@ fn emit(env: &Env, topic: Symbol, data: impl soroban_sdk::IntoVal<Env, soroban_s
 
 // ── Invoice Events ────────────────────────────────────────────────────────────
 
-/// Schema: (actor=sme, invoice_id, amount, timestamp)
-pub fn invoice_created(env: &Env, invoice_id: u64, sme: &Address, amount: i128) {
+/// Schema: (actor=sme, invoice_id, amount, currency, timestamp)
+pub fn invoice_created(env: &Env, invoice_id: u64, sme: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_CRT"),
-        (sme.clone(), invoice_id, amount, env.ledger().timestamp()),
+        (sme.clone(), invoice_id, amount, currency, env.ledger().timestamp()),
     );
 }
 
 /// Standardized marketplace event: invoice listed for financing.
-/// Schema: (actor=seller, invoice_id, asking_price, timestamp)
-pub fn invoice_listed(env: &Env, invoice_id: u64, seller: &Address, asking_price: i128) {
+/// Schema: (actor=seller, invoice_id, asking_price, currency, timestamp)
+pub fn invoice_listed(env: &Env, invoice_id: u64, seller: &Address, asking_price: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_LIST"),
+        symbol_short!("INV_LST"),
         (
             seller.clone(),
             invoice_id,
             asking_price,
+            currency,
             env.ledger().timestamp(),
         ),
     );
 }
 
 /// Standardized marketplace event: investor funded a listing.
-/// Schema: (actor=investor, invoice_id, funded_amount, timestamp)
-pub fn invoice_funded(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
+/// Schema: (actor=investor, invoice_id, funded_amount, currency, timestamp)
+pub fn invoice_funded(env: &Env, invoice_id: u64, investor: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_FUND"),
+        symbol_short!("INV_FND"),
         (
             investor.clone(),
             invoice_id,
             amount,
+            currency,
             env.ledger().timestamp(),
         ),
     );
 }
 
-/// Schema: (actor=sme, invoice_id, amount, timestamp)
-pub fn invoice_repaid(env: &Env, invoice_id: u64, sme: &Address, amount: i128) {
+/// Schema: (actor=sme, invoice_id, amount, currency, timestamp)
+pub fn invoice_repaid(env: &Env, invoice_id: u64, sme: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_RPD"),
-        (sme.clone(), invoice_id, amount, env.ledger().timestamp()),
+        (sme.clone(), invoice_id, amount, currency, env.ledger().timestamp()),
     );
 }
 
-/// Schema: (actor, invoice_id, timestamp)
+/// Schema: (actor, invoice_id, amount, currency, timestamp)
 /// actor is the admin marking the default (or the SME address in invoice_nft context)
-pub fn invoice_defaulted(env: &Env, invoice_id: u64, actor: &Address) {
+pub fn invoice_defaulted(env: &Env, invoice_id: u64, actor: &Address, amount: i128, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_DFT"),
-        (actor.clone(), invoice_id, env.ledger().timestamp()),
+        (actor.clone(), invoice_id, amount, currency, env.ledger().timestamp()),
     );
 }
 
-pub fn invoice_amended(env: &Env, invoice_id: u64, sme: &Address) {
+/// Schema: (invoice_id, sme, currency, timestamp)
+pub fn invoice_amended(env: &Env, invoice_id: u64, sme: &Address, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_AMD"),
-        (invoice_id, sme.clone(), env.ledger().timestamp()),
+        (invoice_id, sme.clone(), currency, env.ledger().timestamp()),
     );
 }
 
-pub fn invoice_withdrawn(env: &Env, invoice_id: u64, sme: &Address) {
+/// Schema: (invoice_id, sme, currency, timestamp)
+pub fn invoice_withdrawn(env: &Env, invoice_id: u64, sme: &Address, currency: Symbol) {
     emit(
         env,
         symbol_short!("INV_WTH"),
-        (invoice_id, sme.clone(), env.ledger().timestamp()),
+        (invoice_id, sme.clone(), currency, env.ledger().timestamp()),
+    );
+}
+
+/// Batch-level correlation event for `mint_invoices_batch`, emitted once per
+/// call (in addition to the per-invoice `invoice_created` events) so an
+/// off-chain indexer can group invoices minted together in one batch.
+/// Schema: (actor=sme, batch_id, invoice_ids, timestamp)
+pub fn invoice_batch_minted(env: &Env, batch_id: u64, sme: &Address, invoice_ids: &Vec<u64>) {
+    emit(
+        env,
+        symbol_short!("INV_BATCH"),
+        (
+            sme.clone(),
+            batch_id,
+            invoice_ids.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Records a risk-score refresh on an already-`Funded` invoice, capturing both
+/// the prior and updated score/tier for audit purposes.
+/// Schema: (actor=caller, invoice_id, old_score, new_score, old_tier, new_tier, timestamp)
+pub fn risk_score_refreshed(
+    env: &Env,
+    invoice_id: u64,
+    caller: &Address,
+    old_score: u32,
+    new_score: u32,
+    old_tier: &RiskTier,
+    new_tier: &RiskTier,
+) {
+    emit(
+        env,
+        symbol_short!("RISK_RFSH"),
+        (
+            caller.clone(),
+            invoice_id,
+            old_score,
+            new_score,
+            old_tier.clone(),
+            new_tier.clone(),
+            env.ledger().timestamp(),
+        ),
     );
 }
 
@@ -112,6 +163,8 @@ pub fn installment_paid(env: &Env, invoice_id: u64, payer: &Address, index: u32,
     emit(
         env,
         symbol_short!("INSTLPAID"),
+        symbol_short!("INSTMT_PD"),
+        symbol_short!("INSTL_PD"),
         (payer.clone(), invoice_id, index, amount, env.ledger().timestamp()),
     );
 }
@@ -170,6 +223,9 @@ pub fn fee_collected(
     emit(
         env,
         symbol_short!("FEE_COLL"),
+        symbol_short!("FEE_COL"),
+        symbol_short!("TREAS_FEE"),
+        symbol_short!("TRES_FEE"),
         (
             investor.clone(),
             invoice_id,
@@ -232,6 +288,8 @@ pub fn protocol_unpaused(env: &Env, by: &Address) {
     emit(
         env,
         symbol_short!("AC_UNPSD"),
+        symbol_short!("UNPAUSED"),
+        symbol_short!("AC_UNPAUS"),
         (by.clone(), env.ledger().timestamp()),
     );
 }
@@ -241,6 +299,15 @@ pub fn token_whitelisted(env: &Env, actor: &Address, token: &Address) {
     emit(
         env,
         symbol_short!("TOK_WL"),
+        (actor.clone(), token.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, token, timestamp)
+pub fn token_whitelist_removed(env: &Env, actor: &Address, token: &Address) {
+    emit(
+        env,
+        symbol_short!("TOK_UNWL"),
         (actor.clone(), token.clone(), env.ledger().timestamp()),
     );
 }
@@ -301,6 +368,8 @@ pub fn position_recorded(
     emit(
         env,
         symbol_short!("POS_RECD"),
+        symbol_short!("POS_RECRD"),
+        symbol_short!("POS_REC"),
         (
             admin.clone(),
             invoice_id,
@@ -319,6 +388,7 @@ pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
         symbol_short!("VRF_ADDED"),
+        symbol_short!("VRF_ADD"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
 }
@@ -328,6 +398,8 @@ pub fn verifier_removed(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
         symbol_short!("VRF_RMVD"),
+        symbol_short!("VRF_REM"),
+        symbol_short!("VRF_RMV"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
 }
@@ -346,6 +418,9 @@ pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score
     emit(
         env,
         symbol_short!("SME_SCORE"),
+        symbol_short!("SME_UPD"),
+        symbol_short!("SME_SCORE"),
+        symbol_short!("SME_SCU"),
         (verifier.clone(), sme.clone(), new_score, env.ledger().timestamp()),
     );
 }
@@ -354,6 +429,7 @@ pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score
 pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_defaults: u32) {
     emit(
         env,
+        symbol_short!("SME_DFT"),
         symbol_short!("SME_DFLT"),
         (admin.clone(), sme.clone(), total_defaults, env.ledger().timestamp()),
     );
@@ -364,6 +440,9 @@ pub fn sme_invoice_count_incremented(env: &Env, sme: &Address, new_total: u32) {
     emit(
         env,
         symbol_short!("SME_INVCT"),
+        symbol_short!("SME_INV"),
+        symbol_short!("SME_INVCT"),
+        symbol_short!("SME_INVC"),
         (sme.clone(), new_total, env.ledger().timestamp()),
     );
 }
@@ -373,6 +452,7 @@ pub fn debtor_score_set(env: &Env, verifier: &Address, debtor_hash: &Bytes, scor
     emit(
         env,
         symbol_short!("DBT_SCORE"),
+        symbol_short!("DBT_SCR"),
         (
             verifier.clone(),
             debtor_hash.clone(),
@@ -395,6 +475,7 @@ pub fn registry_initialized(env: &Env, admin: &Address, invoice_nft: &Address) {
 pub fn sub_account_added(env: &Env, primary: &Address, sub_account: &Address) {
     emit(
         env,
+        symbol_short!("SUB_ADD"),
         symbol_short!("VRF_SADD"),
         (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
     );
@@ -404,6 +485,7 @@ pub fn sub_account_added(env: &Env, primary: &Address, sub_account: &Address) {
 pub fn sub_account_removed(env: &Env, primary: &Address, sub_account: &Address) {
     emit(
         env,
+        symbol_short!("SUB_RMV"),
         symbol_short!("VRF_SRMV"),
         (primary.clone(), sub_account.clone(), env.ledger().timestamp()),
     );
@@ -416,6 +498,8 @@ pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
     emit(
         env,
         symbol_short!("AC_UPG_PR"),
+        symbol_short!("UPG_PROP"),
+        symbol_short!("AC_UPG_P"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
 }
@@ -425,6 +509,8 @@ pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
     emit(
         env,
         symbol_short!("AC_UPG_EX"),
+        symbol_short!("UPG_EXEC"),
+        symbol_short!("AC_UPG_E"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
 }
@@ -437,6 +523,9 @@ pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
     emit(
         env,
         symbol_short!("MSIG_CFG"),
+        symbol_short!("MS_CFG"),
+        symbol_short!("MSIG_CFG"),
+        symbol_short!("AC_MSIG"),
         (threshold, signer_count, env.ledger().timestamp()),
     );
 }
@@ -446,6 +535,9 @@ pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
     emit(
         env,
         symbol_short!("ACT_PROP"),
+        symbol_short!("MS_PROP"),
+        symbol_short!("ACT_PROP"),
+        symbol_short!("AC_ACT_P"),
         (proposal_id, proposer.clone(), env.ledger().timestamp()),
     );
 }
@@ -455,6 +547,9 @@ pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval
     emit(
         env,
         symbol_short!("ACT_APPR"),
+        symbol_short!("MS_APPR"),
+        symbol_short!("ACT_APPR"),
+        symbol_short!("AC_ACT_A"),
         (
             proposal_id,
             approver.clone(),
@@ -469,6 +564,9 @@ pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
     emit(
         env,
         symbol_short!("ACT_EXEC"),
+        symbol_short!("MS_EXEC"),
+        symbol_short!("ACT_EXEC"),
+        symbol_short!("AC_ACT_E"),
         (proposal_id, executor.clone(), env.ledger().timestamp()),
     );
 }
@@ -480,6 +578,8 @@ pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i1
     emit(
         env,
         symbol_short!("REFUND_CL"),
+        symbol_short!("REFUND"),
+        symbol_short!("RFND_CLM"),
         (
             investor.clone(),
             invoice_id,
@@ -534,6 +634,7 @@ pub fn sme_credit_limit_set(env: &Env, verifier: &Address, sme: &Address, credit
     emit(
         env,
         symbol_short!("SME_CLSET"),
+        symbol_short!("SME_CL"),
         (verifier.clone(), sme.clone(), credit_limit, env.ledger().timestamp()),
     );
 }
@@ -605,6 +706,70 @@ pub fn metadata_hash_corrected(
             invoice_id,
             old_hash.clone(),
             new_hash.clone(),
+// ── Dutch Auction / Decay Schedule Events (#439) ──────────────────────────────
+
+/// Schema: (actor=seller, invoice_id, floor_price, decay_end_ts, timestamp)
+pub fn decay_schedule_set(
+    env: &Env,
+    invoice_id: u64,
+    seller: &Address,
+    floor_price: i128,
+    decay_end_ts: u64,
+) {
+    emit(
+        env,
+        symbol_short!("DECAY_SET"),
+        (
+            seller.clone(),
+            invoice_id,
+            floor_price,
+            decay_end_ts,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+// ── Reverse Auction / Bid Events (#440) ───────────────────────────────────────
+
+/// Schema: (actor=investor, invoice_id, bid_price, amount, timestamp)
+pub fn bid_submitted(
+    env: &Env,
+    invoice_id: u64,
+    investor: &Address,
+    bid_price: i128,
+    amount: i128,
+) {
+    emit(
+        env,
+        symbol_short!("BID_SUBM"),
+        (
+            investor.clone(),
+            invoice_id,
+            bid_price,
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Schema: (actor=seller, invoice_id, investor, bid_price, amount, timestamp)
+pub fn bid_accepted(
+    env: &Env,
+    invoice_id: u64,
+    seller: &Address,
+    investor: &Address,
+    bid_price: i128,
+    amount: i128,
+) {
+    emit(
+        env,
+        symbol_short!("BID_ACCP"),
+        (
+            seller.clone(),
+            invoice_id,
+            investor.clone(),
+            bid_price,
+            amount,
             env.ledger().timestamp(),
         ),
     );

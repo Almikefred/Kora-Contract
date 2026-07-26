@@ -1,5 +1,67 @@
 # Invoice NFT Contract
 
+<<<<<<< HEAD
+## Overview
+
+The `invoice_nft` contract is the source of truth for every invoice in the Kora protocol. It mints invoice NFTs, owns the invoice lifecycle state machine, and is the sole authority that may advance or block status transitions.
+
+## Status State Machine
+
+```
+Created → Listed → Funded → Repaid
+                          ↘ Defaulted
+```
+
+| Transition   | Function      | Caller           |
+|--------------|---------------|------------------|
+| → Listed     | `set_listed`  | Marketplace      |
+| → Funded     | `set_funded`  | Financing Pool   |
+| → Repaid     | `set_repaid`  | Financing Pool   |
+| → Defaulted  | `set_defaulted` | Admin          |
+
+## Freeze Mechanism
+
+### Design
+
+Freeze enforcement is **owned internally by `invoice_nft`**, not delegated to callers. Every status-mutating function (`set_listed`, `set_funded`, `set_repaid`) calls the private `require_not_frozen` guard before executing. This provides defense-in-depth: no caller — current or future — can advance a frozen invoice's state by forgetting an external pre-check.
+
+This is intentional and important. Earlier designs relied on external callers (e.g., `marketplace.fund_invoice`) to call `is_invoice_frozen` themselves before invoking invoice transitions. That approach is fragile: a single missed call site anywhere in the protocol silently defeats the freeze. The current design closes that class of bypass entirely.
+
+### Admin Operations
+
+| Function           | Who can call | Effect                                      |
+|--------------------|--------------|---------------------------------------------|
+| `freeze_invoice`   | Admin only   | Blocks all status transitions on the invoice |
+| `unfreeze_invoice` | Admin only   | Removes the freeze; transitions resume       |
+| `is_invoice_frozen`| Anyone       | Returns `true` if the invoice is frozen      |
+
+### Error
+
+A frozen invoice returns `KoraError::InvoiceFrozen (17)` on any attempted transition.
+
+### Use Cases
+
+- KYC / AML dispute on the SME or debtor
+- Regulatory hold pending investigation
+- Emergency administrative block
+
+### Storage
+
+Freeze state is stored as a `persistent` boolean under `DataKey::FrozenInvoice(invoice_id)`. The key is removed (not set to false) on unfreeze to reclaim storage.
+
+## Error Codes
+
+| Code | Variant                | Meaning                                  |
+|------|------------------------|------------------------------------------|
+| 10   | `InvoiceNotFound`      | No invoice exists for the given ID       |
+| 11   | `InvoiceAlreadyExists` | Duplicate invoice ID in marketplace      |
+| 12   | `InvalidInvoiceStatus` | Transition not allowed from current state |
+| 13   | `InvoiceExpired`       | Invoice past due date                    |
+| 14   | `InvalidAmount`        | Zero or negative amount                  |
+| 15   | `InvalidDueDate`       | Due date not in the future               |
+| 16   | `InvalidRiskScore`     | Risk score out of 0–100 range            |
+| 17   | `InvoiceFrozen`        | Invoice is administratively frozen       |
+=======
 The `invoice_nft` contract is the canonical source of truth for all invoice state in the Kora Protocol. Each invoice is represented as an immutable NFT with a unique ID, capturing all financial and metadata details of the underlying invoice.
 
 ## Invoice NFT Data Model
@@ -124,6 +186,8 @@ pub fn mint_invoice(
 **Errors:**
 - `KoraError::ArithmeticOverflow` if amount > i128::MAX / 2 or ID counter overflows
 - `KoraError::ProtocolPaused` if the protocol is paused
+- `KoraError::SMENotVerified` if a risk_registry is configured and `sme` is not verified — see [Minting Rules](#minting-rules)
+- `KoraError::ComplianceNotAttested` if a risk_registry is configured and `sme` lacks a compliance attestation — see [Minting Rules](#minting-rules)
 - `KoraError::InvalidInput` if:
   - `amount <= 0`
   - `due_date <= current_time` (must be in the future)
@@ -138,6 +202,87 @@ pub fn mint_invoice(
 - Uses checked arithmetic for ID allocation
 - Emits `invoice_created` event with ID, SME, and amount
 - Invoice is stored in persistent storage with TTL managed by the protocol operator
+
+---
+
+### Batch Minting
+
+```rust
+pub fn mint_invoices_batch(
+    env: Env,
+    sme: Address,
+    invoices: Vec<BatchInvoiceInput>,
+) -> Result<Vec<u64>, KoraError>
+```
+
+**Purpose:** Create multiple invoice NFTs in a single transaction, with atomic validation (all-or-nothing semantics).
+
+**Parameters:**
+- `env` — Soroban environment
+- `sme` — Address of the SME (must be the same for all invoices in the batch)
+- `invoices` — Vector of `BatchInvoiceInput` structs (maximum **25 invoices**)
+
+**Batch Size Limit:**
+- Maximum batch size is **`MAX_BATCH_MINT_SIZE = 25`**
+- This limit is enforced before any validation or storage writes occur
+- Batches exceeding 25 invoices are rejected immediately with `KoraError::BatchSizeExceeded`
+- The limit is conservatively chosen based on measured resource cost per invoice:
+  - ~50K CPU instructions for persistent storage write
+  - ~5K CPU instructions for event emission
+  - ~10K CPU instructions for TTL bump
+  - Total: ~65K CPU per invoice × 25 = ~1.625M (safe margin under Soroban's ~80M CPU budget)
+
+**Rationale:**
+- Prevents transactions from exceeding Soroban's CPU, memory, and ledger-write resource limits
+- Provides a stable, documented maximum that enables predictable client-side tooling
+- Allows reasonable batch sizes while preserving headroom for other middleware
+
+**Returns:** A vector of newly allocated invoice IDs (in order), or an error.
+
+**Errors:**
+- `KoraError::BatchSizeExceeded` if `invoices.len() > 25` (fast-fail, before any validation)
+- `KoraError::ProtocolPaused` if the protocol is paused
+- Validation errors (applied to each invoice in the batch):
+  - `KoraError::InvalidAmount` if any invoice has `amount <= 0` or `amount > i128::MAX / 2`
+  - `KoraError::InvalidDueDate` if any invoice has `due_date <= current_time`
+  - `KoraError::InvalidRiskScore` if any invoice has `risk_score > 100`
+  - `KoraError::EmptyBytes` if any invoice has an empty `debtor_hash`
+  - `KoraError::FieldTooLong` if any invoice has a `debtor_hash` longer than 64 bytes or `ipfs_cid` longer than 128 bytes
+  - `KoraError::EmptyString` if any invoice has an empty `ipfs_cid`
+
+**Atomicity:**
+- All inputs are validated **before** any storage writes
+- If any validation fails, the entire batch is aborted (no invoices are stored)
+- `next_id` is only updated after all invoices are successfully stored
+
+**Authorization:** Requires `sme.require_auth()`.
+
+**Security:**
+- Validates all inputs before state changes
+- Uses checked arithmetic for ID allocation
+- Each invoice emits an `invoice_created` event with ID, SME, and amount
+- All invoices are stored in persistent storage with TTL managed by the protocol operator
+- Batch size limit prevents resource exhaustion
+
+**Example:**
+
+```javascript
+// Client-side: batch up to 25 invoices
+const batch = [];
+for (let i = 0; i < 25; i++) {
+  batch.push({
+    debtor_hash: Buffer.from(...), // SHA-256 hash
+    amount: 10_000_000i128,        // In stroops
+    currency: "USDC",
+    due_date: Math.floor(Date.now() / 1000) + 86_400 * 30,
+    ipfs_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+    risk_score: 50,
+    notes: "Batch invoice",
+  });
+}
+const ids = await nftContract.mint_invoices_batch(smeMAddress, batch);
+console.log(`Created ${ids.length} invoices`);
+```
 
 ---
 
@@ -449,9 +594,55 @@ this shared struct is follow-up work.
    - Due date must be in the future (> current block timestamp)
    - Risk score must be 0–100 (typically assigned by a verifier)
    - Debtor hash must be non-empty (32-byte SHA-256 hash)
-   - IPFS CID must be non-empty (pointer to encrypted invoice metadata)
+   - IPFS CID must be non-empty, ≤128 bytes, and **structurally valid** — either a CIDv0
+     (`Qm` prefix, exactly 46 base58btc characters) or a CIDv1 (multibase-prefixed with
+     `b`/`B`/`z`/`f`/`F`/`u`/`U`/`k`/`K`, ≥10 characters). A garbage string such as
+     `"not-a-cid"` is rejected with `KoraError::InvalidCid` — this is enforced structurally
+     on-chain (see `kora_shared::validation::require_valid_ipfs_cid`), not merely a length
+     check, at `mint_invoice`, `mint_invoices_batch` (per item), and `amend_invoice`. This
+     is **not retroactive**: invoices minted before this validation was wired in and whose
+     CID happens not to conform are left as-is; the check only gates new mints and amends
+     going forward.
+   - If a `risk_registry` is wired up (`set_risk_registry`) and the SME has a non-zero
+     `credit_limit` on their `SmeProfile`, the mint (or batch, or amend) is rejected with
+     `KoraError::CreditLimitExceeded` whenever it would push the SME's aggregate
+     `OutstandingExposure` — the sum of `amount` across all of that SME's non-terminal
+     (not `Repaid`/`Defaulted`) invoices — over `credit_limit`. `OutstandingExposure` itself
+     is tracked for every SME regardless of whether a registry is wired up (it is
+     incremented on mint and decremented on withdraw/repay/default), and adjusted by the
+     delta when `amend_invoice` changes `amount`. `mint_invoices_batch` checks the whole
+     batch's cumulative amount against a single running total before writing anything, so a
+     batch that individually fits per item but collectively exceeds `credit_limit` is
+     rejected in its entirety (atomic-abort).
 
-3. **NFT Immutability**
+3. **Verification and compliance gating.** When `set_risk_registry()` has been
+   called (admin-only, post-deployment), `mint_invoice()` and
+   `mint_invoices_batch()` additionally require, *before any storage write*:
+   - `sme` is `verified` in the risk_registry's `SmeProfile` — otherwise
+     `KoraError::SMENotVerified`. In practice this means `sme` must have been
+     registered via `risk_registry.register_sme()` by a verifier; there is
+     currently no code path that registers an SME as unverified.
+   - `sme.compliance_attested == true` — otherwise `KoraError::ComplianceNotAttested`.
+
+   **This is enforced at two lifecycle stages, intentionally (defense in depth):**
+   - **Mint time** (`invoice_nft.mint_invoice` / `mint_invoices_batch`) — closes the
+     window where a non-compliant or unverified SME could otherwise mint an
+     on-chain invoice (with real metadata, notes, and `invoice_created` events)
+     that only gets rejected much later, at listing.
+   - **Listing time** (`marketplace.list_invoice`, via `require_compliance_attested`)
+     — kept as an independent, second gate. It protects against `invoice_nft` and
+     `marketplace` being wired to *different* `risk_registry` deployments, and
+     against invoices minted before `invoice_nft.set_risk_registry()` was ever
+     called (mint-time gating is a no-op with no registry configured). Note
+     marketplace only re-checks `compliance_attested`, not `verified` — `verified`
+     is invoice_nft-only, mint-time-only enforcement.
+
+   If no risk_registry has been configured on `invoice_nft`, the verified/compliance
+   checks are skipped entirely — an explicit backward-compatibility no-op, not a
+   silent bypass. Production deployments **must** call `set_risk_registry` for
+   these checks to be enforced.
+
+4. **NFT Immutability**
    - Once minted, the following fields **never change:**
      - `id`, `sme`, `debtor_hash`, `amount`, `currency`, `due_date`, `ipfs_cid`, `risk_score`, `risk_tier`, `created_at`
    - Only the following fields can change:
@@ -570,11 +761,16 @@ admin calls invoice_nft.set_defaulted(admin_address, invoice_id)
 - No on-chain verification that the underlying invoice is real
 - Mitigated off-chain by the verifier network's KYC/KYB checks
 
-### TTL Management
-- Invoice NFT storage entries expire if TTL is not extended
-- Protocol operator or keeper bot must periodically extend TTL
-- Failure to do so could result in invoice data loss
+### TTL Management (Fixed in v1.1)
+- **[FIXED]** Invoice storage entries now have their TTL extended on all state transitions:
+  - `mint_invoice()`, `mint_invoices_batch()`, `amend_invoice()`
+  - `set_listed()`, `set_funded()`, `set_repaid()`, `set_defaulted()`
+  - `commit_metadata_hash()`
+- Previously, `set_repaid()` and `commit_metadata_hash()` did not refresh the TTL, leaving repaid invoices (terminal state, rarely touched) vulnerable to expiry
+- TTL extension now uses unified shared constants (`DEFAULT_TTL_THRESHOLD`, `DEFAULT_TTL_BUMP`) from `kora_shared::validation::extend_persistent_ttl`
+- Protocol operator should still monitor persistent storage to ensure TTL stays healthy
 
 ### No Signature Delegation
 - Only the SME can mint their own invoices (no delegation mechanism)
 - Future versions may support signed delegation for agents
+>>>>>>> origin/Kora-Contract46

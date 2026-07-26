@@ -1,9 +1,20 @@
 #![no_std]
 
-use kora_shared::errors::KoraError;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 
 const MAX_STALENESS_SECS: u64 = 3600;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PriceOracleError {
+    AlreadyInitialized = 1,
+    ArithmeticOverflow = 2,
+    InvalidAmount = 3,
+    InvoiceExpired = 4,
+    NotAdmin = 5,
+    NotInitialized = 6,
+}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -23,9 +34,9 @@ pub struct PriceOracleContract;
 
 #[contractimpl]
 impl PriceOracleContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), PriceOracleError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(PriceOracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         Ok(())
@@ -39,12 +50,12 @@ impl PriceOracleContract {
         base: Symbol,
         quote: Symbol,
         price: i128,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), PriceOracleError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         if price <= 0 {
-            return Err(KoraError::InvalidAmount);
+            return Err(PriceOracleError::InvalidAmount);
         }
 
         let data = PriceData {
@@ -63,12 +74,12 @@ impl PriceOracleContract {
         env: Env,
         base: Symbol,
         quote: Symbol,
-    ) -> Result<PriceData, KoraError> {
+    ) -> Result<PriceData, PriceOracleError> {
         let data: PriceData = env
             .storage()
             .persistent()
             .get(&DataKey::Price(base.clone(), quote.clone()))
-            .ok_or(KoraError::InvalidAmount)?;
+            .ok_or(PriceOracleError::InvalidAmount)?;
 
         let age = env
             .ledger()
@@ -76,6 +87,7 @@ impl PriceOracleContract {
             .saturating_sub(data.timestamp);
         if age > MAX_STALENESS_SECS {
             return Err(KoraError::InvalidAmount);
+            return Err(PriceOracleError::InvoiceExpired);
         }
 
         Ok(data)
@@ -88,7 +100,7 @@ impl PriceOracleContract {
         amount: i128,
         from: Symbol,
         to: Symbol,
-    ) -> Result<i128, KoraError> {
+    ) -> Result<i128, PriceOracleError> {
         if from == to {
             return Ok(amount);
         }
@@ -97,23 +109,23 @@ impl PriceOracleContract {
         let converted = amount
             .checked_mul(price_data.price)
             .and_then(|v| v.checked_div(10_000_000))
-            .ok_or(KoraError::ArithmeticOverflow)?;
+            .ok_or(PriceOracleError::ArithmeticOverflow)?;
 
         if converted <= 0 {
-            return Err(KoraError::InvalidAmount);
+            return Err(PriceOracleError::InvalidAmount);
         }
 
         Ok(converted)
     }
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), PriceOracleError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(PriceOracleError::NotInitialized)?;
         if &admin != caller {
-            return Err(KoraError::NotAdmin);
+            return Err(PriceOracleError::NotAdmin);
         }
         Ok(())
     }
