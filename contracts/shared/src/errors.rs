@@ -63,6 +63,16 @@ pub enum KoraError {
     FundingNotExpired = 28,
     RefundAlreadyClaimed = 29,
     NoContribution = 95,
+    /// funding_deadline is too close to the invoice's due_date (#441)
+    FundingDeadlineTooCloseToDueDate = 103,
+    /// A bidding window is active; direct fund_invoice is not allowed in bidding mode (#440)
+    BiddingWindowActive = 104,
+    /// The bidding window has closed; no new bids may be submitted (#440)
+    BiddingWindowClosed = 105,
+    /// No bid found for the given (invoice_id, investor) pair (#440)
+    BidNotFound = 106,
+    /// Investor already has an active bid on this invoice (#440)
+    BidAlreadyExists = 107,
 
     // Pool
     PoolNotFound = 30,
@@ -97,17 +107,18 @@ pub enum KoraError {
     EmptyString = 93,
     AlreadyInitialized = 94,
     NotInitialized = 96,
-    // Distinct error for empty bytes (semantically different from EmptyString)
+    /// Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
+    /// Reentrancy guard triggered
     // Reentrancy guard triggered
     Reentrancy = 98,
-    // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
+    /// Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
     InvalidLength = 99,
     // Upgrade
     NoUpgradeProposed = 100,
     UpgradeTimelockNotElapsed = 101,
-    // Field value exceeds the allowed maximum length (was mistakenly = 95; fixed to 103)
-    FieldTooLong = 103,
+    /// Field value exceeds the allowed maximum length
+    FieldTooLong = 102,
     // Parameter governance
     ParameterProposalNotFound = 110,
     ParameterProposalAlreadyExecuted = 111,
@@ -116,9 +127,9 @@ pub enum KoraError {
     GovernanceThresholdNotMet = 114,
     GovernanceTimelockNotElapsed = 115,
     InvalidParameterValue = 116,
-    // Cooldown between debtor risk score updates per (verifier, debtor_hash) pair
+    /// Cooldown between debtor risk score updates per (verifier, debtor_hash) pair
     ScoreUpdateCooldownNotElapsed = 117,
-    // Marketplace two-phase cancellation
+    /// Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
 

@@ -596,6 +596,75 @@ pub fn cancellation_requested(env: &Env, invoice_id: u64, caller: &Address) {
     );
 }
 
+// ── Dutch Auction / Decay Schedule Events (#439) ──────────────────────────────
+
+/// Schema: (actor=seller, invoice_id, floor_price, decay_end_ts, timestamp)
+pub fn decay_schedule_set(
+    env: &Env,
+    invoice_id: u64,
+    seller: &Address,
+    floor_price: i128,
+    decay_end_ts: u64,
+) {
+    emit(
+        env,
+        symbol_short!("DECAY_SET"),
+        (
+            seller.clone(),
+            invoice_id,
+            floor_price,
+            decay_end_ts,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+// ── Reverse Auction / Bid Events (#440) ───────────────────────────────────────
+
+/// Schema: (actor=investor, invoice_id, bid_price, amount, timestamp)
+pub fn bid_submitted(
+    env: &Env,
+    invoice_id: u64,
+    investor: &Address,
+    bid_price: i128,
+    amount: i128,
+) {
+    emit(
+        env,
+        symbol_short!("BID_SUBM"),
+        (
+            investor.clone(),
+            invoice_id,
+            bid_price,
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Schema: (actor=seller, invoice_id, investor, bid_price, amount, timestamp)
+pub fn bid_accepted(
+    env: &Env,
+    invoice_id: u64,
+    seller: &Address,
+    investor: &Address,
+    bid_price: i128,
+    amount: i128,
+) {
+    emit(
+        env,
+        symbol_short!("BID_ACCP"),
+        (
+            seller.clone(),
+            invoice_id,
+            investor.clone(),
+            bid_price,
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 // ── Admin Audit Trail ─────────────────────────────────────────────────────────
 
 /// Canonical admin-action audit event emitted alongside every admin-gated call.

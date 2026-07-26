@@ -1,10 +1,18 @@
 #![no_std]
+#![no_std]
 // Two-phase cancellation for partially-funded listings (issue #263)
+// Dutch-auction price decay (#439)
+// Reverse-auction bidding (#440)
+// Funding deadline vs due-date guard (#441)
 
 use kora_shared::{
     errors::CommonError,
     events,
     reentrancy::ReentrancyGuard,
+    types::{Bid, DecaySchedule, Listing, RiskTier},
+    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
     types::{Listing, RiskTier},
     validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
     validation::{bps_of, bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
@@ -15,6 +23,10 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Ad
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
 const PERSISTENT_TTL_BUMP: u32 = 518_400;
 
+/// Default minimum gap (in seconds) that must exist between a listing's
+/// `funding_deadline` and the underlying invoice's `due_date` (#441).
+/// Default: 3 days = 3 * 86_400 s.
+pub const DEFAULT_MIN_FUNDING_BUFFER: u64 = 3 * 86_400;
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -170,6 +182,32 @@ impl MarketplaceContract {
         Ok(())
     }
 
+    /// Set the minimum funding-to-due-date buffer in seconds. Admin only. (#441)
+    /// Defaults to DEFAULT_MIN_FUNDING_BUFFER (3 days) if never explicitly set.
+    pub fn set_min_funding_buffer(
+        env: Env,
+        admin: Address,
+        buffer_seconds: u64,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinFundingBuffer, &buffer_seconds);
+        Ok(())
+    }
+
+    /// Returns the current minimum funding buffer in seconds. (#441)
+    pub fn get_min_funding_buffer(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinFundingBuffer)
+            .unwrap_or(DEFAULT_MIN_FUNDING_BUFFER)
+    }
+
     /// Update the referrer split fraction. Admin only.
     pub fn set_referrer_split_bps(env: Env, admin: Address, referrer_split_bps: u32) -> Result<(), MarketplaceError> {
         admin.require_auth();
@@ -320,6 +358,7 @@ impl MarketplaceContract {
     /// SME lists an invoice NFT for financing.
     /// An optional `referrer` address may be provided to credit a referring verifier
     /// with a portion of the protocol fee collected on each investor contribution.
+    /// An optional `bidding_deadline` puts the listing into reverse-auction mode (#440).
     pub fn list_invoice(
         env: Env,
         seller: Address,
@@ -329,6 +368,119 @@ impl MarketplaceContract {
         token: Address,
         funding_deadline: u64,
         referrer: Option<Address>,
+    ) -> Result<(), KoraError> {
+        Self::list_invoice_inner(
+            env,
+            seller,
+            invoice_id,
+            asking_price,
+            face_value,
+            token,
+            funding_deadline,
+            referrer,
+            None,  // no bidding deadline
+            None,  // no decay schedule
+        )
+    }
+
+    /// List an invoice with an optional Dutch-auction decay schedule (#439).
+    ///
+    /// `min_asking_price` is the floor price (must be > 0 and < asking_price).
+    /// `decay_start_ts`   is when price starts decaying (must be >= now).
+    /// `decay_end_ts`     is when price reaches the floor (must be <= funding_deadline).
+    pub fn list_invoice_with_decay(
+        env: Env,
+        seller: Address,
+        invoice_id: u64,
+        asking_price: i128,
+        face_value: i128,
+        token: Address,
+        funding_deadline: u64,
+        referrer: Option<Address>,
+        min_asking_price: i128,
+        decay_start_ts: u64,
+        decay_end_ts: u64,
+    ) -> Result<(), KoraError> {
+        // Validate decay schedule parameters
+        require_non_zero_amount(min_asking_price)?;
+        if min_asking_price >= asking_price {
+            return Err(KoraError::InvalidAmount);
+        }
+        if decay_start_ts >= decay_end_ts {
+            return Err(KoraError::InvalidDueDate);
+        }
+        if decay_end_ts > funding_deadline {
+            return Err(KoraError::InvalidDueDate);
+        }
+
+        let schedule = DecaySchedule {
+            start_price: asking_price,
+            floor_price: min_asking_price,
+            decay_start_ts,
+            decay_end_ts,
+        };
+
+        Self::list_invoice_inner(
+            env,
+            seller,
+            invoice_id,
+            asking_price,
+            face_value,
+            token,
+            funding_deadline,
+            referrer,
+            None,
+            Some(schedule),
+        )
+    }
+
+    /// List an invoice in reverse-auction (bidding) mode (#440).
+    ///
+    /// `bidding_deadline` must be before `funding_deadline`.
+    /// Direct `fund_invoice` calls are disabled while the bidding window is open.
+    pub fn list_invoice_with_bidding(
+        env: Env,
+        seller: Address,
+        invoice_id: u64,
+        asking_price: i128,
+        face_value: i128,
+        token: Address,
+        funding_deadline: u64,
+        referrer: Option<Address>,
+        bidding_deadline: u64,
+    ) -> Result<(), KoraError> {
+        if bidding_deadline >= funding_deadline {
+            return Err(KoraError::InvalidDueDate);
+        }
+        kora_shared::validation::require_future_timestamp(&env, bidding_deadline)?;
+
+        Self::list_invoice_inner(
+            env,
+            seller,
+            invoice_id,
+            asking_price,
+            face_value,
+            token,
+            funding_deadline,
+            referrer,
+            Some(bidding_deadline),
+            None,
+        )
+    }
+
+    /// Internal implementation shared by all list_invoice variants.
+    fn list_invoice_inner(
+        env: Env,
+        seller: Address,
+        invoice_id: u64,
+        asking_price: i128,
+        face_value: i128,
+        token: Address,
+        funding_deadline: u64,
+        referrer: Option<Address>,
+        bidding_deadline: Option<u64>,
+        decay_schedule: Option<DecaySchedule>,
+    ) -> Result<(), KoraError> {
     ) -> Result<(), MarketplaceError> {
         seller.require_auth();
         Self::require_not_paused(&env)?;
@@ -337,7 +489,6 @@ impl MarketplaceContract {
         require_non_zero_amount(face_value)?;
         require_within_max_amount(asking_price)?;
         require_within_max_amount(face_value)?;
-        kora_shared::validation::require_future_timestamp(&env, funding_deadline)?;
 
         // asking_price must be strictly less than face_value (discount must exist)
         if asking_price >= face_value {
@@ -373,6 +524,34 @@ impl MarketplaceContract {
 
         let config = Self::load_config(&env)?;
 
+        // ── #441: Fetch invoice BEFORE deadline validation so we can cross-check ──
+        let nft_client =
+            kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+        let invoice = nft_client.get_invoice(&invoice_id);
+
+        if invoice.amount != face_value {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        // ── #441: Validate funding_deadline is in the future ──────────────────
+        kora_shared::validation::require_future_timestamp(&env, funding_deadline)?;
+
+        // ── #441: funding_deadline must be at least `min_buffer` seconds before
+        //         the invoice's due_date ──────────────────────────────────────
+        let min_buffer: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinFundingBuffer)
+            .unwrap_or(DEFAULT_MIN_FUNDING_BUFFER);
+
+        let deadline_with_buffer = funding_deadline
+            .checked_add(min_buffer)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+
+        if deadline_with_buffer > invoice.due_date {
+            return Err(KoraError::FundingDeadlineTooCloseToDueDate);
+        }
+
         // Referrer may not be the seller (self-referral)
         if let Some(ref r) = referrer {
             if r == &seller {
@@ -384,15 +563,25 @@ impl MarketplaceContract {
             Self::bump_persistent(&env, &DataKey::Referrer(invoice_id));
         }
 
-        let nft_client =
-            kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+        nft_client.set_listed(&env.current_contract_address(), &invoice_id);
 
+        // ── #439: Store decay schedule if provided ────────────────────────────
+        if let Some(ref schedule) = decay_schedule {
+            env.storage()
+                .persistent()
+                .set(&DataKey::DecaySchedule(invoice_id), schedule);
+            Self::bump_persistent(&env, &DataKey::DecaySchedule(invoice_id));
+            events::decay_schedule_set(
+                &env,
+                invoice_id,
+                &seller,
+                schedule.floor_price,
+                schedule.decay_end_ts,
+            );
         let invoice = nft_client.get_invoice(&invoice_id);
         if invoice.amount != face_value {
             return Err(MarketplaceError::InvalidAmount);
         }
-
-        nft_client.set_listed(&env.current_contract_address(), &invoice_id);
 
         let listing = Listing {
             invoice_id,
@@ -403,6 +592,7 @@ impl MarketplaceContract {
             funded_amount: 0,
             funding_deadline,
             is_active: true,
+            bidding_deadline,
         };
         env.storage()
             .persistent()
@@ -413,6 +603,8 @@ impl MarketplaceContract {
     }
 
     /// Investor funds a share of an invoice.
+    /// Rejected when the listing is in bidding mode and the bidding window is still open (#440).
+    /// Uses the time-adjusted price from the decay schedule when active (#439).
     pub fn fund_invoice(
         env: Env,
         investor: Address,
@@ -438,7 +630,16 @@ impl MarketplaceContract {
             return Err(MarketplaceError::FundingDeadlinePassed);
         }
 
-        let remaining = safe_sub(listing.asking_price, listing.funded_amount)?;
+        // ── #440: Reject direct funding while bidding window is open ──────────
+        if let Some(bid_dl) = listing.bidding_deadline {
+            if env.ledger().timestamp() <= bid_dl {
+                return Err(KoraError::BiddingWindowActive);
+            }
+        }
+
+        // ── #439: Use the time-adjusted price (Dutch auction) ─────────────────
+        let effective_price = Self::current_asking_price_impl(&env, &listing);
+        let remaining = safe_sub(effective_price, listing.funded_amount)?;
         if amount > remaining {
             return Err(MarketplaceError::ExceedsFundingTarget);
         }
@@ -492,7 +693,8 @@ impl MarketplaceContract {
             .persistent()
             .set(&contrib_key, &safe_add(prev_contrib, net)?);
 
-        let fully_funded = listing.funded_amount >= listing.asking_price;
+        // Fully funded when funded_amount reaches the current effective price
+        let fully_funded = listing.funded_amount >= effective_price;
         if fully_funded {
             listing.is_active = false;
         }
@@ -765,6 +967,18 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .get(&DataKey::Listing(invoice_id))
+            .ok_or(KoraError::ListingNotFound)
+    }
+
+    // ── Dutch Auction / Price Decay (#439) ────────────────────────────────────
+
+    /// View: returns the current effective asking price for a listing.
+    ///
+    /// If no decay schedule is set, returns `listing.asking_price` unchanged.
+    /// If a schedule is active, performs linear interpolation between
+    /// `start_price` and `floor_price` based on the current ledger timestamp.
+    pub fn get_current_price(env: Env, invoice_id: u64) -> Result<i128, KoraError> {
+        let listing: Listing = env
             .ok_or(MarketplaceError::ListingNotFound)
     pub fn get_listing(env: Env, invoice_id: u64) -> Result<Listing, KoraError> {
         let listing = env
@@ -772,6 +986,255 @@ impl MarketplaceContract {
             .persistent()
             .get(&DataKey::Listing(invoice_id))
             .ok_or(KoraError::ListingNotFound)?;
+        Ok(Self::current_asking_price_impl(&env, &listing))
+    }
+
+    /// View: returns the decay schedule for a listing, if one is set.
+    pub fn get_decay_schedule(
+        env: Env,
+        invoice_id: u64,
+    ) -> Option<DecaySchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DecaySchedule(invoice_id))
+    }
+
+    // ── Reverse Auction / Bid submission (#440) ───────────────────────────────
+
+    /// Investor submits a bid on a reverse-auction listing.
+    ///
+    /// - The listing must have a `bidding_deadline` set.
+    /// - Current ledger time must be <= `bidding_deadline`.
+    /// - `bid_price` must be <= current_asking_price and > 0.
+    /// - `amount` must be > 0 and <= face_value.
+    /// - Each investor may have at most one active bid per listing.
+    pub fn submit_bid(
+        env: Env,
+        investor: Address,
+        invoice_id: u64,
+        bid_price: i128,
+        amount: i128,
+    ) -> Result<(), KoraError> {
+        investor.require_auth();
+        Self::require_not_paused(&env)?;
+
+        require_non_zero_amount(bid_price)?;
+        require_non_zero_amount(amount)?;
+        require_within_max_amount(bid_price)?;
+        require_within_max_amount(amount)?;
+
+        let listing: Listing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Listing(invoice_id))
+            .ok_or(KoraError::ListingNotFound)?;
+
+        if !listing.is_active {
+            return Err(KoraError::ListingAlreadyCancelled);
+        }
+
+        // Must be in bidding mode
+        let bidding_deadline = listing
+            .bidding_deadline
+            .ok_or(KoraError::BiddingWindowClosed)?;
+
+        // Must be inside the bidding window
+        if env.ledger().timestamp() > bidding_deadline {
+            return Err(KoraError::BiddingWindowClosed);
+        }
+
+        // bid_price must not exceed the current effective asking price
+        let current_price = Self::current_asking_price_impl(&env, &listing);
+        if bid_price > current_price {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        // amount must not exceed the face_value
+        if amount > listing.face_value {
+            return Err(KoraError::ExceedsFundingTarget);
+        }
+
+        // One bid per investor per listing
+        let bid_key = DataKey::Bid(invoice_id, investor.clone());
+        if env.storage().persistent().has(&bid_key) {
+            return Err(KoraError::BidAlreadyExists);
+        }
+
+        let bid = Bid {
+            investor: investor.clone(),
+            invoice_id,
+            bid_price,
+            amount,
+            submitted_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&bid_key, &bid);
+        Self::bump_persistent(&env, &bid_key);
+
+        events::bid_submitted(&env, invoice_id, &investor, bid_price, amount);
+        Ok(())
+    }
+
+    /// Seller accepts one or more winning bids after the bidding window closes (#440).
+    ///
+    /// `bid_investors` is the ordered list of investors whose bids the seller accepts.
+    /// Accepted bids are settled through the same fee/transfer/pool-release pipeline
+    /// as `fund_invoice`.  Acceptance stops once the listing is fully funded.
+    ///
+    /// Rules:
+    /// - Caller must be the listing seller or admin.
+    /// - `bidding_deadline` must have passed.
+    /// - Each accepted bid must exist.
+    /// - Total accepted `amount` must not exceed remaining capacity.
+    pub fn accept_bids(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        bid_investors: Vec<Address>,
+    ) -> Result<(), KoraError> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let mut listing: Listing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Listing(invoice_id))
+            .ok_or(KoraError::ListingNotFound)?;
+
+        if !listing.is_active {
+            return Err(KoraError::ListingAlreadyCancelled);
+        }
+
+        let config = Self::load_config(&env)?;
+
+        // Only seller or admin may accept bids
+        if caller != listing.seller && caller != config.admin {
+            return Err(KoraError::Unauthorized);
+        }
+
+        // Must be in bidding mode and bidding window must have closed
+        let bidding_deadline = listing
+            .bidding_deadline
+            .ok_or(KoraError::BiddingWindowClosed)?;
+
+        if env.ledger().timestamp() <= bidding_deadline {
+            return Err(KoraError::BiddingWindowActive);
+        }
+
+        let nft_client =
+            kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+        if nft_client.is_invoice_frozen(&invoice_id) {
+            return Err(KoraError::InvoiceFrozen);
+        }
+
+        let token_client = token::Client::new(&env, &listing.token);
+        let token_decimals = token_client.decimals();
+
+        let invoice = nft_client.get_invoice(&invoice_id);
+        let effective_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TierFeeBps(Self::tier_ordinal(&invoice.risk_tier)))
+            .unwrap_or(config.fee_bps);
+
+        let effective_price = Self::current_asking_price_impl(&env, &listing);
+
+        for investor in bid_investors.iter() {
+            // Stop once fully funded
+            if listing.funded_amount >= effective_price {
+                break;
+            }
+
+            let bid_key = DataKey::Bid(invoice_id, investor.clone());
+            let bid: Bid = env
+                .storage()
+                .persistent()
+                .get(&bid_key)
+                .ok_or(KoraError::BidNotFound)?;
+
+            let remaining = safe_sub(effective_price, listing.funded_amount)?;
+            // Accept the smaller of bid.amount and remaining capacity
+            let accept_amount = if bid.amount > remaining {
+                remaining
+            } else {
+                bid.amount
+            };
+
+            let fee = bps_of_normalized(accept_amount, effective_fee_bps, token_decimals)?;
+            let net = accept_amount
+                .checked_sub(fee)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+
+            if fee > 0 {
+                token_client.transfer(&investor, &config.treasury, &fee);
+                let treasury_client =
+                    kora_treasury::TreasuryContractClient::new(&env, &config.treasury);
+                treasury_client.collect_fee(&listing.token, &fee);
+            }
+            if net > 0 {
+                token_client.transfer(&investor, &config.financing_pool, &net);
+            }
+
+            listing.funded_amount = safe_add(listing.funded_amount, accept_amount)?;
+
+            // Track per-investor net contribution for potential refund
+            let contrib_key = DataKey::Contribution(invoice_id, investor.clone());
+            let prev_contrib: i128 = env
+                .storage()
+                .persistent()
+                .get(&contrib_key)
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&contrib_key, &safe_add(prev_contrib, net)?);
+
+            // Consume the bid
+            env.storage().persistent().remove(&bid_key);
+
+            events::invoice_funded(&env, invoice_id, &investor, accept_amount);
+            events::bid_accepted(
+                &env,
+                invoice_id,
+                &listing.seller,
+                &investor,
+                bid.bid_price,
+                accept_amount,
+            );
+            if fee > 0 {
+                events::fee_collected(&env, &investor, invoice_id, fee, &listing.token);
+            }
+        }
+
+        let fully_funded = listing.funded_amount >= effective_price;
+        if fully_funded {
+            listing.is_active = false;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(invoice_id), &listing);
+        Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
+
+        if fully_funded {
+            let pool_client = kora_financing_pool::FinancingPoolContractClient::new(
+                &env,
+                &config.financing_pool,
+            );
+            pool_client.release_funds(
+                &env.current_contract_address(),
+                &invoice_id,
+                &listing.token,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Returns the bid submitted by `investor` for `invoice_id`, if any.
+    pub fn get_bid(env: Env, invoice_id: u64, investor: Address) -> Option<Bid> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Bid(invoice_id, investor))
         Self::bump_listing(&env, invoice_id);
         Ok(listing)
     }
@@ -797,6 +1260,51 @@ impl MarketplaceContract {
             return Err(MarketplaceError::TokenNotWhitelisted);
         }
         Ok(())
+    }
+
+    /// Compute the current effective asking price for a listing (#439).
+    ///
+    /// - If no `DecaySchedule` is stored for the listing, returns `listing.asking_price`.
+    /// - If now < `decay_start_ts`: returns `start_price`.
+    /// - If now > `decay_end_ts`:   returns `floor_price`.
+    /// - Otherwise:  linear interpolation between `start_price` and `floor_price`.
+    ///
+    /// Formula (integer, rounds toward floor):
+    /// ```text
+    /// elapsed   = now - decay_start_ts
+    /// duration  = decay_end_ts - decay_start_ts
+    /// drop      = (start_price - floor_price) * elapsed / duration
+    /// price     = start_price - drop
+    /// ```
+    fn current_asking_price_impl(env: &Env, listing: &Listing) -> i128 {
+        let schedule: Option<DecaySchedule> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DecaySchedule(listing.invoice_id));
+
+        let schedule = match schedule {
+            None => return listing.asking_price,
+            Some(s) => s,
+        };
+
+        let now = env.ledger().timestamp();
+
+        if now <= schedule.decay_start_ts {
+            return schedule.start_price;
+        }
+        if now >= schedule.decay_end_ts {
+            return schedule.floor_price;
+        }
+
+        // Linear interpolation (integer arithmetic, truncates toward floor)
+        let elapsed = (now - schedule.decay_start_ts) as i128;
+        let duration = (schedule.decay_end_ts - schedule.decay_start_ts) as i128;
+        let price_drop = (schedule.start_price - schedule.floor_price)
+            .checked_mul(elapsed)
+            .unwrap_or(schedule.start_price - schedule.floor_price)
+            / duration;
+
+        schedule.start_price - price_drop
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
@@ -1058,6 +1566,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         id
@@ -1320,6 +1829,7 @@ mod tests {
             &10_000i128,
             &bad_token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::TokenNotWhitelisted);
@@ -1331,6 +1841,7 @@ mod tests {
         let _id = mint_invoice(&t);
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline, &None::<Address>);
             t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
@@ -1342,6 +1853,7 @@ mod tests {
         let _id = mint_invoice(&t);
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline, &None::<Address>);
             t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
@@ -1359,6 +1871,7 @@ mod tests {
             &10_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
@@ -1470,6 +1983,7 @@ mod tests {
             &10_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
@@ -1481,6 +1995,7 @@ mod tests {
         let _id = mint_invoice(&t);
         let past = t.env.ledger().timestamp() - 1;
         let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past, &None::<Address>);
             t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidDueDate);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
@@ -1498,6 +2013,7 @@ mod tests {
             &10_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         assert_eq!(
@@ -1511,6 +2027,7 @@ mod tests {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline, &None::<Address>);
             t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
@@ -1538,6 +2055,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::ComplianceNotAttested);
@@ -1585,6 +2103,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         ).is_ok());
     }
@@ -1610,6 +2129,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         let listing = t.mp.get_listing(&1u64);
@@ -1670,6 +2190,7 @@ mod tests {
             &10_000_000_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
             &None,
         );
         t.env.ledger().set(LedgerInfo {
@@ -2218,5 +2739,430 @@ mod tests {
         let t = deploy();
         let result = t.mp.try_set_referrer_split_bps(&t.admin, &10_001u32);
         assert!(result.is_err());
+    }
+
+    // ── Issue #441: funding_deadline vs due_date buffer ───────────────────────
+
+    /// funding_deadline exactly equal to due_date → rejected (no buffer at all).
+    #[test]
+    fn test_list_invoice_deadline_equals_due_date_rejected() {
+        let t = deploy();
+        let id = mint_invoice(&t); // due_date = now + 60 days
+        let due_date = t.env.ledger().timestamp() + 86_400 * 60;
+        // deadline == due_date → 0 buffer < 3-day minimum
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &due_date,
+            &None::<Address>,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::FundingDeadlineTooCloseToDueDate
+        );
+    }
+
+    /// funding_deadline 1 second before due_date → rejected.
+    #[test]
+    fn test_list_invoice_deadline_one_second_before_due_date_rejected() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let due_date = t.env.ledger().timestamp() + 86_400 * 60;
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &(due_date - 1), // 1 second buffer — less than 3 days
+            &None::<Address>,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::FundingDeadlineTooCloseToDueDate
+        );
+    }
+
+    /// funding_deadline exactly at due_date - buffer → accepted.
+    #[test]
+    fn test_list_invoice_deadline_exactly_at_buffer_boundary_accepted() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let due_date = t.env.ledger().timestamp() + 86_400 * 60;
+        let min_buffer = DEFAULT_MIN_FUNDING_BUFFER; // 3 days
+        // deadline + buffer == due_date → accepted
+        let deadline = due_date - min_buffer;
+        assert!(t.mp.try_list_invoice(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None::<Address>,
+        ).is_ok());
+    }
+
+    /// funding_deadline comfortably before due_date → accepted (existing valid behavior).
+    #[test]
+    fn test_list_invoice_deadline_well_before_due_date_accepted() {
+        let t = deploy();
+        let id = list_one(&t); // deadline = now + 30 days, due_date = now + 60 days
+        let listing = t.mp.get_listing(&id);
+        assert!(listing.is_active);
+    }
+
+    /// Admin can configure the buffer; new buffer is respected.
+    #[test]
+    fn test_set_min_funding_buffer_admin_can_change() {
+        let t = deploy();
+        // Set buffer to 1 day
+        t.mp.set_min_funding_buffer(&t.admin, &86_400u64);
+        assert_eq!(t.mp.get_min_funding_buffer(), 86_400u64);
+
+        // Now a listing with deadline = due_date - 2 days should be accepted
+        let id = mint_invoice(&t);
+        let due_date = t.env.ledger().timestamp() + 86_400 * 60;
+        let deadline = due_date - 2 * 86_400; // 2 days > 1-day buffer
+        assert!(t.mp.try_list_invoice(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None::<Address>,
+        ).is_ok());
+    }
+
+    /// Non-admin cannot change the buffer.
+    #[test]
+    fn test_set_min_funding_buffer_non_admin_rejected() {
+        let t = deploy();
+        let stranger = Address::generate(&t.env);
+        let result = t.mp.try_set_min_funding_buffer(&stranger, &86_400u64);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+    }
+
+    // ── Issue #439: Dutch auction / price decay ───────────────────────────────
+
+    /// list_invoice_with_decay stores a schedule and get_current_price returns start_price before decay begins.
+    #[test]
+    fn test_decay_schedule_price_before_decay_start() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let now = t.env.ledger().timestamp();
+        let due_date = now + 86_400 * 60;
+        let funding_deadline = due_date - DEFAULT_MIN_FUNDING_BUFFER;
+        let decay_start = now + 86_400 * 5;   // decay starts in 5 days
+        let decay_end   = now + 86_400 * 25;  // reaches floor in 25 days
+
+        t.mp.list_invoice_with_decay(
+            &t.seller,
+            &id,
+            &10_000_000_000i128, // start price
+            &10_000_000_000i128, // face value
+            &t.token,
+            &funding_deadline,
+            &None::<Address>,
+            &8_000_000_000i128, // floor price
+            &decay_start,
+            &decay_end,
+        );
+
+        // Before decay_start → price == start_price
+        let price = t.mp.get_current_price(&id);
+        assert_eq!(price, 10_000_000_000i128);
+    }
+
+    /// Price at exactly the mid-point of the decay window is half-way between start and floor.
+    #[test]
+    fn test_decay_schedule_price_at_midpoint() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let now = t.env.ledger().timestamp();
+        let due_date = now + 86_400 * 60;
+        let funding_deadline = due_date - DEFAULT_MIN_FUNDING_BUFFER;
+        let decay_start = now + 1_000;
+        let decay_end   = now + 3_000; // 2000-second window
+
+        t.mp.list_invoice_with_decay(
+            &t.seller,
+            &id,
+            &10_000_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &funding_deadline,
+            &None::<Address>,
+            &8_000_000_000i128, // drop = 2_000_000_000 total
+            &decay_start,
+            &decay_end,
+        );
+
+        // Advance to exactly the mid-point of the window
+        t.env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: now + 2_000, // elapsed=1000 out of 2000
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        // drop = 2_000_000_000 * 1000 / 2000 = 1_000_000_000
+        // price = 10_000_000_000 - 1_000_000_000 = 9_000_000_000
+        let price = t.mp.get_current_price(&id);
+        assert_eq!(price, 9_000_000_000i128);
+    }
+
+    /// After decay_end the price equals the floor.
+    #[test]
+    fn test_decay_schedule_price_after_decay_end_is_floor() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let now = t.env.ledger().timestamp();
+        let due_date = now + 86_400 * 60;
+        let funding_deadline = due_date - DEFAULT_MIN_FUNDING_BUFFER;
+        let decay_start = now + 100;
+        let decay_end   = now + 200;
+
+        t.mp.list_invoice_with_decay(
+            &t.seller,
+            &id,
+            &10_000_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &funding_deadline,
+            &None::<Address>,
+            &7_000_000_000i128,
+            &decay_start,
+            &decay_end,
+        );
+
+        // Advance past decay_end
+        t.env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: now + 300,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        let price = t.mp.get_current_price(&id);
+        assert_eq!(price, 7_000_000_000i128);
+    }
+
+    /// A listing without a decay schedule returns asking_price unchanged (backward compat).
+    #[test]
+    fn test_no_decay_schedule_price_unchanged() {
+        let t = deploy();
+        let id = list_one(&t);
+        let listing = t.mp.get_listing(&id);
+        let price = t.mp.get_current_price(&id);
+        assert_eq!(price, listing.asking_price);
+    }
+
+    /// floor_price >= asking_price → rejected.
+    #[test]
+    fn test_decay_schedule_floor_gte_asking_rejected() {
+        let t = deploy();
+        let id = mint_invoice(&t);
+        let now = t.env.ledger().timestamp();
+        let due_date = now + 86_400 * 60;
+        let funding_deadline = due_date - DEFAULT_MIN_FUNDING_BUFFER;
+        let result = t.mp.try_list_invoice_with_decay(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &funding_deadline,
+            &None::<Address>,
+            &9_500_000_000i128, // floor == asking → invalid
+            &(now + 100),
+            &(now + 200),
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    // ── Issue #440: Reverse-auction bidding ───────────────────────────────────
+
+    /// Helper: list an invoice in bidding mode.
+    fn list_with_bidding(t: &TestEnv, bidding_deadline: u64) -> u64 {
+        let id = mint_invoice(t);
+        let due_date = t.env.ledger().timestamp() + 86_400 * 60;
+        let funding_deadline = due_date - DEFAULT_MIN_FUNDING_BUFFER;
+        t.mp.list_invoice_with_bidding(
+            &t.seller,
+            &id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &funding_deadline,
+            &None::<Address>,
+            &bidding_deadline,
+        );
+        id
+    }
+
+    /// submit_bid succeeds during the bidding window and can be retrieved.
+    #[test]
+    fn test_submit_bid_success() {
+        let t = deploy();
+        let bid_deadline = t.env.ledger().timestamp() + 86_400 * 7; // 7-day window
+        let id = list_with_bidding(&t, bid_deadline);
+
+        let investor = Address::generate(&t.env);
+        assert!(t.mp.try_submit_bid(
+            &investor,
+            &id,
+            &9_000_000_000i128, // bid below asking price
+            &5_000_000_000i128, // amount
+        ).is_ok());
+
+        let bid = t.mp.get_bid(&id, &investor);
+        assert!(bid.is_some());
+        let b = bid.unwrap();
+        assert_eq!(b.bid_price, 9_000_000_000i128);
+        assert_eq!(b.amount, 5_000_000_000i128);
+    }
+
+    /// submit_bid after the bidding window closes → BiddingWindowClosed.
+    #[test]
+    fn test_submit_bid_after_window_closed_rejected() {
+        let t = deploy();
+        let bid_deadline = t.env.ledger().timestamp() + 100;
+        let id = list_with_bidding(&t, bid_deadline);
+
+        // Advance past bidding deadline
+        t.env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: bid_deadline + 1,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_submit_bid(
+            &investor,
+            &id,
+            &9_000_000_000i128,
+            &5_000_000_000i128,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowClosed);
+    }
+
+    /// fund_invoice while bidding window is open → BiddingWindowActive.
+    #[test]
+    fn test_fund_invoice_during_bidding_window_rejected() {
+        let t = deploy();
+        let bid_deadline = t.env.ledger().timestamp() + 86_400 * 7;
+        let id = list_with_bidding(&t, bid_deadline);
+
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_fund_invoice(&investor, &id, &1_000_000i128);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowActive);
+    }
+
+    /// Duplicate bid from same investor → BidAlreadyExists.
+    #[test]
+    fn test_submit_bid_duplicate_rejected() {
+        let t = deploy();
+        let bid_deadline = t.env.ledger().timestamp() + 86_400 * 7;
+        let id = list_with_bidding(&t, bid_deadline);
+
+        let investor = Address::generate(&t.env);
+        t.mp.submit_bid(&investor, &id, &9_000_000_000i128, &5_000_000_000i128);
+        let result = t.mp.try_submit_bid(
+            &investor,
+            &id,
+            &9_000_000_000i128,
+            &5_000_000_000i128,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::BidAlreadyExists);
+    }
+
+    /// bid_price exceeds current_asking_price → InvalidAmount.
+    #[test]
+    fn test_submit_bid_price_above_asking_rejected() {
+        let t = deploy();
+        let bid_deadline = t.env.ledger().timestamp() + 86_400 * 7;
+        let id = list_with_bidding(&t, bid_deadline);
+
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_submit_bid(
+            &investor,
+            &id,
+            &9_500_000_001i128, // > asking_price
+            &5_000_000_000i128,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    /// accept_bids before bidding window closes → BiddingWindowActive.
+    #[test]
+    fn test_accept_bids_before_window_closes_rejected() {
+        let t = deploy();
+        let bid_deadline = t.env.ledger().timestamp() + 86_400 * 7;
+        let id = list_with_bidding(&t, bid_deadline);
+
+        let investor = Address::generate(&t.env);
+        t.mp.submit_bid(&investor, &id, &9_000_000_000i128, &5_000_000_000i128);
+
+        let investors = soroban_sdk::vec![&t.env, investor.clone()];
+        let result = t.mp.try_accept_bids(&t.seller, &id, &investors);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowActive);
+    }
+
+    /// Non-seller/non-admin cannot accept bids.
+    #[test]
+    fn test_accept_bids_stranger_rejected() {
+        let t = deploy();
+        let bid_deadline = t.env.ledger().timestamp() + 100;
+        let id = list_with_bidding(&t, bid_deadline);
+
+        // Advance past bid deadline
+        t.env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: bid_deadline + 1,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        let stranger = Address::generate(&t.env);
+        let investors = soroban_sdk::vec![&t.env, stranger.clone()];
+        let result = t.mp.try_accept_bids(&stranger, &id, &investors);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::Unauthorized);
+    }
+
+    /// submit_bid on a non-bidding listing → BiddingWindowClosed.
+    #[test]
+    fn test_submit_bid_on_non_bidding_listing_rejected() {
+        let t = deploy();
+        let id = list_one(&t); // standard listing (no bidding deadline)
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_submit_bid(
+            &investor,
+            &id,
+            &9_000_000_000i128,
+            &5_000_000_000i128,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowClosed);
     }
 }
