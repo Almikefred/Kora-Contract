@@ -5,6 +5,9 @@
   },
   "auth": [
     [],
+<<<<<<< HEAD:contracts/invoice_nft/test_snapshots/tests/test_initialize_success.1.json
+    []
+=======
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
@@ -24,6 +27,7 @@
         }
       ]
     ]
+>>>>>>> origin/Kora-Contract46:contracts/invoice_nft/test_snapshots/tests/test_migrate_success.1.json
   ],
   "ledger": {
     "protocol_version": 21,
@@ -274,12 +278,19 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
               },
               {
+<<<<<<< HEAD:contracts/invoice_nft/test_snapshots/tests/test_initialize_success.1.json
+                "symbol": "next_id"
+              }
+            ],
+            "data": "void"
+=======
                 "symbol": "migrate"
               }
             ],
             "data": {
               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
             }
+>>>>>>> origin/Kora-Contract46:contracts/invoice_nft/test_snapshots/tests/test_migrate_success.1.json
           }
         }
       },
@@ -297,10 +308,19 @@
                 "symbol": "fn_return"
               },
               {
+<<<<<<< HEAD:contracts/invoice_nft/test_snapshots/tests/test_initialize_success.1.json
+                "symbol": "next_id"
+              }
+            ],
+            "data": {
+              "u64": 1
+            }
+=======
                 "symbol": "migrate"
               }
             ],
             "data": "void"
+>>>>>>> origin/Kora-Contract46:contracts/invoice_nft/test_snapshots/tests/test_migrate_success.1.json
           }
         }
       },
