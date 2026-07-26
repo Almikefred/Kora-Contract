@@ -7,6 +7,7 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     types::{Listing, RiskTier},
     validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of, bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
 
@@ -58,6 +59,10 @@ impl From<CommonError> for MarketplaceError {
         }
     }
 }
+/// Default minimum discount (face_value - asking_price) required to list an
+/// invoice, in basis points of face_value. Admin-configurable via
+/// `set_min_discount_bps`. See docs/marketplace.md.
+const DEFAULT_MIN_DISCOUNT_BPS: u32 = 10;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -85,6 +90,17 @@ pub enum DataKey {
     CancellationRequest(u64),
     /// Set once admin confirms a two-phase cancellation, unlocking claim_refund (#263)
     CancellationConfirmed(u64),
+    /// Legacy individual risk_registry key (never written; present only so
+    /// load_config's legacy migration path can look it up and fail cleanly).
+    RiskRegistry,
+    /// Referrer address recorded at listing time, if any.
+    Referrer(u64),
+    /// Pending two-phase cancellation request (who requested it).
+    CancellationRequest(u64),
+    /// Marks a listing's cancellation as admin-confirmed, unblocking refunds.
+    CancellationConfirmed(u64),
+    /// Minimum discount (bps of face_value) required to list an invoice.
+    MinDiscountBps,
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -127,6 +143,16 @@ impl MarketplaceContract {
         require_valid_fee_bps(fee_bps)?;
         // Write the consolidated Config entry first so that every subsequent
         // load_config call resolves in a single storage lookup.
+        // Referrer splits are disabled at init and opted into later via
+        // set_referrer_split_bps — kept out of the constructor to avoid
+        // widening every deployment call site for a rarely-used feature.
+        let referrer_split_bps: u32 = 0;
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::InvoiceNft, &invoice_nft);
+        env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
         let config = MarketplaceConfig {
             admin: admin.clone(),
             invoice_nft: invoice_nft.clone(),
@@ -180,6 +206,31 @@ impl MarketplaceContract {
     /// Returns the current fee in basis points.
     pub fn get_fee_bps(env: Env) -> Result<u32, MarketplaceError> {
         Ok(Self::load_config(&env)?.fee_bps)
+    }
+
+    /// Update the minimum required discount (face_value - asking_price), in
+    /// basis points of face_value, that a listing must offer. Admin only.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidFeeRate` — `min_discount_bps` > 10 000.
+    pub fn set_min_discount_bps(env: Env, admin: Address, min_discount_bps: u32) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        require_valid_fee_bps(min_discount_bps)?;
+        env.storage().instance().set(&DataKey::MinDiscountBps, &min_discount_bps);
+        Ok(())
+    }
+
+    /// Returns the current minimum discount requirement in basis points.
+    pub fn get_min_discount_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinDiscountBps)
+            .unwrap_or(DEFAULT_MIN_DISCOUNT_BPS)
     }
 
     /// Set a per-risk-tier fee override. Admin only. (#210)
@@ -253,7 +304,8 @@ impl MarketplaceContract {
         }
         env.storage()
             .persistent()
-            .remove(&DataKey::WhitelistedToken(token));
+            .remove(&DataKey::WhitelistedToken(token.clone()));
+        events::token_whitelist_removed(&env, &admin, &token);
         Ok(())
     }
 
@@ -290,6 +342,16 @@ impl MarketplaceContract {
         // asking_price must be strictly less than face_value (discount must exist)
         if asking_price >= face_value {
             return Err(MarketplaceError::InvalidAmount);
+        }
+
+        // Enforce a minimum discount so listings offer investors meaningful yield.
+        let min_discount_bps = Self::get_min_discount_bps(env.clone());
+        let min_discount = bps_of(face_value, min_discount_bps)?;
+        let discount = face_value
+            .checked_sub(asking_price)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        if discount < min_discount {
+            return Err(KoraError::InvalidAmount);
         }
 
         Self::require_whitelisted_token(&env, &token)?;
@@ -704,6 +766,14 @@ impl MarketplaceContract {
             .persistent()
             .get(&DataKey::Listing(invoice_id))
             .ok_or(MarketplaceError::ListingNotFound)
+    pub fn get_listing(env: Env, invoice_id: u64) -> Result<Listing, KoraError> {
+        let listing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Listing(invoice_id))
+            .ok_or(KoraError::ListingNotFound)?;
+        Self::bump_listing(&env, invoice_id);
+        Ok(listing)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -776,6 +846,29 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::Config)
             .ok_or(MarketplaceError::NotInitialized)
+            .get(&DataKey::FeeBps)
+            .ok_or(KoraError::NotInitialized)?;
+        // risk_registry was never part of the legacy per-key storage format —
+        // contracts still on that format must be re-initialized to consolidate
+        // into `Config` before risk_registry-dependent calls can succeed.
+        let risk_registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RiskRegistry)
+            .ok_or(KoraError::NotInitialized)?;
+
+        let config = MarketplaceConfig {
+            admin,
+            invoice_nft,
+            financing_pool,
+            treasury,
+            access_control,
+            risk_registry,
+            fee_bps,
+            referrer_split_bps: 0,
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
+        Ok(config)
     }
 
     /// NOTE: `DataKey::AccessControl` is read directly (not from inside Config) so this
@@ -859,6 +952,9 @@ mod tests {
 
     fn deploy() -> TestEnv {
         let env = Env::default();
+        // add_verifier's stake transfer requires verifier.require_auth() from
+        // inside a nested call (risk_registry -> token), which isn't tied to
+        // the root invocation — plain mock_all_auths() rejects that.
         env.mock_all_auths_allowing_non_root_auth();
 
         env.ledger().set(LedgerInfo {
@@ -873,7 +969,14 @@ mod tests {
         });
 
         let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
+        let treasury_id = env.register_contract(None, kora_treasury::TreasuryContract);
+        let treasury_client = kora_treasury::TreasuryContractClient::new(&env, &treasury_id);
+        treasury_client.initialize(&admin, &50u32);
+        let treasury = treasury_id;
+
+        let ac_id = env.register_contract(None, AccessControlContract);
+        let ac_client = kora_access_control::AccessControlContractClient::new(&env, &ac_id);
+        ac_client.initialize(&admin);
 
         let ac_id = env.register_contract(None, AccessControlContract);
 
@@ -891,6 +994,8 @@ mod tests {
         let registry = registry_id.clone();
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&env, &registry_id);
         let staking_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_admin = Address::generate(&env);
+        let staking_token = env.register_stellar_asset_contract_v2(token_admin).address();
         registry_client.initialize(&admin, &nft_id, &staking_token, &1_000_000i128, &5_000u32);
 
         let mp_id = env.register_contract(None, MarketplaceContract);
@@ -900,14 +1005,20 @@ mod tests {
         // Register marketplace and pool as authorized callers on the NFT contract (#209)
         nft.set_authorized_callers(&admin, &mp_id, &pool_id);
 
-        let token = Address::generate(&env);
+        let token_issuer = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_issuer).address();
         mp.whitelist_token(&admin, &token);
+        treasury_client.whitelist_token(&admin, &token);
 
         let seller = Address::generate(&env);
 
         // Default seller must be compliance-attested for list_invoice to succeed.
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        // list_invoice requires the seller to be a compliance-attested SME.
+        let verifier = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token)
+            .mint(&verifier, &1_000_000i128);
         registry_client.add_verifier(&admin, &verifier, &1_000_000i128);
         registry_client.register_sme(&verifier, &seller, &50u32, &true);
 
@@ -931,6 +1042,8 @@ mod tests {
             &due_date,
             &ipfs_cid,
             &30u32, &None,
+            &30u32,
+            &None,
         )
     }
 
@@ -1104,6 +1217,73 @@ mod tests {
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::NotAdmin);
     }
 
+    // ── remove_token_whitelist ────────────────────────────────────────────────
+
+    #[test]
+    fn test_remove_token_whitelist_success() {
+        let t = deploy();
+        let new_token = Address::generate(&t.env);
+        t.mp.whitelist_token(&t.admin, &new_token);
+        assert!(t.mp.is_token_whitelisted(&new_token));
+        t.mp.remove_token_whitelist(&t.admin, &new_token);
+        assert!(!t.mp.is_token_whitelisted(&new_token));
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_non_admin_rejected() {
+        let t = deploy();
+        let stranger = Address::generate(&t.env);
+        let new_token = Address::generate(&t.env);
+        t.mp.whitelist_token(&t.admin, &new_token);
+        let result = t.mp.try_remove_token_whitelist(&stranger, &new_token);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+        assert!(t.mp.is_token_whitelisted(&new_token));
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_not_whitelisted_rejected() {
+        let t = deploy();
+        let new_token = Address::generate(&t.env);
+        let result = t.mp.try_remove_token_whitelist(&t.admin, &new_token);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_blocks_new_listing() {
+        let t = deploy();
+        // t.token is whitelisted by deploy(); remove it, then listing must fail.
+        t.mp.remove_token_whitelist(&t.admin, &t.token);
+        assert!(!t.mp.is_token_whitelisted(&t.token));
+
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_000i128,
+            &10_000i128,
+            &t.token,
+            &deadline,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
+    }
+
+    #[test]
+    fn test_remove_token_whitelist_existing_listing_unaffected() {
+        let t = deploy();
+        let id = list_one(&t);
+        // Remove the whitelist for the token used by the already-created listing.
+        t.mp.remove_token_whitelist(&t.admin, &t.token);
+        assert!(!t.mp.is_token_whitelisted(&t.token));
+
+        // The existing listing must remain funded-able despite the removal.
+        let listing = t.mp.get_listing(&id);
+        assert!(listing.is_active);
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_fund_invoice(&investor, &id, &1_000_000i128);
+        assert!(result.is_ok());
+    }
+
     // ── list_invoice ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1153,6 +1333,7 @@ mod tests {
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
     #[test]
@@ -1163,6 +1344,7 @@ mod tests {
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
     #[test]
@@ -1180,6 +1362,100 @@ mod tests {
             &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
+    }
+
+    // ── minimum discount enforcement ──────────────────────────────────────────
+
+    #[test]
+    fn test_list_invoice_discount_below_minimum_rejected() {
+        let t = deploy();
+        // mint_invoice() always mints a face value of 10_000_000_000.
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        // face_value = 10_000_000_000, default min_discount_bps = 10 →
+        // min_discount = 10_000_000. A discount of 9_999_999 (asking_price =
+        // 9_990_000_001) is one below the minimum.
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_990_000_001i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_list_invoice_discount_exact_minimum_accepted() {
+        let t = deploy();
+        // mint_invoice() always mints a face value of 10_000_000_000.
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        // face_value = 10_000_000_000, default min_discount_bps = 10 →
+        // min_discount = 10_000_000. A discount of exactly 10_000_000
+        // (asking_price = 9_990_000_000) must be accepted.
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_990_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_list_invoice_valid_discount_accepted() {
+        let t = deploy();
+        let id = list_one(&t);
+        let listing = t.mp.get_listing(&id);
+        assert!(listing.is_active);
+        assert_eq!(listing.asking_price, 9_500_000_000i128);
+    }
+
+    #[test]
+    fn test_set_min_discount_bps_enforced_on_next_listing() {
+        let t = deploy();
+        // Raise the minimum discount to 10% (1_000 bps); a 5% discount must
+        // now be rejected even though it passed under the default 10 bps.
+        t.mp.set_min_discount_bps(&t.admin, &1_000u32);
+        let _id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        let result = t.mp.try_list_invoice(
+            &t.seller,
+            &1u64,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+            &None,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_set_min_discount_bps_non_admin_rejected() {
+        let t = deploy();
+        let stranger = Address::generate(&t.env);
+        let result = t.mp.try_set_min_discount_bps(&stranger, &1_000u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_min_discount_bps_over_10000_rejected() {
+        let t = deploy();
+        let result = t.mp.try_set_min_discount_bps(&t.admin, &10_001u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_min_discount_bps_defaults_to_ten() {
+        let t = deploy();
+        assert_eq!(t.mp.get_min_discount_bps(), 10u32);
     }
 
     #[test]
@@ -1207,6 +1483,7 @@ mod tests {
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidDueDate);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
 
     #[test]
@@ -1236,6 +1513,7 @@ mod tests {
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
     #[test]
@@ -1244,6 +1522,8 @@ mod tests {
         let verifier = Address::generate(&t.env);
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&t.env, &t.registry);
         mint_stake(&t.env, &t.staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.staking_token)
+            .mint(&verifier, &1_000_000i128);
         registry_client.add_verifier(&t.admin, &verifier, &1_000_000i128);
 
         let unattested_seller = Address::generate(&t.env);
@@ -1269,6 +1549,8 @@ mod tests {
         let verifier = Address::generate(&t.env);
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&t.env, &t.registry);
         mint_stake(&t.env, &t.staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.staking_token)
+            .mint(&verifier, &1_000_000i128);
         registry_client.add_verifier(&t.admin, &verifier, &1_000_000i128);
 
         let attested_seller = Address::generate(&t.env);
@@ -1291,6 +1573,8 @@ mod tests {
                 &due_date,
                 &ipfs_cid,
                 &30u32, &None,
+                &30u32,
+                &None,
             )
         };
 
@@ -1449,6 +1733,10 @@ mod tests {
         let id = list_one(&t);
         let inv1 = Address::generate(&t.env);
         let inv2 = Address::generate(&t.env);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&inv1, &5_000_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&inv2, &4_500_000_000i128);
 
         // First funding: 5B
         t.mp.fund_invoice(&inv1, &id, &5_000_000_000i128);
@@ -1598,6 +1886,8 @@ mod tests {
         let id = list_one(&t);
         let investor = Address::generate(&t.env);
         let partial_amount = 2_000_000_000i128;
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&investor, &partial_amount);
 
         // Investor funds the listing partially
         t.mp.fund_invoice(&investor, &id, &partial_amount);
@@ -1894,7 +2184,9 @@ mod tests {
         let t = deploy();
         let id = list_with_referrer(&t, None);
         let investor = Address::generate(&t.env);
-        assert!(t.mp.try_fund_invoice(&investor, &id, &10_000_000i128).is_ok());
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&investor, &10_000_000i128);
+        t.mp.fund_invoice(&investor, &id, &10_000_000i128);
     }
 
     #[test]
@@ -1908,6 +2200,8 @@ mod tests {
         let referrer = Address::generate(&t.env);
         let id = list_with_referrer(&t, Some(referrer));
         let investor = Address::generate(&t.env);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&investor, &10_000_000i128);
         assert!(t.mp.try_fund_invoice(&investor, &id, &10_000_000i128).is_ok());
     }
 

@@ -175,6 +175,32 @@ impl RiskRegistryContract {
         Ok(())
     }
 
+    /// Set (or update) the authorized `invoice_nft` contract address. Admin only.
+    ///
+    /// Called after deployment to wire up the `increment_invoice_count` integration,
+    /// or again if `invoice_nft` is redeployed.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `invoice_nft` — The deployed `invoice_nft` contract address.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAddress` — `invoice_nft` is the contract's own address.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Idempotent — safe to call again if
+    /// the invoice_nft contract is redeployed.
+    pub fn set_invoice_nft(env: Env, admin: Address, invoice_nft: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        kora_shared::validation::require_not_self(&env, &invoice_nft)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvoiceNft, &invoice_nft);
+        Self::bump_persistent(&env, &DataKey::InvoiceNft);
+        Ok(())
+    }
+
     // ── Verifier management ───────────────────────────────────────────────────
 
     /// Admin adds a trusted verifier with required staking deposit.
@@ -1055,12 +1081,26 @@ mod tests {
         // root `add_verifier` call). Plain `mock_all_auths()` only auto-satisfies
         // auth requirements tied to the root invocation, so this test setup
         // needs the non-root variant.
+        testutils::{Address as _, Events as _, Ledger, LedgerInfo},
+        Bytes, Env,
+    };
+
+    /// Returns (env, admin, invoice_nft, staking_token, client). `staking_token`
+    /// is a real deployed Stellar asset contract so `add_verifier`'s stake
+    /// transfer has a genuine contract instance to call into.
+    fn setup() -> (Env, Address, Address, Address, RiskRegistryContractClient<'static>) {
+        let env = Env::default();
+        // add_verifier's stake transfer requires verifier.require_auth() from
+        // inside a nested call (risk_registry -> token), which isn't tied to
+        // the root invocation — plain mock_all_auths() rejects that.
         env.mock_all_auths_allowing_non_root_auth();
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let invoice_nft = Address::generate(&env);
         let staking_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_admin = Address::generate(&env);
+        let staking_token = env.register_stellar_asset_contract_v2(token_admin).address();
         client.initialize(&admin, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32);
         (env, admin, invoice_nft, staking_token, client)
     }
@@ -1117,6 +1157,8 @@ mod tests {
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         assert!(client.try_add_verifier(&admin, &verifier, &1_000_000i128).is_ok());
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.is_verifier(&verifier));
     }
 
@@ -1126,6 +1168,7 @@ mod tests {
         let stranger = Address::generate(&env);
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         assert!(client.try_add_verifier(&stranger, &verifier, &1_000_000i128).is_err());
     }
 
@@ -1134,6 +1177,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.is_verifier(&verifier));
         assert!(client.try_remove_verifier(&admin, &verifier).is_ok());
@@ -1146,6 +1190,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let stranger = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.try_remove_verifier(&stranger, &verifier).is_err());
     }
@@ -1167,6 +1212,9 @@ mod tests {
         mint_stake(&env, &staking_token, &v1, 1_000_000i128);
         client.add_verifier(&admin, &v1, &1_000_000i128);
         mint_stake(&env, &staking_token, &v2, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&v1, &1_000_000i128);
+        client.add_verifier(&admin, &v1, &1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&v2, &1_000_000i128);
         client.add_verifier(&admin, &v2, &1_000_000i128);
         client.register_sme(&v1, &sme1, &30u32, &true);
         client.register_sme(&v2, &sme2, &60u32, &true);
@@ -1184,6 +1232,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         assert!(client.is_verified_sme(&sme));
@@ -1202,6 +1251,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         assert!(client.try_register_sme(&verifier, &sme, &50u32, &true).is_err());
@@ -1221,6 +1271,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.try_register_sme(&verifier, &sme, &101u32, &true).is_err());
     }
@@ -1231,6 +1282,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         let _ = client.try_register_sme(&verifier, &sme, &99u32, &true);
@@ -1244,6 +1296,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &true);
         let profile = client.get_sme_profile(&sme);
@@ -1257,6 +1310,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &false);
         let profile = client.get_sme_profile(&sme);
@@ -1272,6 +1326,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         client.update_sme_score(&verifier, &sme, &50u32);
@@ -1284,6 +1339,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
             .try_update_sme_score(&verifier, &sme, &50u32)
@@ -1296,6 +1352,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         assert!(client
@@ -1309,6 +1366,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &true);
         client.update_sme_score(&verifier, &sme, &0u32);
@@ -1325,6 +1383,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         assert_eq!(client.get_sme_profile(&sme).total_invoices, 0);
@@ -1338,6 +1397,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         for i in 1u32..=5 {
@@ -1353,6 +1413,7 @@ mod tests {
         let sme = Address::generate(&env);
         let stranger = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         assert!(client.try_increment_invoice_count(&stranger, &sme).is_err());
@@ -1375,6 +1436,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         assert_eq!(client.get_sme_profile(&sme).defaults, 0);
@@ -1389,6 +1451,7 @@ mod tests {
         let sme = Address::generate(&env);
         let stranger = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         assert!(client.try_record_default(&stranger, &sme).is_err());
@@ -1407,6 +1470,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         client.record_default(&admin, &sme);
@@ -1423,6 +1487,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.set_debtor_score(&verifier, &debtor_hash, &45u32);
         assert_eq!(client.get_debtor_score(&debtor_hash), 45u32);
@@ -1434,6 +1499,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
             .try_set_debtor_score(&verifier, &debtor_hash, &101u32)
@@ -1446,6 +1512,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let empty_hash = Bytes::from_slice(&env, &[]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
             .try_set_debtor_score(&verifier, &empty_hash, &50u32)
@@ -1458,6 +1525,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let hash = Bytes::from_slice(&env, &[0xABu8; 32]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.try_set_debtor_score(&verifier, &hash, &50u32).is_ok());
     }
@@ -1468,6 +1536,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let hash = Bytes::from_slice(&env, &[0xABu8; 31]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
         assert_eq!(result.unwrap_err().unwrap(), RiskRegistryError::InvalidLength);
@@ -1479,6 +1548,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let hash = Bytes::from_slice(&env, &[0xABu8; 33]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
         assert_eq!(result.unwrap_err().unwrap(), RiskRegistryError::InvalidLength);
@@ -1506,6 +1576,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let hash0 = Bytes::from_slice(&env, &[0x01u8; 32]);
         client.set_debtor_score(&verifier, &hash0, &0u32);
@@ -1542,6 +1613,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let sme0 = Address::generate(&env);
         client.register_sme(&verifier, &sme0, &0u32, &true);
@@ -1562,6 +1634,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(!env.events().all().is_empty());
     }
@@ -1570,7 +1643,7 @@ mod tests {
     fn test_remove_verifier_emits_event() {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
-        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let events_before = env.events().all().len();
         client.remove_verifier(&admin, &verifier);
@@ -1583,6 +1656,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         let events_before = env.events().all().len();
         client.register_sme(&verifier, &sme, &42u32, &true);
@@ -1595,6 +1669,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &35u32, &true);
         let events_before = env.events().all().len();
@@ -1612,6 +1687,7 @@ mod tests {
         // staking token), so no funding is required here — but mint first anyway
         // so `events_before` is captured only after unrelated setup activity.
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         let events_before = env.events().all().len();
         let _ = client.try_add_verifier(&stranger, &verifier, &1_000_000i128);
         let _ = client.try_register_sme(&stranger, &verifier, &50u32, &true);
@@ -1625,6 +1701,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &80u32, &true);
         client.record_default(&admin, &sme);
@@ -1644,6 +1721,13 @@ mod tests {
         let invoice_nft = Address::generate(&env);
         let staking_token = Address::generate(&env);
         let result = client.try_initialize(&contract_id, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32);
+        let result = client.try_initialize(
+            &contract_id,
+            &invoice_nft,
+            &staking_token,
+            &1_000_000i128,
+            &5_000u32,
+        );
         assert!(result.is_err());
     }
 
@@ -1652,6 +1736,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let contract_id = client.address.clone();
         mint_stake(&env, &staking_token, &contract_id, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&contract_id, &1_000_000i128);
         let result = client.try_add_verifier(&admin, &contract_id, &1_000_000i128);
         assert!(result.is_err());
     }
@@ -1675,6 +1760,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &50u32, &true);
         // Score 0 is valid (lowest risk tier boundary).
@@ -1692,6 +1778,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xAAu8; 32]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.set_debtor_score(&verifier, &debtor_hash, &30u32);
         assert_eq!(client.get_debtor_score(&debtor_hash), 30);
@@ -1716,6 +1803,7 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         // A verifier registering themselves as an SME is permitted (no rule
         // prevents it). The test ensures it doesn't panic / silently fail.
@@ -1733,6 +1821,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.register_sme(&verifier, &sme, &40u32, &true);
         client.remove_verifier(&admin, &verifier);
@@ -1750,6 +1839,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         // Score 0 is valid: AAA tier.
         assert!(client.try_register_sme(&verifier, &sme, &0u32, &true).is_ok());
@@ -1776,6 +1866,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xBBu8; 32]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client
             .try_set_debtor_score(&verifier, &debtor_hash, &40u32)
@@ -1790,6 +1881,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xCCu8; 32]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         client.set_debtor_score(&verifier, &debtor_hash, &40u32);
         // Advance time by one second less than the cooldown — still blocked.
@@ -1812,6 +1904,7 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xDDu8; 32]);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
         client.add_verifier(&admin, &verifier, &1_000_000i128);
         // First update at t=0.
         client.set_debtor_score(&verifier, &debtor_hash, &40u32);
@@ -1836,6 +1929,9 @@ mod tests {
         mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
         client.add_verifier(&admin, &verifier_a, &1_000_000i128);
         mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier_a, &1_000_000i128);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier_b, &1_000_000i128);
         client.add_verifier(&admin, &verifier_b, &1_000_000i128);
         // verifier_a sets the score; its cooldown now ticks.
         client.set_debtor_score(&verifier_a, &debtor_hash, &40u32);

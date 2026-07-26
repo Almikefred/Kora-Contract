@@ -105,6 +105,24 @@ pub struct Pool {
     pub penalty_applied: bool,
 }
 
+/// A single scheduled installment within an `InstallmentSchedule`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Installment {
+    pub amount: i128,
+    pub due_date: u64,
+    pub paid: bool,
+}
+
+/// An ordered repayment schedule attached to a pool. `next_index` points at
+/// the next unpaid installment in `installments`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InstallmentSchedule {
+    pub installments: Vec<Installment>,
+    pub next_index: u32,
+}
+
 /// An active offer to sell an investor position on the secondary market
 #[contracttype]
 #[derive(Clone, Debug)]
