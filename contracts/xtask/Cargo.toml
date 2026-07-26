@@ -1,0 +1,9 @@
+[package]
+name = "kora-xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "check-error-variants"
+path = "src/main.rs"
