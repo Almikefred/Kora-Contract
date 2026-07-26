@@ -60,6 +60,8 @@ pub enum KoraError {
     DebtorNotRegistered = 51,
     RiskScoreOutOfRange = 52,
     ComplianceNotAttested = 53,
+    // SME profile exists but has not been marked `verified` by a risk_registry verifier
+    SMENotVerified = 54,
 
     // General
     ArithmeticOverflow = 90,
