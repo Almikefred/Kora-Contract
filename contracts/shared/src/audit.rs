@@ -39,6 +39,18 @@ pub enum AdminActionType {
     ExecuteWithdrawalCap,
     TreasuryProposeUpgrade,
     TreasuryExecuteUpgrade,
+    // ── Treasury: recipient allowlist (#457) ────────────────────────────────
+    ProposeRecipient,
+    ExecuteRecipient,
+    // ── Treasury: insurance/loss reserve (#458) ─────────────────────────────
+    SetReserveAllocation,
+    SetReserveCaller,
+    DisburseFromReserve,
+    // ── Treasury: multisig quorum gate (#455) ───────────────────────────────
+    SetAccessControl,
+    ProposeTreasuryAction,
+    ApproveTreasuryAction,
+    ExecuteTreasuryAction,
     // ── RiskRegistry ─────────────────────────────────────────────────────────
     AddVerifier,
     RemoveVerifier,
@@ -62,4 +74,9 @@ pub struct AdminAuditEntry {
     pub action: AdminActionType,
     /// Contract that originated the action.
     pub source: AuditSource,
+    /// Token involved in the action, when financially meaningful (e.g. `withdraw`'s token).
+    pub token: Option<Address>,
+    /// Amount involved in the action, when financially meaningful (e.g. withdrawn amount,
+    /// new fee bps, new withdrawal cap). `None` for actions with no natural amount.
+    pub amount: Option<i128>,
 }

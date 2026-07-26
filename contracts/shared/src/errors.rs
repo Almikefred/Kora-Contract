@@ -70,8 +70,6 @@ pub enum KoraError {
     NotInitialized = 96,
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
-    // Field value exceeds the allowed maximum length
-    FieldTooLong = 102,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
@@ -94,4 +92,28 @@ pub enum KoraError {
     // Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+    // Multisig (B2) — referenced by access_control but previously undefined; restored.
+    InvalidThreshold = 120,
+    ProposalNotFound = 121,
+    ProposalAlreadyExecuted = 122,
+    ProposalExpired = 123,
+    AlreadyApproved = 124,
+    ThresholdNotMet = 125,
+    MultisigNotConfigured = 126,
+    SignerNotFound = 127,
+    // Previously undefined but referenced elsewhere; restored.
+    CreditLimitExceeded = 128,
+    CurrencyNotAllowed = 129,
+    NotInvoiceOwner = 130,
+    // Treasury — recipient allowlist/timelock (#457)
+    RecipientNotAllowed = 131,
+    NoRecipientProposed = 132,
+    RecipientTimelockNotElapsed = 133,
+    // Treasury — insurance/loss reserve (#458)
+    ReserveCallerNotAuthorized = 134,
+    InsufficientReserveBalance = 135,
+    // Treasury — multisig quorum gate (#455)
+    /// A highest-risk function was called directly while a multisig with threshold > 1
+    /// is configured — callers must use propose/approve/execute_treasury_action instead.
+    QuorumRequired = 136,
 }

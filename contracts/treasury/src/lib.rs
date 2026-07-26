@@ -1,13 +1,21 @@
 #![no_std]
 
+use kora_access_control::AccessControlContractClient;
 use kora_shared::{
     audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
-    validation::{require_valid_fee_bps, require_within_max_amount, UPGRADE_TIMELOCK_DELAY},
+    types::MultisigConfig,
+    validation::{
+        bps_of, require_not_self, require_valid_fee_bps, require_within_max_amount,
+        UPGRADE_TIMELOCK_DELAY,
+    },
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
+
+/// TTL for treasury multisig proposals — mirrors access_control's PROPOSAL_TTL_LEDGERS (~7 days).
+const TREASURY_PROPOSAL_TTL: u64 = 604_800;
 
 // ── Storage TTL constants (~31 days in ledgers) ───────────────────────────────
 const PERSISTENT_BUMP_AMOUNT: u32 = 535_680;
@@ -47,6 +55,50 @@ pub enum DataKey {
     AuditLogTotal,
     /// An audit log entry at ring-buffer position `n`.
     AuditEntry(u64),
+    // ── Recipient allowlist (#457) ───────────────────────────────────────────
+    /// Whether `recipient` is a matured, allowed withdrawal destination.
+    AllowedRecipient(Address),
+    /// Pending recipient proposal: (recipient is implicit in the key, proposed_at timestamp).
+    RecipientProposal(Address),
+    // ── Insurance / loss reserve (#458) ──────────────────────────────────────
+    /// Whether `caller` (typically a `financing_pool` deployment) may call `disburse_from_reserve`.
+    AuthorizedReserveCaller(Address),
+    /// Reserve balance earmarked per token — a subset of the live token balance,
+    /// excluded from `withdraw`/`emergency_withdraw`.
+    ReserveBalance(Address),
+    /// Portion (bps) of every newly `collect_fee`'d amount routed into the reserve.
+    ReserveAllocationBps,
+    // ── Multisig quorum gate (#455) ──────────────────────────────────────────
+    /// The `access_control` contract treasury checks for multisig configuration.
+    AccessControl,
+    /// Monotonic counter for the next treasury proposal id.
+    NextTreasuryProposalId,
+    /// A pending treasury multisig proposal, keyed by proposal id.
+    TreasuryProposal(u64),
+}
+
+/// A highest-risk treasury action gated behind `access_control`'s multisig quorum
+/// once one is configured (see `set_access_control`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TreasuryAction {
+    Withdraw(Address, Address, i128),
+    EmergencyWithdraw(Address, Address),
+    SetFeeBps(u32),
+    ProposeUpgrade(BytesN<32>),
+}
+
+/// A pending treasury action proposal awaiting multisig quorum.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TreasuryProposal {
+    pub id: u64,
+    pub action: TreasuryAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+    pub created_at: u64,
+    pub expires_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -111,6 +163,11 @@ impl TreasuryContract {
     pub fn set_fee_bps(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_no_quorum_required(&env)?;
+        Self::do_set_fee_bps(&env, &admin, fee_bps)
+    }
+
+    fn do_set_fee_bps(env: &Env, admin: &Address, fee_bps: u32) -> Result<(), KoraError> {
         require_valid_fee_bps(fee_bps)?;
 
         let old_bps: u32 = env
@@ -120,10 +177,16 @@ impl TreasuryContract {
             .unwrap_or(50);
 
         env.storage().persistent().set(&DataKey::FeeBps, &fee_bps);
-        Self::bump_persistent(&env, &DataKey::FeeBps);
+        Self::bump_persistent(env, &DataKey::FeeBps);
 
-        events::fee_rate_updated(&env, &admin, old_bps, fee_bps);
-        Self::append_audit_entry(&env, &admin, AdminActionType::SetFeeBps);
+        events::fee_rate_updated(env, admin, old_bps, fee_bps);
+        Self::append_audit_entry(
+            env,
+            admin,
+            AdminActionType::SetFeeBps,
+            None,
+            Some(fee_bps as i128),
+        );
         Ok(())
     }
 
@@ -149,7 +212,13 @@ impl TreasuryContract {
         Self::bump_persistent(&env, &DataKey::WhitelistedToken(token.clone()));
 
         events::token_whitelisted(&env, &admin, &token);
-        Self::append_audit_entry(&env, &admin, AdminActionType::WhitelistToken);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::WhitelistToken,
+            Some(token),
+            None,
+        );
         Ok(())
     }
 
@@ -183,6 +252,27 @@ impl TreasuryContract {
         env.storage().persistent().set(&key, &new_total);
         Self::bump_persistent(&env, &key);
 
+        // Earmark a configurable portion of the incoming fee as a loss reserve,
+        // distinct from the freely admin-withdrawable balance (#458).
+        let reserve_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReserveAllocationBps)
+            .unwrap_or(0);
+        if reserve_bps > 0 {
+            let reserve_cut = bps_of(amount, reserve_bps)?;
+            if reserve_cut > 0 {
+                let reserve_key = DataKey::ReserveBalance(token.clone());
+                let current_reserve: i128 =
+                    env.storage().persistent().get(&reserve_key).unwrap_or(0);
+                let new_reserve = current_reserve
+                    .checked_add(reserve_cut)
+                    .ok_or(KoraError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&reserve_key, &new_reserve);
+                Self::bump_persistent(&env, &reserve_key);
+            }
+        }
+
         events::fee_collected(&env, &env.current_contract_address(), 0, amount, &token);
         Ok(())
     }
@@ -212,23 +302,41 @@ impl TreasuryContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), KoraError> {
-        // ── Checks ────────────────────────────────────────────────────────────
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_no_quorum_required(&env)?;
+        Self::do_withdraw(&env, &admin, &token, &recipient, amount)
+    }
+
+    fn do_withdraw(
+        env: &Env,
+        admin: &Address,
+        token: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Result<(), KoraError> {
+        // ── Checks ────────────────────────────────────────────────────────────
         if amount <= 0 {
             return Err(KoraError::InvalidAmount);
         }
         require_within_max_amount(amount)?;
-        Self::require_whitelisted_token(&env, &token)?;
-        Self::enforce_rate_limit(&env, amount)?;
+        Self::require_whitelisted_token(env, token)?;
+        Self::require_allowed_recipient(env, recipient)?;
+        Self::enforce_rate_limit(env, amount)?;
 
         // Acquire reentrancy guard — released automatically when _guard drops
-        let _guard = ReentrancyGuard::new(&env)?;
+        let _guard = ReentrancyGuard::new(env)?;
 
-        let token_client = token::Client::new(&env, &token);
+        let token_client = token::Client::new(env, token);
         let balance = token_client.balance(&env.current_contract_address());
+        let reserved: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReserveBalance(token.clone()))
+            .unwrap_or(0);
+        let spendable = balance.saturating_sub(reserved);
 
-        if balance < amount {
+        if spendable < amount {
             return Err(KoraError::InsufficientPoolBalance);
         }
 
@@ -241,15 +349,21 @@ impl TreasuryContract {
         {
             let new_collected = collected.saturating_sub(amount);
             env.storage().persistent().set(&collected_key, &new_collected);
-            Self::bump_persistent(&env, &collected_key);
+            Self::bump_persistent(env, &collected_key);
         }
-        Self::record_withdrawal(&env, amount);
+        Self::record_withdrawal(env, amount);
 
         // ── Interactions ──────────────────────────────────────────────────────
-        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+        token_client.transfer(&env.current_contract_address(), recipient, &amount);
 
-        events::fee_withdrawn(&env, &admin, &token, amount);
-        Self::append_audit_entry(&env, &admin, AdminActionType::Withdraw);
+        events::fee_withdrawn(env, admin, token, amount);
+        Self::append_audit_entry(
+            env,
+            admin,
+            AdminActionType::Withdraw,
+            Some(token.clone()),
+            Some(amount),
+        );
         Ok(())
     }
 
@@ -275,18 +389,41 @@ impl TreasuryContract {
     ) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        Self::require_whitelisted_token(&env, &token)?;
+        Self::require_no_quorum_required(&env)?;
+        Self::do_emergency_withdraw(&env, &admin, &token, &recipient)
+    }
 
-        let _guard = ReentrancyGuard::new(&env)?;
+    fn do_emergency_withdraw(
+        env: &Env,
+        admin: &Address,
+        token: &Address,
+        recipient: &Address,
+    ) -> Result<(), KoraError> {
+        Self::require_whitelisted_token(env, token)?;
+        Self::require_allowed_recipient(env, recipient)?;
 
-        let token_client = token::Client::new(&env, &token);
+        let _guard = ReentrancyGuard::new(env)?;
+
+        let token_client = token::Client::new(env, token);
         let balance = token_client.balance(&env.current_contract_address());
+        let reserved: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReserveBalance(token.clone()))
+            .unwrap_or(0);
+        let spendable = balance.saturating_sub(reserved);
 
-        if balance > 0 {
-            token_client.transfer(&env.current_contract_address(), &recipient, &balance);
-            events::emergency_withdrawn(&env, &admin, &token, balance);
+        if spendable > 0 {
+            token_client.transfer(&env.current_contract_address(), recipient, &spendable);
+            events::emergency_withdrawn(env, admin, token, spendable);
         }
-        Self::append_audit_entry(&env, &admin, AdminActionType::EmergencyWithdraw);
+        Self::append_audit_entry(
+            env,
+            admin,
+            AdminActionType::EmergencyWithdraw,
+            Some(token.clone()),
+            Some(spendable),
+        );
         Ok(())
     }
 
@@ -318,7 +455,13 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::WithdrawalCapProposal, &(new_cap, env.ledger().timestamp()));
         events::withdrawal_cap_proposed(&env, &admin, new_cap);
-        Self::append_audit_entry(&env, &admin, AdminActionType::ProposeWithdrawalCap);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::ProposeWithdrawalCap,
+            None,
+            Some(new_cap),
+        );
         Ok(())
     }
 
@@ -360,7 +503,13 @@ impl TreasuryContract {
             .instance()
             .remove(&DataKey::WithdrawalCapProposal);
         events::withdrawal_cap_updated(&env, &admin, old_cap, new_cap);
-        Self::append_audit_entry(&env, &admin, AdminActionType::ExecuteWithdrawalCap);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::ExecuteWithdrawalCap,
+            None,
+            Some(new_cap),
+        );
         Ok(())
     }
 
@@ -456,11 +605,27 @@ impl TreasuryContract {
     ) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
-        events::upgrade_proposed(&env, &admin, &new_wasm_hash);
-        Self::append_audit_entry(&env, &admin, AdminActionType::TreasuryProposeUpgrade);
+        Self::require_no_quorum_required(&env)?;
+        Self::do_propose_upgrade(&env, &admin, &new_wasm_hash)
+    }
+
+    fn do_propose_upgrade(
+        env: &Env,
+        admin: &Address,
+        new_wasm_hash: &BytesN<32>,
+    ) -> Result<(), KoraError> {
+        env.storage().instance().set(
+            &DataKey::UpgradeProposal,
+            &(new_wasm_hash.clone(), env.ledger().timestamp()),
+        );
+        events::upgrade_proposed(env, admin, new_wasm_hash);
+        Self::append_audit_entry(
+            env,
+            admin,
+            AdminActionType::TreasuryProposeUpgrade,
+            None,
+            None,
+        );
         Ok(())
     }
 
@@ -488,7 +653,13 @@ impl TreasuryContract {
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         events::upgrade_executed(&env, &admin, &wasm_hash);
-        Self::append_audit_entry(&env, &admin, AdminActionType::TreasuryExecuteUpgrade);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::TreasuryExecuteUpgrade,
+            None,
+            None,
+        );
         env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
     }
@@ -534,6 +705,401 @@ impl TreasuryContract {
         results
     }
 
+    // ── Recipient allowlist (#457) ───────────────────────────────────────────
+
+    /// Propose a new allowed withdrawal recipient. Takes effect after
+    /// `UPGRADE_TIMELOCK_DELAY` (24 h), mirroring `propose_withdrawal_cap`.
+    ///
+    /// **Security:** Requires `admin.require_auth()`.
+    pub fn propose_recipient(env: Env, admin: Address, recipient: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().set(
+            &DataKey::RecipientProposal(recipient.clone()),
+            &env.ledger().timestamp(),
+        );
+        Self::bump_persistent(&env, &DataKey::RecipientProposal(recipient.clone()));
+        events::recipient_proposed(&env, &admin, &recipient);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::ProposeRecipient,
+            Some(recipient),
+            None,
+        );
+        Ok(())
+    }
+
+    /// Execute a previously proposed recipient after the timelock elapses, adding it
+    /// to the allowlist that `withdraw`/`emergency_withdraw` recipients must belong to.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NoRecipientProposed` — No proposal pending for this address.
+    /// - `KoraError::RecipientTimelockNotElapsed` — 24-hour timelock has not yet passed.
+    pub fn execute_recipient(env: Env, admin: Address, recipient: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let proposed_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecipientProposal(recipient.clone()))
+            .ok_or(KoraError::NoRecipientProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::RecipientTimelockNotElapsed);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RecipientProposal(recipient.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowedRecipient(recipient.clone()), &true);
+        Self::bump_persistent(&env, &DataKey::AllowedRecipient(recipient.clone()));
+        events::recipient_allowed(&env, &admin, &recipient);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::ExecuteRecipient,
+            Some(recipient),
+            None,
+        );
+        Ok(())
+    }
+
+    /// Returns whether `recipient` is a matured, allowlisted withdrawal destination.
+    pub fn is_recipient_allowed(env: Env, recipient: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedRecipient(recipient))
+            .unwrap_or(false)
+    }
+
+    // ── Insurance / loss reserve (#458) ──────────────────────────────────────
+
+    /// Set the portion (bps, 0–10 000) of every newly `collect_fee`'d amount that is
+    /// earmarked into the per-token loss reserve instead of the freely withdrawable pool.
+    ///
+    /// **Security:** Requires `admin.require_auth()`.
+    pub fn set_reserve_allocation_bps(env: Env, admin: Address, bps: u32) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        require_valid_fee_bps(bps)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReserveAllocationBps, &bps);
+        Self::bump_persistent(&env, &DataKey::ReserveAllocationBps);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::SetReserveAllocation,
+            None,
+            Some(bps as i128),
+        );
+        Ok(())
+    }
+
+    /// Authorize (or deauthorize) an address — typically a `financing_pool` deployment —
+    /// to call `disburse_from_reserve`.
+    ///
+    /// **Security:** Requires `admin.require_auth()`.
+    pub fn set_reserve_caller(
+        env: Env,
+        admin: Address,
+        caller: Address,
+        authorized: bool,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthorizedReserveCaller(caller.clone()), &authorized);
+        Self::bump_persistent(&env, &DataKey::AuthorizedReserveCaller(caller.clone()));
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::SetReserveCaller,
+            Some(caller),
+            Some(if authorized { 1 } else { 0 }),
+        );
+        Ok(())
+    }
+
+    /// Draw down the token's earmarked loss reserve to partially reimburse investors on a
+    /// recorded default. Callable only by an address previously authorized via
+    /// `set_reserve_caller` (e.g. `financing_pool`).
+    ///
+    /// **Errors:**
+    /// - `KoraError::ReserveCallerNotAuthorized` — `caller` is not an authorized reserve caller.
+    /// - `KoraError::InvalidAmount` — `amount` is ≤ 0.
+    /// - `KoraError::InsufficientReserveBalance` — `amount` exceeds the token's reserve balance.
+    ///
+    /// **Security:** Requires `caller.require_auth()` — a genuine contract-to-contract auth
+    /// check, since `financing_pool` calls this programmatically.
+    pub fn disburse_from_reserve(
+        env: Env,
+        caller: Address,
+        token: Address,
+        amount: i128,
+        recipient: Address,
+    ) -> Result<(), KoraError> {
+        caller.require_auth();
+        let authorized: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedReserveCaller(caller.clone()))
+            .unwrap_or(false);
+        if !authorized {
+            return Err(KoraError::ReserveCallerNotAuthorized);
+        }
+        if amount <= 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+        require_within_max_amount(amount)?;
+
+        let reserve_key = DataKey::ReserveBalance(token.clone());
+        let reserve_balance: i128 = env.storage().persistent().get(&reserve_key).unwrap_or(0);
+        if amount > reserve_balance {
+            return Err(KoraError::InsufficientReserveBalance);
+        }
+
+        let _guard = ReentrancyGuard::new(&env)?;
+
+        env.storage()
+            .persistent()
+            .set(&reserve_key, &(reserve_balance - amount));
+        Self::bump_persistent(&env, &reserve_key);
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        events::reserve_disbursed(&env, &caller, &token, &recipient, amount);
+        Self::append_audit_entry(
+            &env,
+            &caller,
+            AdminActionType::DisburseFromReserve,
+            Some(token),
+            Some(amount),
+        );
+        Ok(())
+    }
+
+    /// Returns the token's current loss-reserve balance (excluded from admin withdrawals).
+    pub fn get_reserve_balance(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReserveBalance(token))
+            .unwrap_or(0)
+    }
+
+    /// Returns the current reserve allocation rate in basis points.
+    pub fn get_reserve_allocation_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReserveAllocationBps)
+            .unwrap_or(0)
+    }
+
+    /// Returns whether `caller` is authorized to call `disburse_from_reserve`.
+    pub fn is_reserve_caller(env: Env, caller: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuthorizedReserveCaller(caller))
+            .unwrap_or(false)
+    }
+
+    // ── Multisig quorum gate (#455) ──────────────────────────────────────────
+
+    /// Link this treasury to an `access_control` deployment. When that deployment has a
+    /// multisig configured with `threshold > 1`, treasury's highest-risk functions
+    /// (`withdraw`, `emergency_withdraw`, `set_fee_bps`, `propose_upgrade`) can no longer be
+    /// called directly — they must go through `propose_treasury_action` →
+    /// `approve_treasury_action` → `execute_treasury_action` instead.
+    ///
+    /// **Security:** Requires `admin.require_auth()`.
+    pub fn set_access_control(env: Env, admin: Address, access_control: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        require_not_self(&env, &access_control)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::AccessControl, &access_control);
+        Self::bump_persistent(&env, &DataKey::AccessControl);
+        Self::append_audit_entry(
+            &env,
+            &admin,
+            AdminActionType::SetAccessControl,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Returns the linked `access_control` address, if configured.
+    pub fn get_access_control(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::AccessControl)
+    }
+
+    /// Propose one of treasury's highest-risk actions. Caller must be a signer configured
+    /// in the linked `access_control` multisig. The proposer's approval is recorded
+    /// automatically, matching `access_control::propose_action`.
+    ///
+    /// **Errors:**
+    /// - `KoraError::MultisigNotConfigured` — No `access_control` multisig is configured.
+    /// - `KoraError::SignerNotFound` — Caller is not a configured signer.
+    pub fn propose_treasury_action(
+        env: Env,
+        proposer: Address,
+        action: TreasuryAction,
+    ) -> Result<u64, KoraError> {
+        proposer.require_auth();
+        let config = Self::load_signer_config(&env)?;
+        Self::require_signer(&config, &proposer)?;
+
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextTreasuryProposalId)
+            .unwrap_or(1);
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let proposal = TreasuryProposal {
+            id: proposal_id,
+            action,
+            proposer: proposer.clone(),
+            approvals,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            expires_at: env.ledger().timestamp() + TREASURY_PROPOSAL_TTL,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TreasuryProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::TreasuryProposal(proposal_id));
+        env.storage().persistent().set(
+            &DataKey::NextTreasuryProposalId,
+            &(proposal_id
+                .checked_add(1)
+                .ok_or(KoraError::ArithmeticOverflow)?),
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &proposer,
+            AdminActionType::ProposeTreasuryAction,
+            None,
+            Some(proposal_id as i128),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Approve a pending treasury proposal. Caller must be a configured signer who has not
+    /// already voted on this proposal.
+    pub fn approve_treasury_action(env: Env, approver: Address, proposal_id: u64) -> Result<(), KoraError> {
+        approver.require_auth();
+        let config = Self::load_signer_config(&env)?;
+        Self::require_signer(&config, &approver)?;
+
+        let mut proposal: TreasuryProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryProposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ProposalAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(KoraError::ProposalExpired);
+        }
+        for i in 0..proposal.approvals.len() {
+            if proposal.approvals.get(i).ok_or(KoraError::Unauthorized)? == approver {
+                return Err(KoraError::AlreadyApproved);
+            }
+        }
+        proposal.approvals.push_back(approver.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TreasuryProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::TreasuryProposal(proposal_id));
+
+        Self::append_audit_entry(
+            &env,
+            &approver,
+            AdminActionType::ApproveTreasuryAction,
+            None,
+            Some(proposal_id as i128),
+        );
+        Ok(())
+    }
+
+    /// Execute a treasury proposal once its approval threshold is met, applying the
+    /// underlying action ('withdraw' / 'emergency_withdraw' / 'set_fee_bps' / 'propose_upgrade').
+    ///
+    /// **Errors:**
+    /// - `KoraError::ThresholdNotMet` — Not enough approvals collected yet.
+    pub fn execute_treasury_action(env: Env, executor: Address, proposal_id: u64) -> Result<(), KoraError> {
+        executor.require_auth();
+        let config = Self::load_signer_config(&env)?;
+        Self::require_signer(&config, &executor)?;
+
+        let mut proposal: TreasuryProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryProposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ProposalAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(KoraError::ProposalExpired);
+        }
+        if (proposal.approvals.len()) < config.threshold {
+            return Err(KoraError::ThresholdNotMet);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::TreasuryProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::TreasuryProposal(proposal_id));
+
+        match proposal.action {
+            TreasuryAction::Withdraw(token, recipient, amount) => {
+                Self::do_withdraw(&env, &executor, &token, &recipient, amount)?;
+            }
+            TreasuryAction::EmergencyWithdraw(token, recipient) => {
+                Self::do_emergency_withdraw(&env, &executor, &token, &recipient)?;
+            }
+            TreasuryAction::SetFeeBps(fee_bps) => {
+                Self::do_set_fee_bps(&env, &executor, fee_bps)?;
+            }
+            TreasuryAction::ProposeUpgrade(wasm_hash) => {
+                Self::do_propose_upgrade(&env, &executor, &wasm_hash)?;
+            }
+        }
+
+        Self::append_audit_entry(
+            &env,
+            &executor,
+            AdminActionType::ExecuteTreasuryAction,
+            None,
+            Some(proposal_id as i128),
+        );
+        Ok(())
+    }
+
+    /// Get a treasury proposal by ID.
+    pub fn get_treasury_proposal(env: Env, proposal_id: u64) -> Result<TreasuryProposal, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TreasuryProposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
@@ -556,6 +1122,58 @@ impl TreasuryContract {
             .unwrap_or(false);
         if !whitelisted {
             return Err(KoraError::TokenNotWhitelisted);
+        }
+        Ok(())
+    }
+
+    fn require_allowed_recipient(env: &Env, recipient: &Address) -> Result<(), KoraError> {
+        let allowed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllowedRecipient(recipient.clone()))
+            .unwrap_or(false);
+        if !allowed {
+            return Err(KoraError::RecipientNotAllowed);
+        }
+        Ok(())
+    }
+
+    /// Loads the linked `access_control`'s multisig config, if both a link and a multisig
+    /// are configured. Returns `None` for the degenerate/unconfigured migration case.
+    fn load_signer_config(env: &Env) -> Result<MultisigConfig, KoraError> {
+        let ac: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AccessControl)
+            .ok_or(KoraError::MultisigNotConfigured)?;
+        let client = AccessControlContractClient::new(env, &ac);
+        client
+            .try_get_multisig_config()
+            .map_err(|_| KoraError::MultisigNotConfigured)?
+            .map_err(|_| KoraError::MultisigNotConfigured)
+    }
+
+    fn try_load_signer_config(env: &Env) -> Option<MultisigConfig> {
+        Self::load_signer_config(env).ok()
+    }
+
+    fn require_signer(config: &MultisigConfig, caller: &Address) -> Result<(), KoraError> {
+        for i in 0..config.signers.len() {
+            if &config.signers.get(i).ok_or(KoraError::Unauthorized)? == caller {
+                return Ok(());
+            }
+        }
+        Err(KoraError::SignerNotFound)
+    }
+
+    /// Highest-risk functions may only be called directly (single-signature) when no
+    /// `access_control` multisig with `threshold > 1` is configured — the degenerate,
+    /// backward-compatible case for deployments that haven't opted into multisig.
+    fn require_no_quorum_required(env: &Env) -> Result<(), KoraError> {
+        if let Some(config) = Self::try_load_signer_config(env) {
+            if config.threshold > 1 {
+                return Err(KoraError::QuorumRequired);
+            }
         }
         Ok(())
     }
@@ -627,7 +1245,13 @@ impl TreasuryContract {
         );
     }
 
-    fn append_audit_entry(env: &Env, actor: &Address, action: AdminActionType) {
+    fn append_audit_entry(
+        env: &Env,
+        actor: &Address,
+        action: AdminActionType,
+        token: Option<Address>,
+        amount: Option<i128>,
+    ) {
         let total: u64 = env
             .storage()
             .instance()
@@ -645,6 +1269,8 @@ impl TreasuryContract {
             actor: actor.clone(),
             action,
             source: AuditSource::Treasury,
+            token,
+            amount,
         };
 
         env.storage()
