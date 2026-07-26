@@ -82,6 +82,23 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+  # ── Unbounded loop guard ──────────────────────────────────────────────────
+  #
+  # Flags loops over ledger-sourced collections (Map/Vec loaded from
+  # persistent/instance storage) that make a cross-contract call per
+  # iteration with no visible bound — cost scales with on-chain state size
+  # and can exceed Soroban's CPU instruction limit at scale.
+  # financing_pool::distribute_yield is a known, baselined instance; new
+  # occurrences fail this check. See scripts/check_unbounded_loops.py.
+  unbounded-loop-guard:
+    name: unbounded loop guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for unbounded loops with cross-contract calls
+        run: python3 scripts/check_unbounded_loops.py
+
   # ── Dependency cycle guard (issue #275) ──────────────────────────────────
   #
   # Runs `cargo tree` and fails if any cycle is detected.

@@ -1703,7 +1703,6 @@ fn test_role_override() {
         let result = client.try_initialize(&admin);
         assert!(result.is_err());
     }
-}
 
     #[test]
     fn test_interleaved_pause_and_role_operations_remain_independent() {

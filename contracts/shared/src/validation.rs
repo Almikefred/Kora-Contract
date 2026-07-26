@@ -257,6 +257,15 @@ pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), KoraErr
     Ok(())
 }
 
+/// Reject byte slices that are not exactly `expected_len` bytes.
+#[inline]
+pub fn require_exact_length(b: &Bytes, expected_len: u32) -> Result<(), KoraError> {
+    if b.len() != expected_len {
+        return Err(KoraError::InvalidLength);
+    }
+    Ok(())
+}
+
 /// Maximum allowed byte length for an IPFS CID stored on-chain.
 pub const MAX_IPFS_CID_LEN: u32 = 128;
 

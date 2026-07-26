@@ -1,6 +1,6 @@
 use soroban_sdk::contracterror;
 
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum KoraError {
@@ -95,6 +95,21 @@ pub enum KoraError {
     // Marketplace two-phase cancellation
     CancellationPending = 118,
     NoCancellationPending = 119,
+
+    // Multisig admin-action proposals
+    InvalidThreshold = 120,
+    ProposalNotFound = 121,
+    ProposalAlreadyExecuted = 122,
+    ProposalExpired = 123,
+    AlreadyApproved = 124,
+    ThresholdNotMet = 125,
+    MultisigNotConfigured = 126,
+    SignerNotFound = 127,
+
+    // Invoice ownership, credit limit, currency allowlist
+    CreditLimitExceeded = 130,
+    NotInvoiceOwner = 131,
+    CurrencyNotAllowed = 132,
     // Minting/amending an invoice would push the SME's aggregate OutstandingExposure
     // above their risk_registry-assigned SmeProfile.credit_limit
     CreditLimitExceeded = 120,

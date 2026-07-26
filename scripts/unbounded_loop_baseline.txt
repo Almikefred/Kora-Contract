@@ -1,0 +1,8 @@
+# Known unbounded-loop-with-cross-contract-call findings.
+# One `path:function` per line. New findings not listed here fail CI —
+# see scripts/check_unbounded_loops.py for what's being detected.
+#
+# Remove an entry once the underlying loop is bounded (or the
+# cross-contract call is moved out of it) so it can't silently regress.
+
+contracts/financing_pool/src/lib.rs:distribute_yield
