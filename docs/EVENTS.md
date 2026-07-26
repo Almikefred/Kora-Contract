@@ -150,15 +150,25 @@ System events (where there is no single initiating actor — e.g. `late_penalty_
 
 | Topic Symbol | Function | Payload | Emitter |
 |---|---|---|---|
-| `INV_CRT` | `invoice_created` | `(sme, invoice_id, amount, timestamp)` | `invoice_nft` |
-| `INV_LST` | `invoice_listed` | `(seller, invoice_id, asking_price, timestamp)` | `marketplace`, `invoice_nft` |
-| `INV_FND` | `invoice_funded` | `(investor, invoice_id, funded_amount, timestamp)` | `marketplace`, `invoice_nft` |
-| `INV_RPD` | `invoice_repaid` | `(sme, invoice_id, amount, timestamp)` | `invoice_nft` |
-| `INV_DFT` | `invoice_defaulted` | `(actor, invoice_id, timestamp)` | `invoice_nft`, `financing_pool` |
+| `INV_CRT` | `invoice_created` | `(sme, invoice_id, amount, currency, timestamp)` | `invoice_nft` |
+| `INV_LISTED` | `invoice_listed` | `(seller, invoice_id, asking_price, currency, timestamp)` | `marketplace`, `invoice_nft` |
+| `INV_FUNDED` | `invoice_funded` | `(investor, invoice_id, funded_amount, currency, timestamp)` | `marketplace`, `invoice_nft` |
+| `INV_RPD` | `invoice_repaid` | `(sme, invoice_id, amount, currency, timestamp)` | `invoice_nft` |
+| `INV_DFT` | `invoice_defaulted` | `(actor, invoice_id, amount, currency, timestamp)` | `invoice_nft`, `financing_pool` |
+| `INV_AMD` | `invoice_amended` | `(invoice_id, sme, currency, timestamp)` | `invoice_nft` |
+| `INV_WTH` | `invoice_withdrawn` | `(invoice_id, sme, currency, timestamp)` | `invoice_nft` |
 
 > **Note on `INV_DFT`:** The `actor` field is the admin address that triggered the
 > default marking — it is not the SME. In `invoice_nft`, the caller is validated as
 > the contract admin; in `financing_pool`, it is the admin address passed to `mark_default`.
+
+> **Breaking schema change (#420):** `invoice_defaulted` gained an `amount` field
+> (previously omitted, unlike every sibling invoice event), and all seven
+> invoice-lifecycle events (`invoice_created`, `invoice_listed`, `invoice_funded`,
+> `invoice_repaid`, `invoice_amended`, `invoice_withdrawn`, `invoice_defaulted`) gained
+> a `currency` field so the accompanying `amount` can be interpreted without a separate
+> `get_invoice` call. Existing off-chain indexers that decode these event tuples by
+> fixed position/arity must be updated to match the new schemas above.
 
 ---
 
@@ -210,6 +220,7 @@ System events (where there is no single initiating actor — e.g. `late_penalty_
 | `PAUSED` | `protocol_paused` | `(admin, timestamp)` | `access_control` |
 | `UNPAUSED` | `protocol_unpaused` | `(admin, timestamp)` | `access_control` |
 | `TOK_WL` | `token_whitelisted` | `(admin, token, timestamp)` | `marketplace`, `treasury` |
+| `TOK_UNWL` | `token_whitelist_removed` | `(admin, token, timestamp)` | `marketplace` |
 | `ADM_TRF` | `admin_transferred` | `(current_admin, new_admin, timestamp)` | `access_control`, `risk_registry` |
 | `ROL_GRT` | `role_granted` | `(admin, target, timestamp)` | `access_control` |
 | `ROL_RVK` | `role_revoked` | `(admin, target, timestamp)` | `access_control` |

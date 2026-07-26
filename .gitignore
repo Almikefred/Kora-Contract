@@ -23,3 +23,7 @@ waves-issues.md
 # Rust artifacts
 Cargo.lock.bak
 **/*.orig
+
+# Python artifacts
+__pycache__/
+*.pyc

@@ -82,6 +82,23 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+  # ── Unbounded loop guard ──────────────────────────────────────────────────
+  #
+  # Flags loops over ledger-sourced collections (Map/Vec loaded from
+  # persistent/instance storage) that make a cross-contract call per
+  # iteration with no visible bound — cost scales with on-chain state size
+  # and can exceed Soroban's CPU instruction limit at scale.
+  # financing_pool::distribute_yield is a known, baselined instance; new
+  # occurrences fail this check. See scripts/check_unbounded_loops.py.
+  unbounded-loop-guard:
+    name: unbounded loop guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for unbounded loops with cross-contract calls
+        run: python3 scripts/check_unbounded_loops.py
+
   # ── Dependency cycle guard (issue #275) ──────────────────────────────────
   #
   # Runs `cargo tree` and fails if any cycle is detected.
@@ -127,6 +144,37 @@ jobs:
             exit 1
           fi
           echo "No dependency cycles detected."
+
+  # ── KoraError variant consistency guard (issue #421) ─────────────────────
+  #
+  # Fails the build if any contract crate references a `KoraError::Variant`
+  # that isn't actually declared on the `KoraError` enum in
+  # contracts/shared/src/errors.rs — the recurring bug class behind issues
+  # #188, #244, #245, #346, #347. Runs independently of `cargo check` so it
+  # still gives a signal even when the workspace itself fails to compile.
+  error-variant-guard:
+    name: KoraError variant consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-xtask-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-xtask-
+
+      - name: cargo run -p kora-xtask --bin check-error-variants
+        run: cargo run -p kora-xtask --bin check-error-variants
 
   # ── Unit & integration tests ──────────────────────────────────────────────
   test:
