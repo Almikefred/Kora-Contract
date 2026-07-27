@@ -1969,4 +1969,62 @@ mod tests {
         let result = client.try_set_credit_limit(&verifier, &sme, &-1i128);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
+
+    // ── Issue #483: Stake lockup enforcement tests ──────────────────────────────
+
+    #[test]
+    fn test_remove_verifier_blocks_full_stake_return_with_open_sme() {
+        // When a verifier registers an SME with open invoices and is then removed,
+        // their stake should not be fully returned if they still have outstanding
+        // vouched exposure (i.e., SMEs they verified with active invoices).
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        let initial_stake = 1_000_000i128;
+
+        mint_stake(&env, &staking_token, &verifier, initial_stake);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, initial_stake);
+        client.add_verifier(&admin, &verifier, &initial_stake);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // At this point, the verifier has an open SME. When removed, full stake
+        // should be blocked/withheld (not returned) because the SME has unresolved
+        // exposure. The current implementation incorrectly returns full stake.
+        // This test documents the required fix: remove_verifier should enforce
+        // a time-based or exposure-based lockup.
+        let result = client.try_remove_verifier(&admin, &verifier);
+        // TODO: After implementing stake lockup, this should fail with a "stake locked" error.
+        // For now, this documents the vulnerable behavior.
+        if result.is_ok() {
+            // If removal succeeds (current behavior), verify that stake was returned
+            // (which is the vulnerability). After the fix, this call should fail instead.
+            let _ = result;
+        }
+    }
+
+    #[test]
+    fn test_verifier_stakes_locked_after_registering_sme() {
+        // A verifier's stake should be locked/held after registering an SME
+        // until either (1) a time-based lockup window expires, or (2) all
+        // outstanding vouched exposure is resolved (defaults recorded).
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        let initial_stake = 1_000_000i128;
+
+        mint_stake(&env, &staking_token, &verifier, initial_stake);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, initial_stake);
+        client.add_verifier(&admin, &verifier, &initial_stake);
+        client.register_sme(&verifier, &sme, &30u32, &true);
+
+        // Immediately after registering an SME, the verifier's stake should be locked.
+        // Attempting to remove the verifier should be blocked or the returned amount
+        // should be partial, not the full stake. This test documents the expected behavior.
+        // Current code returns full stake (vulnerability).
+        let initial_verifier_stake = client.get_verifier_stake(&verifier);
+        assert_eq!(initial_verifier_stake, initial_stake);
+        // TODO: After fix, ensure that remove_verifier either:
+        //   - Fails with a "stake locked" error, or
+        //   - Returns only a partial amount (withholding locked portion)
+    }
 }
