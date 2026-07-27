@@ -1,10 +1,21 @@
 #![no_std]
 
-use kora_shared::errors::KoraError;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 
 const MAX_STALENESS_SECS: u64 = 3600;
 const DEFAULT_MAX_PRICE_DEVIATION_BPS: u32 = 1000; // 10% deviation
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PriceOracleError {
+    AlreadyInitialized = 1,
+    ArithmeticOverflow = 2,
+    InvalidAmount = 3,
+    InvoiceExpired = 4,
+    NotAdmin = 5,
+    NotInitialized = 6,
+}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -30,9 +41,9 @@ pub struct PriceOracleContract;
 
 #[contractimpl]
 impl PriceOracleContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), KoraError> {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), PriceOracleError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(KoraError::AlreadyInitialized);
+            return Err(PriceOracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -50,57 +61,12 @@ impl PriceOracleContract {
         base: Symbol,
         quote: Symbol,
         price: i128,
-    ) -> Result<(), KoraError> {
-        feeder.require_auth();
-        Self::require_feeder(&env, &feeder)?;
+    ) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
 
         if price <= 0 {
-            return Err(KoraError::InvalidAmount);
-        }
-
-        Self::check_price_deviation(&env, &base, &quote, price)?;
-
-        let data = PriceData {
-            price,
-            timestamp: env.ledger().timestamp(),
-        };
-        env.storage()
-            .persistent()
-            .set(
-                &DataKey::FeederPrice(base.clone(), quote.clone(), feeder.clone()),
-                &data,
-            );
-
-        let mut feeders: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PriceFeeders(base.clone(), quote.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        if !feeders.iter().any(|f| f == &feeder) {
-            feeders.push_back(feeder);
-            env.storage()
-                .persistent()
-                .set(&DataKey::PriceFeeders(base, quote), &feeders);
-        }
-
-        Ok(())
-    }
-
-    /// Set a price with override, bypassing deviation checks.
-    /// Authorized feeders only. Use for legitimate large moves (e.g., de-peg events).
-    pub fn set_price_override(
-        env: Env,
-        feeder: Address,
-        base: Symbol,
-        quote: Symbol,
-        price: i128,
-    ) -> Result<(), KoraError> {
-        feeder.require_auth();
-        Self::require_feeder(&env, &feeder)?;
-
-        if price <= 0 {
-            return Err(KoraError::InvalidAmount);
+            return Err(PriceOracleError::InvalidAmount);
         }
 
         let data = PriceData {
@@ -180,39 +146,19 @@ impl PriceOracleContract {
         env: Env,
         base: Symbol,
         quote: Symbol,
-    ) -> Result<PriceData, KoraError> {
-        let feeders: Vec<Address> = env
+    ) -> Result<PriceData, PriceOracleError> {
+        let data: PriceData = env
             .storage()
             .persistent()
-            .get(&DataKey::PriceFeeders(base.clone(), quote.clone()))
-            .ok_or(KoraError::InvalidAmount)?;
+            .get(&DataKey::Price(base.clone(), quote.clone()))
+            .ok_or(PriceOracleError::InvalidAmount)?;
 
-        if feeders.is_empty() {
-            return Err(KoraError::InvalidAmount);
-        }
-
-        let mut prices: Vec<i128> = Vec::new(&env);
-        let mut min_timestamp = u64::MAX;
-
-        for feeder in feeders.iter() {
-            if let Ok(data) = env
-                .storage()
-                .persistent()
-                .get::<_, PriceData>(&DataKey::FeederPrice(base.clone(), quote.clone(), feeder.clone()))
-                .ok_or(KoraError::InvalidAmount)
-            {
-                let age = env
-                    .ledger()
-                    .timestamp()
-                    .saturating_sub(data.timestamp);
-                if age > MAX_STALENESS_SECS {
-                    continue;
-                }
-                prices.push_back(data.price);
-                if data.timestamp < min_timestamp {
-                    min_timestamp = data.timestamp;
-                }
-            }
+        let age = env
+            .ledger()
+            .timestamp()
+            .saturating_sub(data.timestamp);
+        if age > MAX_STALENESS_SECS {
+            return Err(PriceOracleError::InvoiceExpired);
         }
 
         if prices.is_empty() {
@@ -234,132 +180,19 @@ impl PriceOracleContract {
         amount: i128,
         from: Symbol,
         to: Symbol,
-    ) -> Result<i128, KoraError> {
+    ) -> Result<i128, PriceOracleError> {
         if from == to {
             return Ok(amount);
         }
 
-        match Self::get_price(env.clone(), from.clone(), to.clone()) {
-            Ok(price_data) => {
-                let converted = amount
-                    .checked_mul(price_data.price)
-                    .and_then(|v| v.checked_div(10_000_000))
-                    .ok_or(KoraError::ArithmeticOverflow)?;
+        let price_data = Self::get_price(env.clone(), from, to)?;
+        let converted = amount
+            .checked_mul(price_data.price)
+            .and_then(|v| v.checked_div(10_000_000))
+            .ok_or(PriceOracleError::ArithmeticOverflow)?;
 
-                if converted <= 0 {
-                    return Err(KoraError::InvalidAmount);
-                }
-
-                Ok(converted)
-            }
-            Err(_) => {
-                let base_currency: Symbol = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::BaseCurrency)
-                    .ok_or(KoraError::InvalidAmount)?;
-
-                if from == base_currency || to == base_currency {
-                    return Err(KoraError::InvalidAmount);
-                }
-
-                let from_to_base = Self::get_price(env.clone(), from, base_currency.clone())?;
-                let base_to_to = Self::get_price(env, base_currency, to)?;
-
-                let intermediate = amount
-                    .checked_mul(from_to_base.price)
-                    .and_then(|v| v.checked_div(10_000_000))
-                    .ok_or(KoraError::ArithmeticOverflow)?;
-
-                let converted = intermediate
-                    .checked_mul(base_to_to.price)
-                    .and_then(|v| v.checked_div(10_000_000))
-                    .ok_or(KoraError::ArithmeticOverflow)?;
-
-                if converted <= 0 {
-                    return Err(KoraError::InvalidAmount);
-                }
-
-                Ok(converted)
-            }
-        }
-    }
-
-    /// Register a token address to its currency symbol.
-    /// Admin only. Used for address-based conversion lookups.
-    pub fn register_token_symbol(
-        env: Env,
-        admin: Address,
-        token: Address,
-        symbol: Symbol,
-    ) -> Result<(), KoraError> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::TokenSymbol(token), &symbol);
-        Ok(())
-    }
-
-    /// Resolve a token address to its registered currency symbol.
-    pub fn resolve_symbol(env: Env, token: Address) -> Result<Symbol, KoraError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TokenSymbol(token))
-            .ok_or(KoraError::InvalidAddress)
-    }
-
-    /// Convert an amount using token addresses instead of symbols.
-    /// Internally resolves both addresses to symbols and delegates to convert.
-    pub fn convert_by_address(
-        env: Env,
-        amount: i128,
-        from_token: Address,
-        to_token: Address,
-    ) -> Result<i128, KoraError> {
-        let from_symbol = Self::resolve_symbol(env.clone(), from_token)?;
-        let to_symbol = Self::resolve_symbol(env.clone(), to_token)?;
-        Self::convert(env, amount, from_symbol, to_symbol)
-    }
-
-    fn get_max_deviation(env: &Env) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MaxDeviation)
-            .unwrap_or(DEFAULT_MAX_PRICE_DEVIATION_BPS)
-    }
-
-    fn check_price_deviation(
-        env: &Env,
-        base: &Symbol,
-        quote: &Symbol,
-        new_price: i128,
-    ) -> Result<(), KoraError> {
-        let max_deviation_bps = Self::get_max_deviation(env);
-
-        if let Ok(old_data) = Self::get_price(env.clone(), base.clone(), quote.clone()) {
-            let old_price = old_data.price;
-            let deviation_bps = if new_price > old_price {
-                let increase = new_price
-                    .checked_sub(old_price)
-                    .ok_or(KoraError::ArithmeticOverflow)?;
-                increase
-                    .checked_mul(10000)
-                    .and_then(|v| v.checked_div(old_price))
-                    .ok_or(KoraError::ArithmeticOverflow)? as u32
-            } else {
-                let decrease = old_price
-                    .checked_sub(new_price)
-                    .ok_or(KoraError::ArithmeticOverflow)?;
-                decrease
-                    .checked_mul(10000)
-                    .and_then(|v| v.checked_div(old_price))
-                    .ok_or(KoraError::ArithmeticOverflow)? as u32
-            };
-
-            if deviation_bps > max_deviation_bps {
-                return Err(KoraError::InvalidAmount);
-            }
+        if converted <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
         }
 
         Ok(())
@@ -389,14 +222,14 @@ impl PriceOracleContract {
         }
     }
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), PriceOracleError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(PriceOracleError::NotInitialized)?;
         if &admin != caller {
-            return Err(KoraError::NotAdmin);
+            return Err(PriceOracleError::NotAdmin);
         }
         Ok(())
     }
