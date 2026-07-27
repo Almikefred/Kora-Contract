@@ -1,8 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 const MAX_STALENESS_SECS: u64 = 3600;
+const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -14,6 +15,8 @@ pub enum PriceOracleError {
     InvoiceExpired = 4,
     NotAdmin = 5,
     NotInitialized = 6,
+    NoUpgradeProposed = 7,
+    UpgradeTimelockNotElapsed = 8,
 }
 
 #[contracttype]
@@ -27,6 +30,7 @@ pub struct PriceData {
 pub enum DataKey {
     Admin,
     Price(Symbol, Symbol),
+    UpgradeProposal,
 }
 
 #[contract]
@@ -117,6 +121,45 @@ impl PriceOracleContract {
         Ok(converted)
     }
 
+    /// Transfer admin rights to a new address. Admin only.
+    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
+
+    /// Propose a WASM upgrade with a 24-hour timelock. Admin only.
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &(new_wasm_hash, env.ledger().timestamp()));
+        Ok(())
+    }
+
+    /// Execute a previously proposed upgrade after the 24-hour timelock.
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(PriceOracleError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(PriceOracleError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), PriceOracleError> {
         let admin: Address = env
             .storage()
@@ -203,6 +246,70 @@ mod tests {
         });
 
         let result = client.try_get_price(&base, &quote);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transfer_admin_success() {
+        let (env, admin, client) = setup();
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&admin, &new_admin);
+        let result = client.try_set_price(&new_admin, &Symbol::new(&env, "XLM"), &Symbol::new(&env, "USDC"), &10_000_000i128);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_transfer_admin_requires_admin() {
+        let (env, admin, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let result = client.try_transfer_admin(&stranger, &new_admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_propose_upgrade_success() {
+        let (env, admin, client) = setup();
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]);
+        let result = client.try_propose_upgrade(&admin, &wasm_hash);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_execute_upgrade_requires_timelock() {
+        let (env, admin, client) = setup();
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash);
+        let result = client.try_execute_upgrade(&admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_upgrade_success() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let (env, admin, client) = setup();
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + UPGRADE_TIMELOCK_DELAY + 1,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        let result = client.try_execute_upgrade(&admin);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_execute_upgrade_no_proposal() {
+        let (env, admin, client) = setup();
+        let result = client.try_execute_upgrade(&admin);
         assert!(result.is_err());
     }
 }
