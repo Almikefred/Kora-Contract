@@ -98,6 +98,8 @@ pub enum KoraError {
     CreditLimitExceeded = 121,
     // invoice_nft: currency symbol is not on the allowlist
     CurrencyNotAllowed = 122,
+    // marketplace: investor's prospective share would exceed the per-listing concentration cap (#435)
+    InvestorConcentrationExceeded = 123,
 }
 use soroban_sdk::contracterror;
 

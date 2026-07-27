@@ -34,6 +34,18 @@ pub enum DataKey {
     Contribution(u64, Address),
     /// Refund claimed flag
     RefundClaimed(u64, Address),
+    /// Referrer address recorded at listing time, if any (#referral-fee-split)
+    Referrer(u64),
+    /// Pending two-phase cancellation request, storing who requested it (#263)
+    CancellationRequest(u64),
+    /// Set once admin confirms a two-phase cancellation, unlocking claim_refund (#263)
+    CancellationConfirmed(u64),
+    /// Maximum fraction (in bps) of asking_price any single investor may hold.
+    /// 0 = uncapped (default). Admin-settable (#435).
+    MaxInvestorShareBps,
+    /// Gross cumulative contribution (pre-fee) per investor per listing (#435).
+    /// Stored separately from Contribution (net) so the cap check uses gross amounts.
+    GrossContribution(u64, Address),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -131,6 +143,37 @@ impl MarketplaceContract {
     /// Returns the current fee in basis points.
     pub fn get_fee_bps(env: Env) -> Result<u32, KoraError> {
         Ok(Self::load_config(&env)?.fee_bps)
+    }
+
+    /// Set the maximum fraction of `asking_price` any single investor may hold
+    /// across all their `fund_invoice` calls on a given listing, expressed in
+    /// basis points. Admin only. Pass `0` to disable (uncapped). (#435)
+    ///
+    /// **Errors:** `NotAdmin`
+    pub fn set_max_investor_share_bps(
+        env: Env,
+        admin: Address,
+        max_bps: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        require_valid_fee_bps(max_bps)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxInvestorShareBps, &max_bps);
+        Ok(())
+    }
+
+    /// Returns the current per-investor concentration cap in basis points.
+    /// `0` means uncapped (default).
+    pub fn get_max_investor_share_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxInvestorShareBps)
+            .unwrap_or(0)
     }
 
     /// Set a per-risk-tier fee override. Admin only. (#210)
@@ -330,6 +373,42 @@ impl MarketplaceContract {
 
         let config = Self::load_config(&env)?;
 
+        // === #435: Per-listing investor concentration cap ===
+        // Compute prospective gross (pre-fee) cumulative contribution and reject
+        // if it would exceed cap_bps of asking_price.  0 = uncapped (default).
+        let cap_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxInvestorShareBps)
+            .unwrap_or(0);
+        if cap_bps > 0 {
+            let gross_key = DataKey::GrossContribution(invoice_id, investor.clone());
+            let prev_gross: i128 = env
+                .storage()
+                .persistent()
+                .get(&gross_key)
+                .unwrap_or(0);
+            let prospective = safe_add(prev_gross, amount)?;
+            // prospective * 10_000 / asking_price > cap_bps
+            // rearranged to avoid division: prospective * 10_000 > cap_bps * asking_price
+            let lhs = prospective
+                .checked_mul(10_000)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+            let rhs = (cap_bps as i128)
+                .checked_mul(listing.asking_price)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+            if lhs > rhs {
+                events::investor_concentration_exceeded(
+                    &env,
+                    invoice_id,
+                    &investor,
+                    prospective,
+                    cap_bps,
+                );
+                return Err(KoraError::InvestorConcentrationExceeded);
+            }
+        }
+
         // Check per-invoice freeze before any token operations.
         // Enforced in addition to the protocol-wide pause so a single disputed
         // invoice can be frozen without halting all protocol activity.
@@ -376,6 +455,18 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .set(&contrib_key, &safe_add(prev_contrib, net)?);
+
+        // === #435: Update gross (pre-fee) cumulative contribution for cap tracking ===
+        let gross_key = DataKey::GrossContribution(invoice_id, investor.clone());
+        let prev_gross_stored: i128 = env
+            .storage()
+            .persistent()
+            .get(&gross_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&gross_key, &safe_add(prev_gross_stored, amount)?);
+        Self::bump_persistent(&env, &gross_key);
 
         let fully_funded = listing.funded_amount >= listing.asking_price;
         if fully_funded {

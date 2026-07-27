@@ -743,3 +743,22 @@ pub fn admin_action_audited(env: &Env, entry: &AdminAuditEntry) {
         ),
     );
 }
+
+// ── Marketplace investor-concentration / compliance / amendment / index events ─
+
+/// Emitted when fund_invoice is rejected because the investor's prospective
+/// share would exceed the configured per-listing concentration cap (#435).
+/// Schema: (actor=investor, invoice_id, prospective_amount, cap_bps, timestamp)
+pub fn investor_concentration_exceeded(
+    env: &Env,
+    invoice_id: u64,
+    investor: &Address,
+    prospective: i128,
+    cap_bps: u32,
+) {
+    emit(
+        env,
+        symbol_short!("INV_CONC"),
+        (investor.clone(), invoice_id, prospective, cap_bps, env.ledger().timestamp()),
+    );
+}
