@@ -44,6 +44,8 @@ impl PriceOracleContract {
 
     /// Set a price for a currency pair. Admin only.
     /// Price is expressed as `base` units per 1 unit of `quote`, scaled by 1e7 (stroops).
+    /// If the reverse pair (quote, base) is already set, validates that the prices are
+    /// reciprocal-consistent within tolerance (allowing for rounding; exact match is not required).
     pub fn set_price(
         env: Env,
         admin: Address,
@@ -58,6 +60,15 @@ impl PriceOracleContract {
             return Err(PriceOracleError::InvalidAmount);
         }
 
+        // Check reciprocal consistency if reverse pair exists
+        if let Ok(reverse_data) = Self::get_price(env.clone(), quote.clone(), base.clone()) {
+            // Expected reciprocal: if P is forward price, reverse should be ~10^14 / P
+            // We compute the reciprocal and allow 1% tolerance for rounding
+            let expected_reciprocal = Self::compute_reciprocal(price)?;
+            let tolerance_bps = 100; // 1% = 100 basis points
+            Self::validate_reciprocal_tolerance(expected_reciprocal, reverse_data.price, tolerance_bps)?;
+        }
+
         let data = PriceData {
             price,
             timestamp: env.ledger().timestamp(),
@@ -65,6 +76,44 @@ impl PriceOracleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Price(base, quote), &data);
+        Ok(())
+    }
+
+    /// Compute the mathematical reciprocal of a price: 10^14 / price
+    /// The 10^14 accounts for the 1e7 scaling on both sides.
+    fn compute_reciprocal(price: i128) -> Result<i128, PriceOracleError> {
+        if price <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+        (100_000_000_000_000i128)
+            .checked_div(price)
+            .ok_or(PriceOracleError::ArithmeticOverflow)
+    }
+
+    /// Validate that two prices are reciprocally consistent within a tolerance (in basis points).
+    /// tolerance_bps: e.g., 100 = 1%, 10 = 0.1%
+    fn validate_reciprocal_tolerance(
+        expected: i128,
+        actual: i128,
+        tolerance_bps: u32,
+    ) -> Result<(), PriceOracleError> {
+        if expected <= 0 || actual <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+        // Compute percentage difference: |expected - actual| / expected * 10000
+        let diff = if expected > actual {
+            expected.checked_sub(actual).ok_or(PriceOracleError::ArithmeticOverflow)?
+        } else {
+            actual.checked_sub(expected).ok_or(PriceOracleError::ArithmeticOverflow)?
+        };
+        let pct_diff_bps = diff
+            .checked_mul(10000)
+            .and_then(|v| v.checked_div(expected))
+            .ok_or(PriceOracleError::ArithmeticOverflow)?;
+
+        if pct_diff_bps > tolerance_bps as i128 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
         Ok(())
     }
 
@@ -371,5 +420,54 @@ mod tests {
         // = 100_000_000_000_000 / 1e7 / 10 (approximately)
         // ≈ 10_000_000 / 10 = 1_000_000
         assert_eq!(back_to_usdc, 1_000_000i128, "round-trip returns ~original amount");
+    }
+
+    #[test]
+    fn test_set_price_reciprocal_consistent() {
+        let (env, admin, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let usdc = Symbol::new(&env, "USDC");
+        // Forward: 1 EURC = 1.1 USDC (11_000_000 at 1e7 scale)
+        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
+
+        // Reverse: 1 USDC = ~0.909... EURC
+        // Computed reciprocal: 10^14 / 11_000_000 = 9_090_909 (approximately)
+        let result = client.try_set_price(&admin, &usdc, &eurc, &9_090_909i128);
+        assert!(result.is_ok(), "reciprocal-consistent price should be accepted");
+    }
+
+    #[test]
+    fn test_set_price_reciprocal_inconsistent_rejected() {
+        let (env, admin, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let usdc = Symbol::new(&env, "USDC");
+        // Forward: 1 EURC = 1.1 USDC
+        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
+
+        // Try to set reverse to a wildly inconsistent value (off by 2x)
+        let result = client.try_set_price(&admin, &usdc, &eurc, &18_000_000i128);
+        assert!(result.is_err(), "reciprocal-inconsistent price should be rejected");
+    }
+
+    #[test]
+    fn test_round_trip_with_reciprocal_check() {
+        let (env, admin, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let usdc = Symbol::new(&env, "USDC");
+
+        // Set forward: 1 EURC = 1.1 USDC
+        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
+        // Set reverse with tolerance: 10^14 / 11_000_000 ≈ 9_090_909
+        client.set_price(&admin, &usdc, &eurc, &9_090_909i128);
+
+        // Convert forward: 10_000_000 EURC → ~11_000_000 USDC
+        let forward = client.convert(&10_000_000i128, &eurc, &usdc);
+        assert_eq!(forward, 11_000_000i128);
+
+        // Convert back: 11_000_000 USDC → ~10_000_000 EURC
+        // (11_000_000 * 9_090_909) / 1e7 ≈ 10_000_000
+        let back = client.convert(&11_000_000i128, &usdc, &eurc);
+        // Due to fixed-point rounding, expect ~10M but allow ±1% error
+        assert!(back >= 9_900_000i128 && back <= 10_100_000i128, "round-trip within 1%");
     }
 }
