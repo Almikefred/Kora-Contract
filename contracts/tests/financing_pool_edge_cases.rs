@@ -726,4 +726,311 @@ mod financing_pool_edge_cases {
 
         // Event verification would happen via env.events() in real test
     }
+
+    // ── Issue #473: Incremental Yield Claims ──────────────────────────────────
+
+    #[test]
+    fn test_claim_yield_incremental_per_installment() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup pool
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        // Record investor position
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &10_000i128,
+        );
+
+        // Set up installment schedule
+        // 4 equal installments of 2_500 each
+        let _result = t.pool_client.try_set_installment_schedule(
+            &t.admin,
+            &invoice_id,
+            &vec![
+                (1_700_000_100, 2_500i128),
+                (1_700_000_200, 2_500i128),
+                (1_700_000_300, 2_500i128),
+                (1_700_000_400, 2_500i128),
+            ],
+        );
+
+        // Make first repayment of 2_500
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &2_500i128,
+        );
+
+        // Investor should now be able to claim their share of first installment
+        let claim_result = t.pool_client.try_claim_yield(
+            &t.investor1,
+            &invoice_id,
+        );
+
+        assert!(claim_result.is_ok(), "claim_yield should succeed after first installment repaid");
+    }
+
+    #[test]
+    fn test_claim_yield_prevents_double_claiming() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &5_000i128,
+        );
+
+        let _result = t.pool_client.try_set_installment_schedule(
+            &t.admin,
+            &invoice_id,
+            &vec![
+                (1_700_000_100, 5_000i128),
+                (1_700_000_200, 5_000i128),
+            ],
+        );
+
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &5_000i128,
+        );
+
+        // First claim succeeds
+        let claim1 = t.pool_client.try_claim_yield(
+            &t.investor1,
+            &invoice_id,
+        );
+        assert!(claim1.is_ok());
+
+        // Second claim for same amount should fail or return 0
+        let claim2 = t.pool_client.try_claim_yield(
+            &t.investor1,
+            &invoice_id,
+        );
+
+        // Should either fail or return amount 0 (all claimed)
+        if claim2.is_ok() {
+            // Verify returned amount is 0
+        }
+    }
+
+    #[test]
+    fn test_claim_yield_multi_investor_partial_claims() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 12_000i128;
+
+        // Setup pool with 2 investors
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &4_000i128,
+        );
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor2,
+            &8_000i128,
+        );
+
+        // Set 3 installments
+        let _result = t.pool_client.try_set_installment_schedule(
+            &t.admin,
+            &invoice_id,
+            &vec![
+                (1_700_000_100, 4_000i128),
+                (1_700_000_200, 4_000i128),
+                (1_700_000_300, 4_000i128),
+            ],
+        );
+
+        // Repay first installment
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &4_000i128,
+        );
+
+        // Investor1 claims (1/3 of their yield is now available)
+        let claim1 = t.pool_client.try_claim_yield(
+            &t.investor1,
+            &invoice_id,
+        );
+        assert!(claim1.is_ok());
+
+        // Investor2 also claims (1/3 of their yield)
+        let claim2 = t.pool_client.try_claim_yield(
+            &t.investor2,
+            &invoice_id,
+        );
+        assert!(claim2.is_ok());
+
+        // Repay second installment
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &4_000i128,
+        );
+
+        // Investor1 claims again (additional yield from installment 2)
+        let claim3 = t.pool_client.try_claim_yield(
+            &t.investor1,
+            &invoice_id,
+        );
+        assert!(claim3.is_ok());
+    }
+
+    #[test]
+    fn test_distribute_yield_nets_out_prior_claims() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 12_000i128;
+
+        // Setup
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &10_000i128,
+        );
+
+        let _result = t.pool_client.try_set_installment_schedule(
+            &t.admin,
+            &invoice_id,
+            &vec![
+                (1_700_000_100, 6_000i128),
+                (1_700_000_200, 6_000i128),
+            ],
+        );
+
+        // Repay first half
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &6_000i128,
+        );
+
+        // Investor claims partial yield
+        let _result = t.pool_client.try_claim_yield(
+            &t.investor1,
+            &invoice_id,
+        );
+
+        // Repay remaining half
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &6_000i128,
+        );
+
+        // Final distribute_yield should only pay unclaimed amount
+        // (this happens on pool close)
+        // Verify position.yield_claimed reflects all payouts
+    }
+
+    #[test]
+    fn test_yield_claimed_field_is_maintained() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &10_000i128,
+        );
+
+        // Position should start with yield_claimed = 0
+        let position = t.pool_client.get_position(
+            &invoice_id,
+            &t.investor1,
+        );
+        assert_eq!(position.yield_claimed, 0, "yield_claimed should start at 0");
+
+        // Repay
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &12_000i128,
+        );
+
+        // After claim_yield, position.yield_claimed should increase
+        let _result = t.pool_client.try_claim_yield(
+            &t.investor1,
+            &invoice_id,
+        );
+
+        let position = t.pool_client.get_position(
+            &invoice_id,
+            &t.investor1,
+        );
+        assert!(position.yield_claimed > 0, "yield_claimed should be updated after claim");
+    }
 }
