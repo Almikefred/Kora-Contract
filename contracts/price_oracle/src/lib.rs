@@ -4,6 +4,7 @@ use kora_shared::errors::KoraError;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
 const MAX_STALENESS_SECS: u64 = 3600;
+const DEFAULT_MAX_PRICE_DEVIATION_BPS: u32 = 1000; // 10% deviation
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -17,6 +18,7 @@ pub enum DataKey {
     Admin,
     Price(Symbol, Symbol),
     TokenSymbol(Address),
+    MaxDeviation,
 }
 
 #[contract]
@@ -29,12 +31,44 @@ impl PriceOracleContract {
             return Err(KoraError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxDeviation, &DEFAULT_MAX_PRICE_DEVIATION_BPS);
         Ok(())
     }
 
     /// Set a price for a currency pair. Admin only.
     /// Price is expressed as `base` units per 1 unit of `quote`, scaled by 1e7 (stroops).
+    /// Rejects prices that deviate more than MAX_PRICE_DEVIATION_BPS from the current stored price.
     pub fn set_price(
+        env: Env,
+        admin: Address,
+        base: Symbol,
+        quote: Symbol,
+        price: i128,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        if price <= 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        Self::check_price_deviation(&env, &base, &quote, price)?;
+
+        let data = PriceData {
+            price,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Price(base, quote), &data);
+        Ok(())
+    }
+
+    /// Set a price with override, bypassing deviation checks.
+    /// Admin only. Use for legitimate large moves (e.g., de-peg events).
+    pub fn set_price_override(
         env: Env,
         admin: Address,
         base: Symbol,
@@ -55,6 +89,21 @@ impl PriceOracleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Price(base, quote), &data);
+        Ok(())
+    }
+
+    /// Set the maximum allowed price deviation in basis points.
+    /// Admin only. Default is 1000 (10%).
+    pub fn set_max_deviation(
+        env: Env,
+        admin: Address,
+        deviation_bps: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxDeviation, &deviation_bps);
         Ok(())
     }
 
@@ -142,6 +191,54 @@ impl PriceOracleContract {
         let from_symbol = Self::resolve_symbol(env.clone(), from_token)?;
         let to_symbol = Self::resolve_symbol(env.clone(), to_token)?;
         Self::convert(env, amount, from_symbol, to_symbol)
+    }
+
+    fn get_max_deviation(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxDeviation)
+            .unwrap_or(DEFAULT_MAX_PRICE_DEVIATION_BPS)
+    }
+
+    fn check_price_deviation(
+        env: &Env,
+        base: &Symbol,
+        quote: &Symbol,
+        new_price: i128,
+    ) -> Result<(), KoraError> {
+        let max_deviation_bps = Self::get_max_deviation(env);
+
+        if let Ok(old_data) = env
+            .storage()
+            .persistent()
+            .get::<_, PriceData>(&DataKey::Price(base.clone(), quote.clone()))
+            .ok_or(KoraError::InvalidAmount)
+        {
+            let old_price = old_data.price;
+            let deviation_bps = if new_price > old_price {
+                let increase = new_price
+                    .checked_sub(old_price)
+                    .ok_or(KoraError::ArithmeticOverflow)?;
+                increase
+                    .checked_mul(10000)
+                    .and_then(|v| v.checked_div(old_price))
+                    .ok_or(KoraError::ArithmeticOverflow)? as u32
+            } else {
+                let decrease = old_price
+                    .checked_sub(new_price)
+                    .ok_or(KoraError::ArithmeticOverflow)?;
+                decrease
+                    .checked_mul(10000)
+                    .and_then(|v| v.checked_div(old_price))
+                    .ok_or(KoraError::ArithmeticOverflow)? as u32
+            };
+
+            if deviation_bps > max_deviation_bps {
+                return Err(KoraError::InvalidAmount);
+            }
+        }
+
+        Ok(())
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
@@ -265,5 +362,73 @@ mod tests {
 
         let result = client.convert_by_address(&10_000_000i128, &eurc_token, &usdc_token);
         assert_eq!(result, 11_000_000i128);
+    }
+
+    #[test]
+    fn test_price_within_deviation_succeeds() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        client.set_price(&admin, &base, &quote, &10_000_000i128);
+
+        // 10% deviation allowed (default), new price 10.5M is within 10%
+        let result = client.try_set_price(&admin, &base, &quote, &10_500_000i128);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_price_exceeding_deviation_rejected() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        client.set_price(&admin, &base, &quote, &10_000_000i128);
+
+        // 10% deviation allowed (default), new price 11.5M exceeds 10%
+        let result = client.try_set_price(&admin, &base, &quote, &11_500_000i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_price_override_bypasses_deviation() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        client.set_price(&admin, &base, &quote, &10_000_000i128);
+
+        // Exceeds deviation but override bypasses check
+        let result = client.try_set_price_override(&admin, &base, &quote, &20_000_000i128);
+        assert!(result.is_ok());
+        let data = client.get_price(&base, &quote);
+        assert_eq!(data.price, 20_000_000i128);
+    }
+
+    #[test]
+    fn test_set_max_deviation() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        client.set_price(&admin, &base, &quote, &10_000_000i128);
+
+        // Set deviation to 5% (500 bps)
+        client.set_max_deviation(&admin, &500u32);
+
+        // 7% increase should now fail (was within 10% before)
+        let result = client.try_set_price(&admin, &base, &quote, &10_700_000i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_first_price_always_succeeds() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        // No previous price, should succeed regardless of value
+        let result = client.try_set_price(&admin, &base, &quote, &100_000_000i128);
+        assert!(result.is_ok());
     }
 }
