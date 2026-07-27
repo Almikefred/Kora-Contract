@@ -17,6 +17,7 @@ pub enum PriceOracleError {
     NotInitialized = 6,
     NoUpgradeProposed = 7,
     UpgradeTimelockNotElapsed = 8,
+    ProtocolPaused = 9,
 }
 
 #[contracttype]
@@ -29,6 +30,7 @@ pub struct PriceData {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    AccessControl,
     Price(Symbol, Symbol),
     UpgradeProposal,
 }
@@ -38,16 +40,27 @@ pub struct PriceOracleContract;
 
 #[contractimpl]
 impl PriceOracleContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), PriceOracleError> {
+    pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), PriceOracleError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PriceOracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
+        Ok(())
+    }
+
+    /// Set the access_control contract address. Admin only.
+    /// Used for post-deployment wiring or migration.
+    pub fn set_access_control(env: Env, admin: Address, access_control: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
         Ok(())
     }
 
     /// Set a price for a currency pair. Admin only.
     /// Price is expressed as `base` units per 1 unit of `quote`, scaled by 1e7 (stroops).
+    /// Blocked when the protocol is paused.
     pub fn set_price(
         env: Env,
         admin: Address,
@@ -57,6 +70,7 @@ impl PriceOracleContract {
     ) -> Result<(), PriceOracleError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         if price <= 0 {
             return Err(PriceOracleError::InvalidAmount);
@@ -171,6 +185,25 @@ impl PriceOracleContract {
         }
         Ok(())
     }
+
+    fn require_not_paused(env: &Env) -> Result<(), PriceOracleError> {
+        let access_control: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccessControl)
+            .ok_or(PriceOracleError::NotInitialized)?;
+
+        let is_paused: bool = env.invoke_contract(
+            &access_control,
+            &soroban_sdk::Symbol::new(env, "is_paused"),
+            soroban_sdk::vec![env],
+        );
+
+        if is_paused {
+            return Err(PriceOracleError::ProtocolPaused);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -184,7 +217,8 @@ mod tests {
         let contract_id = env.register_contract(None, PriceOracleContract);
         let client = PriceOracleContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin);
+        let access_control = Address::generate(&env);
+        client.initialize(&admin, &access_control);
         (env, admin, client)
     }
 
@@ -311,5 +345,36 @@ mod tests {
         let (env, admin, client) = setup();
         let result = client.try_execute_upgrade(&admin);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_access_control() {
+        let (env, admin, client) = setup();
+        let new_access_control = Address::generate(&env);
+        client.set_access_control(&admin, &new_access_control).unwrap();
+    }
+
+    #[test]
+    fn test_set_price_when_paused_fails() {
+        let (env, admin, client) = setup();
+        let access_control = Address::generate(&env);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("AC"), &true);
+
+        let result = client.try_set_price(
+            &admin,
+            &Symbol::new(&env, "EURC"),
+            &Symbol::new(&env, "USDC"),
+            &11_000_000i128,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_price_when_not_paused_succeeds() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+        let result = client.try_set_price(&admin, &base, &quote, &11_000_000i128);
+        assert!(result.is_ok());
     }
 }
