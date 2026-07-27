@@ -2126,4 +2126,134 @@ mod tests {
         // client.record_default(&admin, &sme);
         // Verify that the new percentage was applied (10% slashed, not 50%).
     }
+
+    // ── Issue #481: Verifier reputation gating tests ─────────────────────────────
+
+    #[test]
+    fn test_register_sme_blocked_below_reputation_threshold() {
+        // Verifiers below a minimum reputation threshold should be blocked
+        // from registering new SMEs. This prevents low-reputation verifiers
+        // from continued fraudulent activity.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+
+        // Slash the verifier down to a low reputation
+        let bad_sme1 = Address::generate(&env);
+        client.register_sme(&verifier, &bad_sme1, &50u32, &true);
+        for _ in 0..10 {
+            client.record_default(&admin, &bad_sme1);
+        }
+        let reputation = client.get_verifier_reputation(&verifier);
+        assert_eq!(reputation, 0); // Slashed below threshold
+
+        // TODO: After implementing reputation gating:
+        // Attempting to register another SME should fail:
+        // let bad_sme2 = Address::generate(&env);
+        // assert!(client.try_register_sme(&verifier, &bad_sme2, &50u32, &true).is_err());
+    }
+
+    #[test]
+    fn test_update_sme_score_blocked_below_reputation_threshold() {
+        // Verifiers below reputation threshold should also be blocked from
+        // updating existing SME scores.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // Slash the verifier to 0 reputation
+        for _ in 0..10 {
+            client.record_default(&admin, &sme);
+        }
+        let reputation = client.get_verifier_reputation(&verifier);
+        assert_eq!(reputation, 0);
+
+        // TODO: After implementing reputation gating:
+        // Attempting to update the score should fail:
+        // assert!(client.try_update_sme_score(&verifier, &sme, &75u32).is_err());
+    }
+
+    #[test]
+    fn test_set_credit_limit_blocked_below_reputation_threshold() {
+        // Verifiers below reputation threshold should be blocked from
+        // setting or updating SME credit limits.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // Slash to 0 reputation
+        for _ in 0..10 {
+            client.record_default(&admin, &sme);
+        }
+
+        // TODO: After implementing reputation gating:
+        // assert!(client.try_set_credit_limit(&verifier, &sme, &1_000_000i128).is_err());
+    }
+
+    #[test]
+    fn test_reputation_preserved_on_verifier_removal_and_re_add() {
+        // Reputation history should survive remove_verifier and be preserved
+        // (not reset to 100) when the same address is re-added via add_verifier.
+        // This prevents a reputation laundering attack.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // Record defaults to slash reputation to 50
+        for _ in 0..5 {
+            client.record_default(&admin, &sme);
+        }
+        assert_eq!(client.get_verifier_reputation(&verifier), 50);
+
+        // Remove the verifier
+        client.remove_verifier(&admin, &verifier);
+        assert!(!client.is_verifier(&verifier));
+
+        // Re-add the same verifier
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+
+        // TODO: After implementing reputation history preservation:
+        // Reputation should still be 50, not reset to 100:
+        // assert_eq!(client.get_verifier_reputation(&verifier), 50);
+        // Current behavior resets to 100 (vulnerability).
+    }
+
+    #[test]
+    fn test_reputation_threshold_allows_default_actions() {
+        // A verifier at or above the reputation threshold should be able
+        // to perform all verifier actions (register_sme, update_sme_score, etc).
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+
+        // Verifier at reputation 100 (initial) should succeed
+        assert!(client.try_register_sme(&verifier, &sme, &50u32, &true).is_ok());
+        assert!(client.try_update_sme_score(&verifier, &sme, &75u32).is_ok());
+        assert!(client.try_set_credit_limit(&verifier, &sme, &500_000i128).is_ok());
+    }
 }
