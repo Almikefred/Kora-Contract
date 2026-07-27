@@ -8,7 +8,7 @@ use kora_shared::{
     types::{Listing, RiskTier},
     validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 
 // ~30 days in ledgers at ~5 s/ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -48,6 +48,8 @@ pub enum DataKey {
     GrossContribution(u64, Address),
     /// Whether an investor address is accredited and allowed to fund listings (#436).
     InvestorAccredited(Address),
+    /// Ordered Vec<Address> of unique investors who have funded a listing (#438).
+    ListingInvestors(u64),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -506,6 +508,19 @@ impl MarketplaceContract {
             .set(&gross_key, &safe_add(prev_gross_stored, amount)?);
         Self::bump_persistent(&env, &gross_key);
 
+        // === #438: Maintain per-listing investor index (unique addresses only) ===
+        let index_key = DataKey::ListingInvestors(invoice_id);
+        let mut investors_vec: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !investors_vec.contains(&investor) {
+            investors_vec.push_back(investor.clone());
+            env.storage().persistent().set(&index_key, &investors_vec);
+            Self::bump_persistent(&env, &index_key);
+        }
+
         let fully_funded = listing.funded_amount >= listing.asking_price;
         if fully_funded {
             listing.is_active = false;
@@ -843,6 +858,59 @@ impl MarketplaceContract {
             listing.funding_deadline,
         );
         Ok(())
+    }
+
+    /// Return a page of investor addresses that have funded `invoice_id`. (#438)
+    ///
+    /// `page` is 0-indexed; results are in order of first contribution.
+    /// `page_size` is clamped to 1–50.
+    pub fn get_listing_investors(
+        env: Env,
+        invoice_id: u64,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<Address> {
+        let page_size = (page_size.max(1).min(50)) as usize;
+        let all: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ListingInvestors(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let start = (page as usize).saturating_mul(page_size);
+        let mut out = Vec::new(&env);
+        let mut i = start as u32;
+        let end = (start + page_size).min(all.len() as usize) as u32;
+        while i < end {
+            out.push_back(all.get_unchecked(i));
+            i += 1;
+        }
+        out
+    }
+
+    /// Sum of all net (post-fee) contributions still outstanding for `invoice_id`. (#438)
+    ///
+    /// Iterates the `ListingInvestors` index and sums `Contribution` entries,
+    /// providing an on-chain reconciliation view that should equal
+    /// `listing.funded_amount` minus any fees collected.
+    pub fn get_total_outstanding_contribution(env: Env, invoice_id: u64) -> i128 {
+        let investors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ListingInvestors(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total: i128 = 0;
+        for investor in investors.iter() {
+            let contrib: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Contribution(invoice_id, investor.clone()))
+                .unwrap_or(0);
+            // Saturating add: malformed storage cannot cause a panic.
+            total = total.saturating_add(contrib);
+        }
+        total
     }
 
     /// Get a listing by invoice_id.
