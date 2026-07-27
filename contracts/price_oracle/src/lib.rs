@@ -22,6 +22,7 @@ pub enum DataKey {
     Feeder(Address),
     FeederPrice(Symbol, Symbol, Address),
     PriceFeeders(Symbol, Symbol),
+    BaseCurrency,
 }
 
 #[contract]
@@ -145,6 +146,18 @@ impl PriceOracleContract {
         Ok(())
     }
 
+    /// Set the base currency for multi-hop triangulation. Admin only.
+    pub fn set_base_currency(
+        env: Env,
+        admin: Address,
+        base: Symbol,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().set(&DataKey::BaseCurrency, &base);
+        Ok(())
+    }
+
     /// Set the maximum allowed price deviation in basis points.
     /// Admin only. Default is 1000 (10%).
     pub fn set_max_deviation(
@@ -214,7 +227,8 @@ impl PriceOracleContract {
     }
 
     /// Convert an amount from one currency to another using the stored price.
-    /// Rejects stale or missing prices.
+    /// First attempts direct pair conversion. If unavailable, triangulates through
+    /// the configured base currency. Rejects stale or missing prices.
     pub fn convert(
         env: Env,
         amount: i128,
@@ -225,17 +239,50 @@ impl PriceOracleContract {
             return Ok(amount);
         }
 
-        let price_data = Self::get_price(env.clone(), from, to)?;
-        let converted = amount
-            .checked_mul(price_data.price)
-            .and_then(|v| v.checked_div(10_000_000))
-            .ok_or(KoraError::ArithmeticOverflow)?;
+        match Self::get_price(env.clone(), from.clone(), to.clone()) {
+            Ok(price_data) => {
+                let converted = amount
+                    .checked_mul(price_data.price)
+                    .and_then(|v| v.checked_div(10_000_000))
+                    .ok_or(KoraError::ArithmeticOverflow)?;
 
-        if converted <= 0 {
-            return Err(KoraError::InvalidAmount);
+                if converted <= 0 {
+                    return Err(KoraError::InvalidAmount);
+                }
+
+                Ok(converted)
+            }
+            Err(_) => {
+                let base_currency: Symbol = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::BaseCurrency)
+                    .ok_or(KoraError::InvalidAmount)?;
+
+                if from == base_currency || to == base_currency {
+                    return Err(KoraError::InvalidAmount);
+                }
+
+                let from_to_base = Self::get_price(env.clone(), from, base_currency.clone())?;
+                let base_to_to = Self::get_price(env, base_currency, to)?;
+
+                let intermediate = amount
+                    .checked_mul(from_to_base.price)
+                    .and_then(|v| v.checked_div(10_000_000))
+                    .ok_or(KoraError::ArithmeticOverflow)?;
+
+                let converted = intermediate
+                    .checked_mul(base_to_to.price)
+                    .and_then(|v| v.checked_div(10_000_000))
+                    .ok_or(KoraError::ArithmeticOverflow)?;
+
+                if converted <= 0 {
+                    return Err(KoraError::InvalidAmount);
+                }
+
+                Ok(converted)
+            }
         }
-
-        Ok(converted)
     }
 
     /// Register a token address to its currency symbol.
@@ -602,5 +649,94 @@ mod tests {
         client.remove_feeder(&admin, &new_feeder);
         let result2 = client.try_set_price(&new_feeder, &base, &quote, &11_000_000i128);
         assert!(result2.is_err());
+    }
+
+    #[test]
+    fn test_multi_hop_conversion_via_base_currency() {
+        let (env, admin, feeder, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let gbpc = Symbol::new(&env, "GBPC");
+        let usdc = Symbol::new(&env, "USDC");
+
+        // Set USDC as base currency
+        client.set_base_currency(&admin, &usdc);
+
+        // Register only EURC->USDC and GBPC->USDC (not direct EURC->GBPC)
+        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128); // 1 EURC = 1.1 USDC
+        client.set_price(&feeder, &gbpc, &usdc, &13_000_000i128); // 1 GBPC = 1.3 USDC
+
+        // Convert EURC to GBPC via USDC triangulation
+        let result = client.convert(&10_000_000i128, &eurc, &gbpc);
+        assert!(result.is_ok());
+
+        // Verify math: 10M EURC * 1.1 = 11M USDC, then 11M / 1.3 ≈ 8.46M GBPC
+        let converted = result.unwrap();
+        assert!(converted > 0);
+        assert!(converted < 11_000_000i128);
+    }
+
+    #[test]
+    fn test_direct_pair_preferred_over_triangulation() {
+        let (env, admin, feeder, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let gbpc = Symbol::new(&env, "GBPC");
+        let usdc = Symbol::new(&env, "USDC");
+
+        client.set_base_currency(&admin, &usdc);
+
+        // Set direct pair and triangulation pairs with different rates
+        client.set_price(&feeder, &eurc, &gbpc, &10_000_000i128); // Direct: 1:1
+        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128); // Via base: 1 EURC = 1.1 USDC
+        client.set_price(&feeder, &gbpc, &usdc, &11_000_000i128); // Via base: 1 GBPC = 1.1 USDC
+
+        // Should use direct pair (10M), not triangulation result (~10M via base)
+        let result = client.convert(&10_000_000i128, &eurc, &gbpc);
+        let converted = result.unwrap();
+        assert_eq!(converted, 10_000_000i128);
+    }
+
+    #[test]
+    fn test_triangulation_fails_without_base_currency() {
+        let (env, _admin, feeder, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let gbpc = Symbol::new(&env, "GBPC");
+        let usdc = Symbol::new(&env, "USDC");
+
+        // No base currency set
+        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128);
+        client.set_price(&feeder, &gbpc, &usdc, &13_000_000i128);
+
+        // Should fail because no direct pair and no base currency
+        let result = client.try_convert(&10_000_000i128, &eurc, &gbpc);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_triangulation_both_legs_checked_for_staleness() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let (env, admin, feeder, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let gbpc = Symbol::new(&env, "GBPC");
+        let usdc = Symbol::new(&env, "USDC");
+
+        client.set_base_currency(&admin, &usdc);
+        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128);
+        client.set_price(&feeder, &gbpc, &usdc, &13_000_000i128);
+
+        // Advance time to make one leg stale
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + MAX_STALENESS_SECS + 1,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
+
+        // Should fail because at least one leg is stale
+        let result = client.try_convert(&10_000_000i128, &eurc, &gbpc);
+        assert!(result.is_err());
     }
 }
