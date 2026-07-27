@@ -762,3 +762,13 @@ pub fn investor_concentration_exceeded(
         (investor.clone(), invoice_id, prospective, cap_bps, env.ledger().timestamp()),
     );
 }
+
+/// Emitted when fund_invoice is rejected because the investor is not accredited (#436).
+/// Schema: (actor=investor, invoice_id, timestamp)
+pub fn investor_not_accredited(env: &Env, invoice_id: u64, investor: &Address) {
+    emit(
+        env,
+        symbol_short!("INV_NACC"),
+        (investor.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}

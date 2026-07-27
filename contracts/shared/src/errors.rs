@@ -100,6 +100,8 @@ pub enum KoraError {
     CurrencyNotAllowed = 122,
     // marketplace: investor's prospective share would exceed the per-listing concentration cap (#435)
     InvestorConcentrationExceeded = 123,
+    // marketplace: investor address has not been marked accredited (#436)
+    InvestorNotAccredited = 124,
 }
 use soroban_sdk::contracterror;
 

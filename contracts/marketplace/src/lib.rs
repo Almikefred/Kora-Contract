@@ -46,6 +46,8 @@ pub enum DataKey {
     /// Gross cumulative contribution (pre-fee) per investor per listing (#435).
     /// Stored separately from Contribution (net) so the cap check uses gross amounts.
     GrossContribution(u64, Address),
+    /// Whether an investor address is accredited and allowed to fund listings (#436).
+    InvestorAccredited(Address),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -174,6 +176,36 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::MaxInvestorShareBps)
             .unwrap_or(0)
+    }
+
+    /// Mark an investor address as accredited, enabling them to call
+    /// `fund_invoice`. Admin only. (#436)
+    ///
+    /// **Errors:** `NotAdmin`
+    pub fn set_investor_accredited(
+        env: Env,
+        admin: Address,
+        investor: Address,
+        accredited: bool,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvestorAccredited(investor.clone()), &accredited);
+        Self::bump_persistent(&env, &DataKey::InvestorAccredited(investor));
+        Ok(())
+    }
+
+    /// Returns whether `investor` is currently marked as accredited.
+    pub fn is_investor_accredited(env: Env, investor: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::InvestorAccredited(investor))
+            .unwrap_or(false)
     }
 
     /// Set a per-risk-tier fee override. Admin only. (#210)
@@ -372,6 +404,12 @@ impl MarketplaceContract {
         }
 
         let config = Self::load_config(&env)?;
+
+        // === #436: Investor compliance gate — must precede any token movement ===
+        // Mirrors the seller-side require_compliance_attested check in list_invoice.
+        // An investor whose accreditation flag is absent or explicitly false is
+        // rejected before touching any other state.
+        Self::require_investor_accredited(&env, &investor)?;
 
         // === #435: Per-listing investor concentration cap ===
         // Compute prospective gross (pre-fee) cumulative contribution and reject
@@ -735,6 +773,21 @@ impl MarketplaceContract {
         let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &config.risk_registry);
         if !rr.is_compliance_attested(sme) {
             return Err(KoraError::ComplianceNotAttested);
+        }
+        Ok(())
+    }
+
+    /// Enforce investor-side accreditation gate (#436).
+    /// Returns `Err(InvestorNotAccredited)` when the investor's accreditation
+    /// flag is absent or explicitly `false`.
+    fn require_investor_accredited(env: &Env, investor: &Address) -> Result<(), KoraError> {
+        let accredited: bool = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::InvestorAccredited(investor.clone()))
+            .unwrap_or(false);
+        if !accredited {
+            return Err(KoraError::InvestorNotAccredited);
         }
         Ok(())
     }
