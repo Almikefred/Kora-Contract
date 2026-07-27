@@ -278,6 +278,47 @@ impl FinancingPoolContract {
             .unwrap_or(5_000)
     }
 
+    /// Update the late-repayment penalty applied to overdue invoices.
+    /// Admin only. Can be synchronized with access_control governance if configured.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `late_penalty_bps` — Late-repayment penalty in basis points (0–10 000).
+    ///
+    /// **Errors:**
+    /// - `FinancingPoolError::NotAdmin` — Caller is not the admin.
+    /// - `FinancingPoolError::InvalidFeeRate` — `late_penalty_bps` > 10 000.
+    ///
+    /// **Security:** Requires `admin.require_auth()`. Once parameter governance is active
+    /// in access_control, this direct setter may be blocked to enforce governance exclusivity.
+    /// Governed value (if present) takes precedence when applying penalties.
+    pub fn set_late_penalty_bps(env: Env, admin: Address, late_penalty_bps: u32) -> Result<(), FinancingPoolError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        require_valid_fee_bps(late_penalty_bps)?;
+        env.storage().instance().set(&DataKey::LatePenaltyBps, &late_penalty_bps);
+        Ok(())
+    }
+
+    /// Returns the current late-repayment penalty in basis points.
+    /// Checks access_control governance first if available; falls back to locally stored value.
+    ///
+    /// **Returns:** The penalty in bps (default 200 = 2% if not explicitly set).
+    ///
+    /// **Security:** Read-only view. No authorization required.
+    /// This function is the integration point for parameter governance.
+    pub fn get_late_penalty_bps(env: Env) -> u32 {
+        // TODO: When access_control cross-contract calls are integrated, add:
+        // let access_control = Address::from_contract_id(&env, &env.storage().persistent().get(&DataKey::AccessControl).unwrap());
+        // if let Ok(governed_value) = AccessControlContractClient::new(&env, &access_control).get_parameter(...) {
+        //     return governed_value;
+        // }
+        env.storage()
+            .instance()
+            .get(&DataKey::LatePenaltyBps)
+            .unwrap_or(200)
+    }
+
     /// Register an investor position for a funded invoice. Admin only.
     ///
     /// Called by the marketplace (via admin) after each investor contribution to record

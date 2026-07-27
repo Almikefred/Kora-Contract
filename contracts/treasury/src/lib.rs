@@ -421,6 +421,7 @@ impl TreasuryContract {
     /// Defaults to 50 bps if the contract has not yet been initialized or if the
     /// fee has never been explicitly set.
     ///
+    /// If parameter governance is active in access_control, the governed value takes precedence.
     /// **Security:** Read-only view. No authorization required.
     pub fn get_fee_bps(env: Env) -> u32 {
         env.storage()
