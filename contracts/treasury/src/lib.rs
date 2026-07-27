@@ -7,7 +7,7 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     validation::{require_non_negative_amount, require_valid_fee_bps, require_within_max_amount, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -62,6 +62,8 @@ pub enum DataKey {
     Admin,
     /// Protocol fee in basis points — persistent for durability.
     FeeBps,
+    /// Price oracle contract address (optional, for multi-token fee valuation).
+    PriceOracle,
     /// Accumulated fees per token (informational).
     Collected(Address),
     /// Whitelisted token flag.
@@ -161,6 +163,29 @@ impl TreasuryContract {
         Self::bump_persistent(&env, &DataKey::FeeBps);
 
         events::fee_rate_updated(&env, &admin, old_bps, fee_bps);
+        Self::append_audit_entry(&env, &admin, AdminActionType::SetFeeBps);
+        Ok(())
+    }
+
+    /// Set or update the price oracle address. Admin only.
+    /// The oracle is optional — if not set, `get_total_collected_value` will work but skip unsupported conversions.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `price_oracle` — The price oracle contract address.
+    ///
+    /// **Errors:**
+    /// - `TreasuryError::NotAdmin` — Caller is not the admin.
+    ///
+    /// **Security:** Requires `admin.require_auth()`.
+    pub fn set_price_oracle(env: Env, admin: Address, price_oracle: Address) -> Result<(), TreasuryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PriceOracle, &price_oracle);
+        Self::bump_persistent(&env, &DataKey::PriceOracle);
         Self::append_audit_entry(&env, &admin, AdminActionType::SetFeeBps);
         Ok(())
     }
@@ -473,6 +498,89 @@ impl TreasuryContract {
             .persistent()
             .get(&DataKey::Admin)
             .ok_or(TreasuryError::NotInitialized)
+    }
+
+    /// Get the total value of collected fees for given tokens in a reference currency.
+    /// Converts each token's collected balance via the price oracle and sums the result.
+    ///
+    /// **Parameters:**
+    /// - `tokens` — Vec of token contract addresses to aggregate.
+    /// - `token_symbols` — Vec of corresponding token symbols (must match length of `tokens`).
+    /// - `reference_currency` — The target currency symbol for valuation (e.g., "USDC").
+    /// - `token_decimals` — Vec of token decimal places (must match length of `tokens`).
+    /// - `ref_decimals` — Decimal places of the reference currency (typically 6 or 7).
+    ///
+    /// **Returns:** Total collected fee revenue across all tokens, converted to reference currency.
+    /// Tokens for which no oracle price is available are skipped gracefully (0 contribution).
+    /// Returns 0 if no oracle is configured or all balances are zero.
+    ///
+    /// **Errors:**
+    /// - `TreasuryError::InvalidAmount` — Token/symbol/decimal vecs have mismatched lengths.
+    ///
+    /// **Security:** Read-only view. No authorization required. Price oracle errors (staleness, missing prices)
+    /// are silently tolerated — conversions are skipped for unavailable price pairs.
+    ///
+    /// **Note:** This is a temporary workaround pending issue #36 (token registry with decimal metadata).
+    /// Once a registry exists, a simpler `get_total_collected_value()` view with no parameters
+    /// will iterate automatically.
+    pub fn get_total_collected_value(
+        env: Env,
+        tokens: Vec<Address>,
+        token_symbols: Vec<Symbol>,
+        reference_currency: Symbol,
+        token_decimals: Vec<u32>,
+        ref_decimals: u32,
+    ) -> Result<i128, TreasuryError> {
+        if tokens.len() != token_symbols.len() || tokens.len() != token_decimals.len() {
+            return Err(TreasuryError::InvalidAmount);
+        }
+
+        // If no oracle is configured, return 0 (cannot perform conversions)
+        let oracle_addr: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceOracle);
+        let oracle_addr = match oracle_addr {
+            Some(addr) => addr,
+            None => return Ok(0),
+        };
+
+        let oracle_client = kora_price_oracle::PriceOracleContractClient::new(&env, &oracle_addr);
+        let mut total: i128 = 0;
+
+        for i in 0..tokens.len() {
+            let token_addr = tokens.get(i).unwrap();
+            let symbol = token_symbols.get(i).unwrap();
+            let decimals = token_decimals.get(i).unwrap();
+
+            let collected: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Collected(token_addr.clone()))
+                .unwrap_or(0);
+
+            if collected == 0 {
+                continue;
+            }
+
+            // Attempt conversion; if it fails (missing price, stale, etc.), skip this token
+            let converted = match oracle_client.try_convert_with_decimals(
+                &collected,
+                symbol,
+                &reference_currency,
+                decimals,
+                &ref_decimals,
+            ) {
+                Ok(val) => val,
+                Err(_) => 0, // Skip this token's contribution if conversion fails
+            };
+
+            total = total
+                .checked_add(converted)
+                .unwrap_or(i128::MAX); // Saturate on overflow
+        }
+
+        Ok(total)
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
