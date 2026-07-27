@@ -772,3 +772,30 @@ pub fn investor_not_accredited(env: &Env, invoice_id: u64, investor: &Address) {
         (investor.clone(), invoice_id, env.ledger().timestamp()),
     );
 }
+
+/// Emitted when a seller or admin successfully amends an unfunded listing (#437).
+/// Schema: (actor=caller, invoice_id, old_asking_price, new_asking_price,
+///          old_deadline, new_deadline, timestamp)
+pub fn listing_amended(
+    env: &Env,
+    invoice_id: u64,
+    caller: &Address,
+    old_asking_price: i128,
+    new_asking_price: i128,
+    old_deadline: u64,
+    new_deadline: u64,
+) {
+    emit(
+        env,
+        symbol_short!("LST_AMND"),
+        (
+            caller.clone(),
+            invoice_id,
+            old_asking_price,
+            new_asking_price,
+            old_deadline,
+            new_deadline,
+            env.ledger().timestamp(),
+        ),
+    );
+}

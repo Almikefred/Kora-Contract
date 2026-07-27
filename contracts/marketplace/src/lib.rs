@@ -6,7 +6,7 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::{Listing, RiskTier},
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
@@ -755,6 +755,93 @@ impl MarketplaceContract {
         token_client.transfer(&config.financing_pool, &investor, &net_contributed);
 
         events::refund_claimed(&env, invoice_id, &investor, net_contributed);
+        Ok(())
+    }
+
+    /// Amend an active, **unfunded** listing's asking price, funding deadline,
+    /// or token. Only the seller or admin may call this, and only while
+    /// `funded_amount == 0`. Any partial funding makes the listing immutable
+    /// until it is cancelled and re-listed. (#437)
+    ///
+    /// All provided values are re-validated using the same rules as
+    /// `list_invoice`: asking_price < face_value, future deadline, whitelisted
+    /// token. Pass `None` for any field you do not want to change.
+    ///
+    /// **Errors:**
+    /// - `NotAdmin` / `Unauthorized` — caller is neither seller nor admin.
+    /// - `ListingNotFound` — no active listing for `invoice_id`.
+    /// - `ListingAlreadyCancelled` — listing is inactive.
+    /// - `ListingAlreadyFunded` — `funded_amount > 0`; amendment is not allowed.
+    /// - `InvalidAmount` — new asking price is invalid or not discounted enough.
+    /// - `InvalidDueDate` — new deadline is not in the future.
+    /// - `TokenNotWhitelisted` — new token is not on the whitelist.
+    pub fn amend_listing(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_asking_price: Option<i128>,
+        new_funding_deadline: Option<u64>,
+        new_token: Option<Address>,
+    ) -> Result<(), KoraError> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let mut listing: Listing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Listing(invoice_id))
+            .ok_or(KoraError::ListingNotFound)?;
+
+        if !listing.is_active {
+            return Err(KoraError::ListingAlreadyCancelled);
+        }
+
+        // Amendment is only allowed before any investor capital has been committed.
+        if listing.funded_amount > 0 {
+            return Err(KoraError::ListingAlreadyFunded);
+        }
+
+        let config = Self::load_config(&env)?;
+        if caller != listing.seller && caller != config.admin {
+            return Err(KoraError::Unauthorized);
+        }
+
+        // Snapshot old values for the event.
+        let old_asking_price = listing.asking_price;
+        let old_deadline = listing.funding_deadline;
+
+        // Apply and validate each optional field.
+        if let Some(price) = new_asking_price {
+            require_non_zero_amount(price)?;
+            require_within_max_amount(price)?;
+            if price >= listing.face_value {
+                return Err(KoraError::InvalidAmount);
+            }
+            listing.asking_price = price;
+        }
+        if let Some(deadline) = new_funding_deadline {
+            kora_shared::validation::require_future_timestamp(&env, deadline)?;
+            listing.funding_deadline = deadline;
+        }
+        if let Some(ref token) = new_token {
+            Self::require_whitelisted_token(&env, token)?;
+            listing.token = token.clone();
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(invoice_id), &listing);
+        Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
+
+        events::listing_amended(
+            &env,
+            invoice_id,
+            &caller,
+            old_asking_price,
+            listing.asking_price,
+            old_deadline,
+            listing.funding_deadline,
+        );
         Ok(())
     }
 

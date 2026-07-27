@@ -102,6 +102,8 @@ pub enum KoraError {
     InvestorConcentrationExceeded = 123,
     // marketplace: investor address has not been marked accredited (#436)
     InvestorNotAccredited = 124,
+    // marketplace: amendment rejected because funding has already begun (#437)
+    ListingAlreadyFunded = 125,
 }
 use soroban_sdk::contracterror;
 
