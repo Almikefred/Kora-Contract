@@ -24,6 +24,7 @@ pub enum DataKey {
     FinancingPool,
     Treasury,
     AccessControl,
+    PriceOracle,
     FeeBps,
     Listing(u64),
     WhitelistedToken(Address),
@@ -46,6 +47,7 @@ pub struct MarketplaceConfig {
     pub financing_pool: Address,
     pub treasury: Address,
     pub access_control: Address,
+    pub price_oracle: Address,
     pub risk_registry: Address,
     pub fee_bps: u32,
     /// Fraction of the collected fee that goes to the referrer (0 = no split).
@@ -67,8 +69,10 @@ impl MarketplaceContract {
         financing_pool: Address,
         treasury: Address,
         access_control: Address,
+        price_oracle: Address,
         risk_registry: Address,
         fee_bps: u32,
+        referrer_split_bps: u32,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(KoraError::AlreadyInitialized);
@@ -81,12 +85,14 @@ impl MarketplaceContract {
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::AccessControl, &access_control);
+        env.storage().instance().set(&DataKey::PriceOracle, &price_oracle);
         let config = MarketplaceConfig {
             admin,
             invoice_nft,
             financing_pool,
             treasury,
             access_control,
+            price_oracle,
             risk_registry,
             fee_bps,
             referrer_split_bps,
@@ -323,26 +329,43 @@ impl MarketplaceContract {
             return Err(KoraError::FundingDeadlinePassed);
         }
 
+        let config = Self::load_config(&env)?;
+
+        // Early load of invoice to determine currency for conversion check
+        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+        let invoice = nft_client.get_invoice(&invoice_id);
+
+        // Determine the amount that will be credited (after conversion if needed)
+        let token_client = token::Client::new(&env, &listing.token);
+        let token_decimals = token_client.decimals();
+        let token_symbol = token_client.symbol();
+        let credited_amount = if token_symbol != invoice.currency {
+            let oracle_client = kora_price_oracle::PriceOracleContractClient::new(&env, &config.price_oracle);
+            let invoice_decimals = 7u32;
+            oracle_client.convert_with_decimals(
+                &amount,
+                &token_symbol,
+                &invoice.currency,
+                &token_decimals,
+                &invoice_decimals,
+            )?
+        } else {
+            amount
+        };
+
         let remaining = safe_sub(listing.asking_price, listing.funded_amount)?;
-        if amount > remaining {
+        if credited_amount > remaining {
             return Err(KoraError::ExceedsFundingTarget);
         }
-
-        let config = Self::load_config(&env)?;
 
         // Check per-invoice freeze before any token operations.
         // Enforced in addition to the protocol-wide pause so a single disputed
         // invoice can be frozen without halting all protocol activity.
-        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
         if nft_client.is_invoice_frozen(&invoice_id) {
             return Err(KoraError::InvoiceFrozen);
         }
 
-        let token_client = token::Client::new(&env, &listing.token);
-        let token_decimals = token_client.decimals();
-
         // Fetch the invoice's risk tier and apply tier-specific fee (#210)
-        let invoice = nft_client.get_invoice(&invoice_id);
         let effective_fee_bps: u32 = env.storage().instance()
             .get(&DataKey::TierFeeBps(Self::tier_ordinal(&invoice.risk_tier)))
             .unwrap_or(config.fee_bps);
@@ -364,7 +387,8 @@ impl MarketplaceContract {
             token_client.transfer(&investor, &config.financing_pool, &net);
         }
 
-        listing.funded_amount = safe_add(listing.funded_amount, amount)?;
+        // Credit the converted amount towards listing asking_price
+        listing.funded_amount = safe_add(listing.funded_amount, credited_amount)?;
 
         // Track per-investor net contribution for potential refund
         let contrib_key = DataKey::Contribution(invoice_id, investor.clone());
@@ -1964,6 +1988,7 @@ pub struct MarketplaceConfig {
     pub financing_pool: Address,
     pub treasury: Address,
     pub access_control: Address,
+    pub price_oracle: Address,
     pub risk_registry: Address,
     pub fee_bps: u32,
     /// Fraction of the collected fee that goes to the referrer (0 = no split).
