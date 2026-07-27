@@ -2027,4 +2027,103 @@ mod tests {
         //   - Fails with a "stake locked" error, or
         //   - Returns only a partial amount (withholding locked portion)
     }
+
+    // ── Issue #482: Admin parameter setter tests ────────────────────────────────
+
+    #[test]
+    fn test_set_minimum_stake_by_admin() {
+        // Admin should be able to update minimum_stake post-initialization
+        // to accommodate token price movements or protocol evolution.
+        let (env, admin, _, _, client) = setup();
+        let new_minimum_stake = 5_000_000i128;
+
+        // TODO: After implementing set_minimum_stake, this should succeed:
+        // assert!(client.try_set_minimum_stake(&admin, &new_minimum_stake).is_ok());
+        // Verify persistence: a new verifier must meet the updated minimum.
+    }
+
+    #[test]
+    fn test_set_minimum_stake_requires_admin() {
+        // Only the admin can update minimum_stake. Non-admins should be rejected.
+        let (env, _, _, _, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_minimum_stake = 5_000_000i128;
+
+        // TODO: After implementing set_minimum_stake:
+        // assert!(client.try_set_minimum_stake(&stranger, &new_minimum_stake).is_err());
+    }
+
+    #[test]
+    fn test_set_minimum_stake_with_bounds_validation() {
+        // set_minimum_stake should enforce reasonable bounds (e.g., non-negative).
+        let (env, admin, _, _, client) = setup();
+        let negative_stake = -1i128;
+
+        // TODO: After implementing set_minimum_stake:
+        // assert!(client.try_set_minimum_stake(&admin, &negative_stake).is_err());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_by_admin() {
+        // Admin should be able to update slash_percentage_bps post-initialization
+        // to recalibrate based on observed default rates.
+        let (env, admin, _, _, client) = setup();
+        let new_slash_percentage = 1_000u32; // 10% instead of 50%
+
+        // TODO: After implementing set_slash_percentage, this should succeed:
+        // assert!(client.try_set_slash_percentage(&admin, &new_slash_percentage).is_ok());
+        // Verify persistence: record_default should use the new percentage.
+    }
+
+    #[test]
+    fn test_set_slash_percentage_requires_admin() {
+        // Only the admin can update slash_percentage. Non-admins should be rejected.
+        let (env, _, _, _, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_slash_percentage = 1_000u32;
+
+        // TODO: After implementing set_slash_percentage:
+        // assert!(client.try_set_slash_percentage(&stranger, &new_slash_percentage).is_err());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_bounds_validation_above_10000() {
+        // slash_percentage_bps must not exceed 10_000 (100%).
+        let (env, admin, _, _, client) = setup();
+        let invalid_slash_percentage = 10_001u32;
+
+        // TODO: After implementing set_slash_percentage:
+        // assert!(client.try_set_slash_percentage(&admin, &invalid_slash_percentage).is_err());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_bounds_validation_zero_allowed() {
+        // slash_percentage_bps = 0 should be allowed (no slashing).
+        let (env, admin, _, _, client) = setup();
+        let zero_slash_percentage = 0u32;
+
+        // TODO: After implementing set_slash_percentage:
+        // assert!(client.try_set_slash_percentage(&admin, &zero_slash_percentage).is_ok());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_affects_future_defaults() {
+        // When slash_percentage is updated, future record_default calls should use
+        // the new percentage, not the one from initialization.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        let initial_stake = 10_000_000i128;
+
+        mint_stake(&env, &staking_token, &verifier, initial_stake);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, initial_stake);
+        client.add_verifier(&admin, &verifier, &initial_stake);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // TODO: After implementing set_slash_percentage:
+        // let new_slash_percentage = 1_000u32; // 10%
+        // client.set_slash_percentage(&admin, &new_slash_percentage);
+        // client.record_default(&admin, &sme);
+        // Verify that the new percentage was applied (10% slashed, not 50%).
+    }
 }
