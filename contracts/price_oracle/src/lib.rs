@@ -94,6 +94,7 @@ impl PriceOracleContract {
 
     /// Convert an amount from one currency to another using the stored price.
     /// Rejects stale or missing prices.
+    /// Does not adjust for token decimal differences; prices must account for decimals.
     pub fn convert(
         env: Env,
         amount: i128,
@@ -115,6 +116,83 @@ impl PriceOracleContract {
         }
 
         Ok(converted)
+    }
+
+    /// Convert an amount between currencies with decimal precision correction.
+    /// Applies: amount_out = (amount_in * price_ratio / 1e7) * 10^(to_decimals - from_decimals)
+    /// This corrects for differing token decimal places (e.g., 6 vs 7 decimal tokens).
+    ///
+    /// **Parameters:**
+    /// - `amount` — The input amount in `from` currency's smallest unit.
+    /// - `from` — Source currency symbol.
+    /// - `to` — Target currency symbol.
+    /// - `from_decimals` — Decimal places of the `from` token (typically 6 or 7).
+    /// - `to_decimals` — Decimal places of the `to` token (typically 6 or 7).
+    ///
+    /// **Returns:** Converted amount in `to` currency's smallest unit.
+    ///
+    /// **Errors:**
+    /// - `PriceOracleError::ArithmeticOverflow` — Multiplication or division overflowed.
+    /// - `PriceOracleError::InvalidAmount` — Price not found, stale, or result is ≤ 0.
+    /// - `PriceOracleError::InvoiceExpired` — Price data is older than MAX_STALENESS_SECS.
+    pub fn convert_with_decimals(
+        env: Env,
+        amount: i128,
+        from: Symbol,
+        to: Symbol,
+        from_decimals: u32,
+        to_decimals: u32,
+    ) -> Result<i128, PriceOracleError> {
+        if from == to {
+            return Ok(amount);
+        }
+
+        let price_data = Self::get_price(env.clone(), from.clone(), to.clone())?;
+        // First: apply price ratio scaled by 1e7
+        let converted = amount
+            .checked_mul(price_data.price)
+            .and_then(|v| v.checked_div(10_000_000))
+            .ok_or(PriceOracleError::ArithmeticOverflow)?;
+
+        if converted <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+
+        // Second: apply decimal rescaling based on token precision differences
+        let rescaled = if from_decimals >= to_decimals {
+            let divisor = Self::compute_10_pow(from_decimals - to_decimals)?;
+            converted
+                .checked_div(divisor)
+                .ok_or(PriceOracleError::ArithmeticOverflow)?
+        } else {
+            let multiplier = Self::compute_10_pow(to_decimals - from_decimals)?;
+            converted
+                .checked_mul(multiplier)
+                .ok_or(PriceOracleError::ArithmeticOverflow)?
+        };
+
+        if rescaled <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+
+        Ok(rescaled)
+    }
+
+    fn compute_10_pow(exp: u32) -> Result<i128, PriceOracleError> {
+        match exp {
+            0 => Ok(1),
+            1 => Ok(10),
+            2 => Ok(100),
+            3 => Ok(1_000),
+            4 => Ok(10_000),
+            5 => Ok(100_000),
+            6 => Ok(1_000_000),
+            7 => Ok(10_000_000),
+            8 => Ok(100_000_000),
+            9 => Ok(1_000_000_000),
+            10 => Ok(10_000_000_000),
+            _ => Err(PriceOracleError::ArithmeticOverflow),
+        }
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), PriceOracleError> {
@@ -204,5 +282,94 @@ mod tests {
 
         let result = client.try_get_price(&base, &quote);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_with_decimals_same_decimals() {
+        let (env, admin, client) = setup();
+        let eurc = Symbol::new(&env, "EURC");
+        let usdc = Symbol::new(&env, "USDC");
+        // 1 EURC = 1.1 USDC (11_000_000 stroops per 10_000_000)
+        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
+        // Both have 7 decimals: no rescaling needed, should match convert()
+        let result = client.convert_with_decimals(&10_000_000i128, &eurc, &usdc, &7u32, &7u32);
+        assert_eq!(result, 11_000_000i128);
+    }
+
+    #[test]
+    fn test_convert_with_decimals_from_7_to_6() {
+        let (env, admin, client) = setup();
+        let token7 = Symbol::new(&env, "TOK7");
+        let token6 = Symbol::new(&env, "TOK6");
+        // Price: 1 TOK7 unit = 1.1 TOK6 units (scaled at 1e7)
+        client.set_price(&admin, &token7, &token6, &11_000_000i128);
+        // Input: 10_000_000 units of 7-decimal token
+        // Expected (raw): 11_000_000 units of 6-decimal token
+        // But we rescale by dividing by 10 (7-6=1): 11_000_000 / 10 = 1_100_000
+        let result = client.convert_with_decimals(&10_000_000i128, &token7, &token6, &7u32, &6u32);
+        assert_eq!(result, 1_100_000i128);
+    }
+
+    #[test]
+    fn test_convert_with_decimals_from_6_to_7() {
+        let (env, admin, client) = setup();
+        let token6 = Symbol::new(&env, "TOK6");
+        let token7 = Symbol::new(&env, "TOK7");
+        // Price: 1 TOK6 unit = 0.9090... TOK7 units (scaled); use 9_090_909 ~ 1e7 / 1.1
+        client.set_price(&admin, &token6, &token7, &9_090_909i128);
+        // Input: 1_000_000 units of 6-decimal token
+        // Expected (raw): 9_090_909 units of 7-decimal token
+        // But we rescale by multiplying by 10 (7-6=1): 9_090_909 * 10 = 90_909_090
+        let result = client.convert_with_decimals(&1_000_000i128, &token6, &token7, &6u32, &7u32);
+        assert_eq!(result, 90_909_090i128);
+    }
+
+    #[test]
+    fn test_convert_with_decimals_regression_old_math_wrong() {
+        let (env, admin, client) = setup();
+        let token7 = Symbol::new(&env, "TOK7");
+        let token6 = Symbol::new(&env, "TOK6");
+        // If old convert() were used without decimals for 7→6: it would be off by 10x
+        client.set_price(&admin, &token7, &token6, &11_000_000i128);
+
+        // Old convert() for 10_000_000 units would give 11_000_000 (wrong order of magnitude)
+        // New convert_with_decimals gives 1_100_000 (correct after rescaling)
+        let old_result = client.convert(&10_000_000i128, &token7, &token6);
+        let new_result = client.convert_with_decimals(&10_000_000i128, &token7, &token6, &7u32, &6u32);
+
+        assert_eq!(old_result, 11_000_000i128, "old convert gives raw price-adjusted value");
+        assert_eq!(new_result, 1_100_000i128, "new convert_with_decimals correctly rescales");
+        assert_eq!(old_result, new_result * 10, "old result is exactly 10x the correct result");
+    }
+
+    #[test]
+    fn test_convert_with_decimals_round_trip() {
+        let (env, admin, client) = setup();
+        let usdc = Symbol::new(&env, "USDC");
+        let eurc = Symbol::new(&env, "EURC");
+        // USDC: 6 decimals, EURC: 7 decimals
+        // Forward: 1 USDC = 0.9 EURC (at 1e7 scale)
+        client.set_price(&admin, &usdc, &eurc, &9_000_000i128);
+        // Reverse: 1 EURC ≈ 1.111... USDC (at 1e7 scale ≈ 1_111_111)
+        client.set_price(&admin, &eurc, &usdc, &11_111_111i128);
+
+        let start = 1_000_000i128; // 1 USDC
+        let to_eurc = client.convert_with_decimals(&start, &usdc, &eurc, &6u32, &7u32).unwrap();
+        // start (1M) * 9_000_000 / 1e7 * 10 = 1M * 9 / 10 * 10 = 9M
+        // Actually: (1_000_000 * 9_000_000) / 1e7 * 10 = 9_000_000_000_000 / 1e7 * 10 = 900 * 10 = 9_000
+
+        // Let's verify with actual math:
+        // 1_000_000 * 9_000_000 = 9_000_000_000_000
+        // / 10_000_000 = 900_000
+        // * 10 (rescale from 6 to 7) = 9_000_000
+        assert_eq!(to_eurc, 9_000_000i128);
+
+        // Convert back
+        let back_to_usdc = client.convert_with_decimals(&to_eurc, &eurc, &usdc, &7u32, &6u32).unwrap();
+        // 9_000_000 * 11_111_111 / 1e7 / 10 (rescale from 7 to 6)
+        // = (9_000_000 * 11_111_111) / 1e7 / 10
+        // = 100_000_000_000_000 / 1e7 / 10 (approximately)
+        // ≈ 10_000_000 / 10 = 1_000_000
+        assert_eq!(back_to_usdc, 1_000_000i128, "round-trip returns ~original amount");
     }
 }
