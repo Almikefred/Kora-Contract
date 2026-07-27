@@ -46,6 +46,8 @@ pub enum AccessControlError {
     ThresholdNotMet = 25,
     Unauthorized = 26,
     UpgradeTimelockNotElapsed = 27,
+    ProposalCancelled = 28,
+    ParameterProposalCancelled = 29,
 }
 
 impl From<CommonError> for AccessControlError {
@@ -435,6 +437,7 @@ impl AccessControlContract {
             proposer: proposer.clone(),
             approvals,
             executed: false,
+            cancelled: false,
             created_at: env.ledger().timestamp(),
             expires_at: env.ledger().timestamp() + PROPOSAL_TTL_LEDGERS,
         };
@@ -483,6 +486,9 @@ impl AccessControlContract {
 
         if proposal.executed {
             return Err(AccessControlError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(AccessControlError::ProposalCancelled);
         }
         if env.ledger().timestamp() > proposal.expires_at {
             return Err(AccessControlError::ProposalExpired);
@@ -534,6 +540,9 @@ impl AccessControlContract {
 
         if proposal.executed {
             return Err(AccessControlError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(AccessControlError::ProposalCancelled);
         }
         if env.ledger().timestamp() > proposal.expires_at {
             return Err(AccessControlError::ProposalExpired);
@@ -587,6 +596,42 @@ impl AccessControlContract {
 
         events::action_executed(&env, proposal_id, &executor);
         Self::append_audit_entry(&env, &executor, AdminActionType::MultisigExecuteAction);
+        Ok(())
+    }
+
+    /// Cancel a proposal before execution. Only the proposer or a quorum of signers may cancel.
+    pub fn cancel_action(
+        env: Env,
+        canceller: Address,
+        proposal_id: u64,
+    ) -> Result<(), AccessControlError> {
+        canceller.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &canceller)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(AccessControlError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(AccessControlError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(AccessControlError::ProposalCancelled);
+        }
+
+        if proposal.proposer != canceller && proposal.approvals.len() < config.threshold {
+            return Err(AccessControlError::Unauthorized);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+
         Ok(())
     }
 
@@ -651,6 +696,7 @@ impl AccessControlContract {
             approvals,
             created_at: env.ledger().timestamp(),
             executed: false,
+            cancelled: false,
         };
 
         env.storage()
@@ -701,6 +747,9 @@ impl AccessControlContract {
         if proposal.executed {
             return Err(AccessControlError::ParameterProposalAlreadyExecuted);
         }
+        if proposal.cancelled {
+            return Err(AccessControlError::ParameterProposalCancelled);
+        }
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == signer {
                 return Err(AccessControlError::AlreadyVoted);
@@ -740,6 +789,9 @@ impl AccessControlContract {
         if proposal.executed {
             return Err(AccessControlError::ParameterProposalAlreadyExecuted);
         }
+        if proposal.cancelled {
+            return Err(AccessControlError::ParameterProposalCancelled);
+        }
         if proposal.approvals.len() < config.threshold {
             return Err(AccessControlError::GovernanceThresholdNotMet);
         }
@@ -760,6 +812,42 @@ impl AccessControlContract {
 
         events::action_executed(&env, proposal_id, &caller);
         Self::append_audit_entry(&env, &caller, AdminActionType::ExecuteParameter);
+        Ok(())
+    }
+
+    /// Cancel a parameter-change proposal before execution. Only the proposer or a quorum of signers may cancel.
+    pub fn cancel_parameter_change(
+        env: Env,
+        canceller: Address,
+        proposal_id: u64,
+    ) -> Result<(), AccessControlError> {
+        canceller.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &canceller)?;
+
+        let mut proposal: ParameterProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ParameterProposal(proposal_id))
+            .ok_or(AccessControlError::ParameterProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(AccessControlError::ParameterProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(AccessControlError::ParameterProposalCancelled);
+        }
+
+        if proposal.proposer != canceller && proposal.approvals.len() < config.threshold {
+            return Err(AccessControlError::Unauthorized);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ParameterProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::ParameterProposal(proposal_id));
+
         Ok(())
     }
 
@@ -1799,5 +1887,92 @@ mod tests {
         assert!(!client.is_paused(), "Pause state should remain unpaused");
         assert!(client.has_role(&target1, &Role::Verifier), "Re-granted role should be assigned");
         assert!(client.has_role(&target2, &Role::Operator), "Other role should be unaffected");
+    }
+
+    // ── Proposal cancellation ──────────────────────────────────────────────
+
+    #[test]
+    fn test_cancel_action_by_proposer() {
+        let (env, admin, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.configure_multisig(&admin, &signers, 1);
+
+        let action = AdminAction::Pause;
+        let proposal_id = client.propose_action(&admin, &action).unwrap();
+
+        client.cancel_action(&admin, proposal_id).unwrap();
+        let proposal = client.get_proposal(proposal_id).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    #[test]
+    fn test_cannot_execute_cancelled_proposal() {
+        let (env, admin, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.configure_multisig(&admin, &signers, 1);
+
+        let action = AdminAction::Pause;
+        let proposal_id = client.propose_action(&admin, &action).unwrap();
+        client.cancel_action(&admin, proposal_id).unwrap();
+
+        assert!(client.try_execute_action(&admin, proposal_id).is_err());
+    }
+
+    #[test]
+    fn test_cannot_approve_cancelled_proposal() {
+        let (env, admin, client) = setup();
+        let signer2 = Address::generate(&env);
+        let signers = soroban_sdk::vec![&env, admin.clone(), signer2.clone()];
+        client.configure_multisig(&admin, &signers, 2);
+
+        let action = AdminAction::Pause;
+        let proposal_id = client.propose_action(&admin, &action).unwrap();
+        client.cancel_action(&admin, proposal_id).unwrap();
+
+        assert!(client.try_approve_action(&signer2, proposal_id).is_err());
+    }
+
+    #[test]
+    fn test_cancel_parameter_change_by_proposer() {
+        let (env, admin, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.configure_multisig(&admin, &signers, 1);
+
+        let proposal_id = client
+            .propose_parameter_change(&admin, &ParameterKey::FeeBps, &500)
+            .unwrap();
+
+        client.cancel_parameter_change(&admin, proposal_id).unwrap();
+        let proposal = client.get_parameter_proposal(proposal_id).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    #[test]
+    fn test_cannot_execute_cancelled_parameter_change() {
+        let (env, admin, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.configure_multisig(&admin, &signers, 1);
+
+        let proposal_id = client
+            .propose_parameter_change(&admin, &ParameterKey::FeeBps, &500)
+            .unwrap();
+        client.cancel_parameter_change(&admin, proposal_id).unwrap();
+
+        assert!(client.try_execute_parameter_change(&admin, proposal_id).is_err());
+    }
+
+    #[test]
+    fn test_cannot_vote_on_cancelled_parameter_change() {
+        let (env, admin, client) = setup();
+        let signer2 = Address::generate(&env);
+        let signers = soroban_sdk::vec![&env, admin.clone(), signer2.clone()];
+        client.configure_multisig(&admin, &signers, 2);
+
+        let proposal_id = client
+            .propose_parameter_change(&admin, &ParameterKey::FeeBps, &500)
+            .unwrap();
+        client.cancel_parameter_change(&admin, proposal_id).unwrap();
+
+        assert!(client.try_vote_parameter_change(&signer2, proposal_id).is_err());
     }
 }
