@@ -6,8 +6,7 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::SmeProfile,
-    validation::{require_exact_length, require_non_negative_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
-    validation::{require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
+    validation::{require_non_negative_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec,
@@ -186,12 +185,12 @@ impl RiskRegistryContract {
     /// - `invoice_nft` — The deployed `invoice_nft` contract address.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::InvalidAddress` — `invoice_nft` is the contract's own address.
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::InvalidAddress` — `invoice_nft` is the contract's own address.
     ///
     /// **Security:** Requires `admin.require_auth()`. Idempotent — safe to call again if
     /// the invoice_nft contract is redeployed.
-    pub fn set_invoice_nft(env: Env, admin: Address, invoice_nft: Address) -> Result<(), KoraError> {
+    pub fn set_invoice_nft(env: Env, admin: Address, invoice_nft: Address) -> Result<(), RiskRegistryError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &invoice_nft)?;
@@ -1066,23 +1065,6 @@ impl RiskRegistryContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events, Ledger, LedgerInfo},
-        Bytes, Env,
-    };
-
-    /// Returns (env, admin, invoice_nft, staking_token, client)
-    ///
-    /// `staking_token` is a real deployed Stellar Asset Contract (not just a
-    /// generated address) so that `add_verifier`'s internal `token::Client::transfer`
-    /// call has a real contract instance to invoke against. Use `mint_stake` to
-    /// fund a verifier address before calling `add_verifier`/`try_add_verifier`.
-    fn setup() -> (Env, Address, Address, Address, RiskRegistryContractClient<'static>) {
-        let env = Env::default();
-        // `add_verifier` internally calls the staking token's `transfer`, which
-        // requires `verifier.require_auth()` in a *nested* invocation (not the
-        // root `add_verifier` call). Plain `mock_all_auths()` only auto-satisfies
-        // auth requirements tied to the root invocation, so this test setup
-        // needs the non-root variant.
         testutils::{Address as _, Events as _, Ledger, LedgerInfo},
         Bytes, Env,
     };
@@ -1100,7 +1082,6 @@ mod tests {
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let invoice_nft = Address::generate(&env);
-        let staking_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
         let token_admin = Address::generate(&env);
         let staking_token = env.register_stellar_asset_contract_v2(token_admin).address();
         client.initialize(&admin, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32);
@@ -1722,7 +1703,6 @@ mod tests {
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let invoice_nft = Address::generate(&env);
         let staking_token = Address::generate(&env);
-        let result = client.try_initialize(&contract_id, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32);
         let result = client.try_initialize(
             &contract_id,
             &invoice_nft,
@@ -1967,6 +1947,6 @@ mod tests {
         });
 
         let result = client.try_set_credit_limit(&verifier, &sme, &-1i128);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), RiskRegistryError::InvalidAmount);
     }
 }

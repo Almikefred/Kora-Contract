@@ -790,15 +790,6 @@ name = "kora-price-oracle"
 version = "0.1.0"
 dependencies = [
  "kora-shared",
- "kora-treasury",
- "soroban-sdk",
-]
-
-[[package]]
-name = "kora-price-oracle"
-version = "0.1.0"
-dependencies = [
- "kora-shared",
  "soroban-sdk",
 ]
 
