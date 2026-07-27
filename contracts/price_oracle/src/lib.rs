@@ -16,6 +16,7 @@ pub struct PriceData {
 pub enum DataKey {
     Admin,
     Price(Symbol, Symbol),
+    TokenSymbol(Address),
 }
 
 #[contract]
@@ -106,6 +107,43 @@ impl PriceOracleContract {
         Ok(converted)
     }
 
+    /// Register a token address to its currency symbol.
+    /// Admin only. Used for address-based conversion lookups.
+    pub fn register_token_symbol(
+        env: Env,
+        admin: Address,
+        token: Address,
+        symbol: Symbol,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenSymbol(token), &symbol);
+        Ok(())
+    }
+
+    /// Resolve a token address to its registered currency symbol.
+    pub fn resolve_symbol(env: Env, token: Address) -> Result<Symbol, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenSymbol(token))
+            .ok_or(KoraError::InvalidAddress)
+    }
+
+    /// Convert an amount using token addresses instead of symbols.
+    /// Internally resolves both addresses to symbols and delegates to convert.
+    pub fn convert_by_address(
+        env: Env,
+        amount: i128,
+        from_token: Address,
+        to_token: Address,
+    ) -> Result<i128, KoraError> {
+        let from_symbol = Self::resolve_symbol(env.clone(), from_token)?;
+        let to_symbol = Self::resolve_symbol(env.clone(), to_token)?;
+        Self::convert(env, amount, from_symbol, to_symbol)
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let admin: Address = env
             .storage()
@@ -193,5 +231,39 @@ mod tests {
 
         let result = client.try_get_price(&base, &quote);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_register_and_resolve_token_symbol() {
+        let (env, admin, client) = setup();
+        let token_addr = Address::generate(&env);
+        let symbol = Symbol::new(&env, "USDC");
+        client.register_token_symbol(&admin, &token_addr, &symbol);
+        let resolved = client.resolve_symbol(&token_addr);
+        assert_eq!(resolved, symbol);
+    }
+
+    #[test]
+    fn test_resolve_unregistered_token_fails() {
+        let (env, _admin, client) = setup();
+        let token_addr = Address::generate(&env);
+        let result = client.try_resolve_symbol(&token_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_by_address() {
+        let (env, admin, client) = setup();
+        let eurc_token = Address::generate(&env);
+        let usdc_token = Address::generate(&env);
+        let eurc_symbol = Symbol::new(&env, "EURC");
+        let usdc_symbol = Symbol::new(&env, "USDC");
+
+        client.register_token_symbol(&admin, &eurc_token, &eurc_symbol);
+        client.register_token_symbol(&admin, &usdc_token, &usdc_symbol);
+        client.set_price(&admin, &eurc_symbol, &usdc_symbol, &11_000_000i128);
+
+        let result = client.convert_by_address(&10_000_000i128, &eurc_token, &usdc_token);
+        assert_eq!(result, 11_000_000i128);
     }
 }
