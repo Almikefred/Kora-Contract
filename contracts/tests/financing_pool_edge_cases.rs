@@ -1033,4 +1033,313 @@ mod financing_pool_edge_cases {
         );
         assert!(position.yield_claimed > 0, "yield_claimed should be updated after claim");
     }
+
+    // ── Issue #472: AggregateFunded Accounting ────────────────────────────────
+
+    #[test]
+    fn test_get_aggregate_funded_view_function() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup pool
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        // Record position
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &10_000i128,
+        );
+
+        // get_aggregate_funded should return total funded for token
+        let aggregate = t.pool_client.get_aggregate_funded(
+            &t.token,
+        );
+
+        assert_eq!(aggregate, 10_000i128, "aggregate_funded should match total position");
+    }
+
+    #[test]
+    fn test_aggregate_funded_updated_on_record_position() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let initial_aggregate = t.pool_client.get_aggregate_funded(&t.token);
+        assert_eq!(initial_aggregate, 0, "aggregate should start at 0");
+
+        // Record position
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &5_000i128,
+        );
+
+        let aggregate1 = t.pool_client.get_aggregate_funded(&t.token);
+        assert_eq!(aggregate1, 5_000i128, "aggregate should increase");
+
+        // Record another position
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor2,
+            &3_000i128,
+        );
+
+        let aggregate2 = t.pool_client.get_aggregate_funded(&t.token);
+        assert_eq!(aggregate2, 8_000i128, "aggregate should accumulate positions");
+    }
+
+    #[test]
+    fn test_aggregate_funded_updated_on_distribute_yield() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &10_000i128,
+        );
+
+        let aggregate_before = t.pool_client.get_aggregate_funded(&t.token);
+        assert_eq!(aggregate_before, 10_000i128);
+
+        // Repay (triggers distribute_yield)
+        let _result = t.pool_client.try_repay(
+            &t.sme,
+            &invoice_id,
+            &t.token,
+            &face_value,
+        );
+
+        // aggregate_funded should decrease after pool closes
+        let aggregate_after = t.pool_client.get_aggregate_funded(&t.token);
+        assert_eq!(aggregate_after, 0, "aggregate should decrease when pool closes");
+    }
+
+    #[test]
+    fn test_max_aggregate_funded_cap_enforcement() {
+        let t = setup();
+
+        // Set max aggregate cap for token
+        let cap = 50_000i128;
+        let result = t.pool_client.try_set_max_aggregate_funded(
+            &t.admin,
+            &t.token,
+            &cap,
+        );
+        assert!(result.is_ok(), "admin should be able to set cap");
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup first pool at 30_000
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &30_000i128,
+        );
+
+        // Setup second pool at 15_000 (total 45_000, within cap)
+        let invoice_id2 = 2u64;
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id2,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id2,
+            &t.investor2,
+            &15_000i128,
+        );
+        assert!(result.is_ok(), "position at 45_000 should be within cap");
+
+        // Try to exceed cap - third pool at 10_000 (total 55_000, exceeds cap)
+        let invoice_id3 = 3u64;
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id3,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id3,
+            &t.investor1,
+            &10_000i128,
+        );
+
+        assert!(result.is_err(), "position exceeding cap should be rejected");
+    }
+
+    #[test]
+    fn test_solvency_check_view_function() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &10_000i128,
+        );
+
+        // Check solvency - should show contract can cover all tracked obligations
+        let solvency = t.pool_client.check_solvency(
+            &t.token,
+        );
+
+        assert!(solvency.is_solvent, "contract should be solvent when tracking obligations");
+    }
+
+    #[test]
+    fn test_max_aggregate_funded_only_enforced_in_record_position() {
+        let t = setup();
+
+        // Set a cap
+        let cap = 20_000i128;
+        let _result = t.pool_client.try_set_max_aggregate_funded(
+            &t.admin,
+            &t.token,
+            &cap,
+        );
+
+        // Cap should NOT prevent pool creation (release_funds)
+        let invoice_id = 1u64;
+        let face_value = 30_000i128;
+
+        let marketplace = Address::generate(&t.env);
+        let result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        assert!(result.is_ok(), "release_funds should not check cap");
+
+        // Cap IS enforced in record_position
+        let position_result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &30_000i128,
+        );
+
+        assert!(position_result.is_err(), "record_position should enforce cap");
+    }
+
+    #[test]
+    fn test_multiple_tokens_independent_aggregate_tracking() {
+        let t = setup();
+
+        let token2 = Address::generate(&t.env);
+        let invoice_id = 1u64;
+        let face_value = 10_000i128;
+
+        // Setup pool for token1
+        let marketplace = Address::generate(&t.env);
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &5_000i128,
+        );
+
+        // Setup pool for token2
+        let invoice_id2 = 2u64;
+        let _result = t.pool_client.try_release_funds(
+            &marketplace,
+            &invoice_id2,
+            &face_value,
+            &t.sme,
+            &token2,
+        );
+
+        let _result = t.pool_client.try_record_position(
+            &marketplace,
+            &invoice_id2,
+            &t.investor2,
+            &3_000i128,
+        );
+
+        // Aggregates should be tracked separately per token
+        let agg_token1 = t.pool_client.get_aggregate_funded(&t.token);
+        let agg_token2 = t.pool_client.get_aggregate_funded(&token2);
+
+        assert_eq!(agg_token1, 5_000i128, "token1 aggregate should be 5_000");
+        assert_eq!(agg_token2, 3_000i128, "token2 aggregate should be 3_000");
+    }
 }
