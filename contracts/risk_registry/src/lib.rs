@@ -274,6 +274,7 @@ impl RiskRegistryContract {
         Self::bump_persistent(&env, &DataKey::Verifier(verifier.clone()));
         Self::bump_persistent(&env, &DataKey::VerifierStake(verifier.clone()));
         Self::bump_persistent(&env, &DataKey::VerifierReputation(verifier.clone()));
+        // TODO: Sync with access_control: AccessControlContractClient::new(&env, &access_control).grant_role(&admin, &verifier, Role::Verifier)?;
         events::verifier_added(&env, &admin, &verifier);
         Self::append_audit_entry(&env, &admin, AdminActionType::AddVerifier);
         Ok(())
@@ -395,6 +396,7 @@ impl RiskRegistryContract {
         env.storage()
             .persistent()
             .remove(&DataKey::VerifierReputation(verifier.clone()));
+        // TODO: Sync with access_control: AccessControlContractClient::new(&env, &access_control).revoke_role(&admin, &verifier)?;
         events::verifier_removed(&env, &admin, &verifier);
         Self::append_audit_entry(&env, &admin, AdminActionType::RemoveVerifier);
         Ok(())

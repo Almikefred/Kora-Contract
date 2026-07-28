@@ -93,6 +93,25 @@ pub fn require_valid_risk_score(score: u32) -> Result<(), KoraError> {
     }
     Ok(())
 }
+/// Validate that `score` is within [0, max_score] inclusive.
+/// Used when the maximum risk score is governed by access_control.
+///
+/// # Examples
+/// ```ignore
+/// use kora_shared::validation::require_valid_risk_score_with_max;
+/// assert!(require_valid_risk_score_with_max(50, 100).is_ok());
+/// assert!(require_valid_risk_score_with_max(100, 100).is_ok());
+/// assert!(require_valid_risk_score_with_max(101, 100).is_err());
+/// assert!(require_valid_risk_score_with_max(50, 50).is_ok());
+/// assert!(require_valid_risk_score_with_max(51, 50).is_err());
+/// ```
+pub fn require_valid_risk_score_with_max(score: u32, max_score: u32) -> Result<(), KoraError> {
+    if score > max_score {
+        return Err(KoraError::InvalidRiskScore);
+    }
+    Ok(())
+}
+
 
 /// Reject risk scores above a protocol-configured ceiling, which may be
 /// stricter than (but never looser than) the hard 100 cap enforced by

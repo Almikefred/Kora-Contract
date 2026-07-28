@@ -169,12 +169,18 @@ impl AccessControlContract {
     /// **Errors:**
     /// - `AccessControlError::Unauthorized` / `AccessControlError::NotAdmin` — Caller is not the admin.
     /// - `AccessControlError::AlreadyPaused` — Protocol is already in the paused state.
+    /// - `AccessControlError::DirectCallProhibited` — Multisig is configured; use propose/approve/execute instead.
     /// - `AccessControlError::Reentrancy` — Reentrancy guard triggered (should never happen in normal flow).
     ///
     /// **Security:** Requires `admin.require_auth()`. Emits `protocol_paused` event.
+    /// Once a multisig is configured, this function is blocked and the action must route through
+    /// propose_action/approve_action/execute_action instead.
     pub fn pause(env: Env, admin: Address) -> Result<(), AccessControlError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        if Self::load_multisig_config(&env).is_ok() {
+            return Err(AccessControlError::DirectCallProhibited);
+        }
         if env
             .storage()
             .instance()
@@ -198,12 +204,18 @@ impl AccessControlContract {
     /// **Errors:**
     /// - `AccessControlError::Unauthorized` / `AccessControlError::NotAdmin` — Caller is not the admin.
     /// - `AccessControlError::NotPaused` — Protocol is not currently paused.
+    /// - `AccessControlError::DirectCallProhibited` — Multisig is configured; use propose/approve/execute instead.
     /// - `AccessControlError::Reentrancy` — Reentrancy guard triggered.
     ///
     /// **Security:** Requires `admin.require_auth()`. Emits `protocol_unpaused` event.
+    /// Once a multisig is configured, this function is blocked and the action must route through
+    /// propose_action/approve_action/execute_action instead.
     pub fn unpause(env: Env, admin: Address) -> Result<(), AccessControlError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        if Self::load_multisig_config(&env).is_ok() {
+            return Err(AccessControlError::DirectCallProhibited);
+        }
         if !env
             .storage()
             .instance()
@@ -232,12 +244,12 @@ impl AccessControlContract {
     /// - `AccessControlError::NotAdmin` — Caller is not the admin.
     /// - `AccessControlError::Unauthorized` — Attempt to grant `Role::Admin` (use `transfer_admin`),
     ///   grant `Role::None` (use `revoke_role`), or grant a role to the current admin.
+    /// - `AccessControlError::DirectCallProhibited` — Multisig is configured; use propose/approve/execute instead.
     ///
     /// **Security:** Requires `admin.require_auth()`. Cannot grant `Role::Admin` directly —
     /// use `transfer_admin` instead. Cannot grant `Role::None` — use `revoke_role` instead.
-    /// - Cannot grant `Role::Admin` (use `transfer_admin`).
-    /// - Cannot grant `Role::None` (use `revoke_role`).
-    /// - Cannot grant a role to the current admin address.
+    /// Once a multisig is configured, this function is blocked and the action must route through
+    /// propose_action/approve_action/execute_action instead.
     pub fn grant_role(
         env: Env,
         admin: Address,
@@ -246,6 +258,9 @@ impl AccessControlContract {
     ) -> Result<(), AccessControlError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        if Self::load_multisig_config(&env).is_ok() {
+            return Err(AccessControlError::DirectCallProhibited);
+        }
 
         if role == Role::Admin {
             return Err(AccessControlError::Unauthorized);
@@ -275,14 +290,17 @@ impl AccessControlContract {
     /// - `AccessControlError::NotAdmin` — Caller is not the admin.
     /// - `AccessControlError::Unauthorized` — Attempt to revoke the admin's own role.
     /// - `AccessControlError::RoleNotAssigned` — Target has no role assigned.
+    /// - `AccessControlError::DirectCallProhibited` — Multisig is configured; use propose/approve/execute instead.
     ///
     /// **Security:** Requires `admin.require_auth()`. Uses `remove()` to reclaim storage
-    /// rather than writing `Role::None`.
-    /// - Cannot revoke the admin's own role.
-    /// - Fails if the target has no role assigned.
+    /// rather than writing `Role::None`. Once a multisig is configured, this function is blocked
+    /// and the action must route through propose_action/approve_action/execute_action instead.
     pub fn revoke_role(env: Env, admin: Address, target: Address) -> Result<(), AccessControlError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        if Self::load_multisig_config(&env).is_ok() {
+            return Err(AccessControlError::DirectCallProhibited);
+        }
         let current_role = env
             .storage()
             .persistent()
@@ -319,12 +337,12 @@ impl AccessControlContract {
     /// - `AccessControlError::InvalidAddress` — `new_admin` equals `current_admin` or is the contract itself.
     /// - `AccessControlError::Unauthorized` — `new_admin` already holds an `Operator` or `Verifier` role.
     ///   The caller must revoke that role first.
+    /// - `AccessControlError::DirectCallProhibited` — Multisig is configured; use propose/approve/execute instead.
     ///
     /// **Security:** Requires `current_admin.require_auth()`. Prevents silent role overwrites
-    /// by rejecting addresses that already hold a non-None, non-Admin role.
-    /// - Cannot transfer to self.
-    /// - Cannot transfer to an address that already holds a non-None role
-    ///   (would silently overwrite it). The caller must revoke first.
+    /// by rejecting addresses that already hold a non-None, non-Admin role. Once a multisig is
+    /// configured, this function is blocked and the action must route through
+    /// propose_action/approve_action/execute_action instead.
     pub fn transfer_admin(
         env: Env,
         current_admin: Address,
@@ -332,6 +350,9 @@ impl AccessControlContract {
     ) -> Result<(), AccessControlError> {
         current_admin.require_auth();
         Self::require_admin(&env, &current_admin)?;
+        if Self::load_multisig_config(&env).is_ok() {
+            return Err(AccessControlError::DirectCallProhibited);
+        }
 
         Self::validate_transfer_admin_target(&env, &new_admin, &current_admin)?;
 
@@ -751,6 +772,7 @@ impl AccessControlContract {
             proposer: proposer.clone(),
             approvals,
             created_at: env.ledger().timestamp(),
+            expires_at: env.ledger().timestamp() + PROPOSAL_TTL_LEDGERS,
             executed: false,
             cancelled: false,
         };
@@ -786,9 +808,11 @@ impl AccessControlContract {
     /// - `AccessControlError::NotMultisigSigner` — Caller is not a configured signer.
     /// - `AccessControlError::ParameterProposalNotFound` — No proposal exists with the given ID.
     /// - `AccessControlError::ParameterProposalAlreadyExecuted` — Proposal already executed.
+    /// - `AccessControlError::ParameterProposalExpired` — Proposal's TTL has elapsed.
     /// - `AccessControlError::AlreadyVoted` — Caller has already cast their vote.
     ///
     /// **Security:** Requires `signer.require_auth()`. Each signer may only vote once.
+    /// Proposals expire after ~7 days (`PROPOSAL_TTL_LEDGERS`).
     pub fn vote_parameter_change(
         env: Env,
         signer: Address,
@@ -830,8 +854,11 @@ impl AccessControlContract {
         Ok(())
     }
 
-    /// Execute a parameter-change proposal once it has reached the multisig threshold (B2) and the
-    /// governance timelock has elapsed (B1). Commits the new value on-chain.
+    /// Execute a parameter-change proposal once it has reached the multisig threshold (B2), the
+    /// governance timelock has elapsed (B1), and the proposal has not expired. Commits the new value on-chain.
+    ///
+    /// **Errors:**
+    /// - `AccessControlError::ParameterProposalExpired` — Proposal's TTL has elapsed.
     pub fn execute_parameter_change(
         env: Env,
         caller: Address,
