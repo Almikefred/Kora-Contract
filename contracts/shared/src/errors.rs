@@ -1,5 +1,88 @@
 use soroban_sdk::contracterror;
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum KoraError {
+    // Auth & Access
+    Unauthorized = 1,
+    NotAdmin = 2,
+    NotVerifier = 3,
+    ProtocolPaused = 4,
+    AlreadyPaused = 5,
+    NotPaused = 6,
+    RoleNotAssigned = 7,
+
+    // Invoice
+    InvoiceNotFound = 10,
+    InvalidInvoiceStatus = 12,
+    InvalidAmount = 14,
+    InvalidDueDate = 15,
+    InvalidRiskScore = 16,
+    InvalidCid = 17,
+    InvoiceFrozen = 18,
+
+    // Marketplace
+    ListingNotFound = 20,
+    ListingAlreadyCancelled = 21,
+    FundingDeadlinePassed = 23,
+    InsufficientFunds = 24,
+    ExceedsFundingTarget = 25,
+    ListingFullyFunded = 27,
+    FundingNotExpired = 28,
+
+    // Pool
+    PoolNotFound = 30,
+    PoolAlreadyClosed = 31,
+    PositionNotFound = 34,
+    SaleAlreadyListed = 35,
+    SaleNotFound = 36,
+
+    // Treasury
+    InvalidFeeRate = 40,
+    TokenNotWhitelisted = 42,
+    WithdrawalRateLimitExceeded = 43,
+
+    // Risk
+    SMENotRegistered = 50,
+    ComplianceNotAttested = 53,
+
+    // General
+    ArithmeticOverflow = 90,
+    /// Returned by `safe_sub` when the result would underflow (a < b).
+    ArithmeticUnderflow = 91,
+    InvalidAddress = 92,
+    EmptyString = 93,
+    AlreadyInitialized = 94,
+    NotInitialized = 96,
+    // Distinct error for empty bytes (semantically different from EmptyString)
+    EmptyBytes = 97,
+    // Reentrancy guard triggered
+    Reentrancy = 98,
+    // Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes)
+    InvalidLength = 99,
+    // Upgrade
+    NoUpgradeProposed = 100,
+    UpgradeTimelockNotElapsed = 101,
+    // Parameter governance
+    ParameterProposalNotFound = 110,
+    ParameterProposalAlreadyExecuted = 111,
+    NotMultisigSigner = 112,
+    GovernanceThresholdNotMet = 114,
+    // Cooldown between debtor risk score updates per (verifier, debtor_hash) pair
+    ScoreUpdateCooldownNotElapsed = 117,
+    // Marketplace two-phase cancellation
+    CancellationPending = 118,
+    NoCancellationPending = 119,
+    // invoice_nft: caller is not the invoice's original SME
+    NotInvoiceOwner = 120,
+    // invoice_nft: minting this invoice would exceed the SME's pre-approved credit limit
+    CreditLimitExceeded = 121,
+    // invoice_nft: currency symbol is not on the allowlist
+    CurrencyNotAllowed = 122,
+}
+use soroban_sdk::contracterror;
+
 /// Common validation/arithmetic errors shared by every contract's
 /// `kora_shared::validation` and `kora_shared::reentrancy` helpers.
 ///
@@ -55,11 +138,8 @@ pub enum KoraError {
     // Marketplace
     ListingNotFound = 20,
     ListingAlreadyCancelled = 21,
-    ListingExpired = 22,
     FundingDeadlinePassed = 23,
-    InsufficientFunds = 24,
     ExceedsFundingTarget = 25,
-    AlreadyFullyFunded = 26,
     ListingFullyFunded = 27,
     FundingNotExpired = 28,
     RefundAlreadyClaimed = 29,
@@ -79,34 +159,41 @@ pub enum KoraError {
     PoolNotFound = 30,
     PoolAlreadyClosed = 31,
     RepaymentAlreadyMade = 32,
+    /// Also covers `risk_registry`'s "insufficient stake" condition (merged to stay
+    /// under Soroban's 50-variant contracterror cap).
     InsufficientPoolBalance = 33,
     PositionNotFound = 34,
-    SaleAlreadyListed = 35,
+    /// Also covers `financing_pool`'s "position already listed for sale" condition
+    /// (merged to stay under Soroban's 50-variant contracterror cap).
+    AlreadyInitialized = 94,
     SaleNotFound = 36,
 
     // Treasury
     InvalidFeeRate = 40,
-    WithdrawalFailed = 41,
     TokenNotWhitelisted = 42,
     WithdrawalRateLimitExceeded = 43,
-    WithdrawalCapTimelockNotElapsed = 44,
-    NoCapChangeProposed = 45,
+    /// Also covers `treasury`'s "no withdrawal-cap proposal pending" and
+    /// `access_control`'s "no upgrade proposal pending" conditions (merged to stay
+    /// under Soroban's 50-variant contracterror cap).
+    NoUpgradeProposed = 100,
 
     // Risk
+    /// Also covers `risk_registry`'s "debtor not registered" condition (merged to
+    /// stay under Soroban's 50-variant contracterror cap).
     SMENotRegistered = 50,
-    DebtorNotRegistered = 51,
-    RiskScoreOutOfRange = 52,
     ComplianceNotAttested = 53,
     // SME profile exists but has not been marked `verified` by a risk_registry verifier
     SMENotVerified = 54,
 
     // General
+    // `InvalidAmount` (above, = 14) also covers `access_control`'s "invalid
+    // governance parameter value" condition (merged to stay under Soroban's
+    // 50-variant contracterror cap).
     ArithmeticOverflow = 90,
     /// Returned by `safe_sub` when the result would underflow (a < b).
     ArithmeticUnderflow = 91,
     InvalidAddress = 92,
     EmptyString = 93,
-    AlreadyInitialized = 94,
     NotInitialized = 96,
     /// Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
@@ -122,6 +209,15 @@ pub enum KoraError {
     FieldTooLong = 102,
     // Parameter governance
     ParameterProposalNotFound = 110,
+    /// Also covers `access_control`'s "caller is not a configured multisig signer"
+    /// and "governance approval threshold not met" conditions, and `access_control`'s
+    /// "already voted" condition maps here as well (merged to stay under Soroban's
+    /// 50-variant contracterror cap).
+    // `Unauthorized` (above, = 1) also covers `access_control`'s "caller is not
+    // a configured multisig signer" and "governance approval threshold not met"
+    // conditions, and its "already voted" condition maps to
+    // `ParameterProposalAlreadyExecuted` above (merged to stay under Soroban's
+    // 50-variant contracterror cap).
     ParameterProposalAlreadyExecuted = 111,
     NotMultisigSigner = 112,
     AlreadyVoted = 113,

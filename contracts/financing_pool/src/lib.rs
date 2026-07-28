@@ -3,6 +3,8 @@
 use kora_shared::{
     errors::CommonError,
     events,
+    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer},
+    validation::{bps_of, bps_of_normalized, require_valid_bps_range, UPGRADE_TIMELOCK_DELAY},
     types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer, ProtocolStats},
     validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
@@ -133,6 +135,7 @@ impl FinancingPoolContract {
         }
         kora_shared::validation::require_valid_fee_bps(late_penalty_bps)?;
         // max_position_bps must be in [1, 10_000]: zero would block all funding
+        require_valid_bps_range(max_position_bps, 1, 10_000)?;
         if max_position_bps == 0 || max_position_bps > 10_000 {
             return Err(FinancingPoolError::InvalidFeeRate);
         }
@@ -255,6 +258,7 @@ impl FinancingPoolContract {
     pub fn set_max_position_bps(env: Env, admin: Address, max_position_bps: u32) -> Result<(), FinancingPoolError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        require_valid_bps_range(max_position_bps, 1, 10_000)?;
         if max_position_bps == 0 || max_position_bps > 10_000 {
             return Err(FinancingPoolError::InvalidFeeRate);
         }
@@ -272,6 +276,16 @@ impl FinancingPoolContract {
             .instance()
             .get(&DataKey::MaxPositionBps)
             .unwrap_or(5_000)
+    }
+
+    /// Returns the configured price oracle address. Lets other protocol
+    /// contracts (e.g. marketplace, for cross-currency funding) reuse the
+    /// same oracle instance instead of wiring a separate reference. (#449)
+    pub fn get_price_oracle(env: Env) -> Result<Address, KoraError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PriceOracle)
+            .ok_or(KoraError::NotInitialized)
     }
 
     /// Register an investor position for a funded invoice. Admin only.
@@ -442,6 +456,7 @@ impl FinancingPoolContract {
 
         if pool.is_closed {
             env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+            return Err(KoraError::PoolAlreadyClosed);
             return Err(FinancingPoolError::RepaymentAlreadyMade);
         }
 
@@ -470,6 +485,7 @@ impl FinancingPoolContract {
             if idx >= len {
                 // All installments already satisfied — pool should have been closed.
                 env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::PoolAlreadyClosed);
                 return Err(FinancingPoolError::RepaymentAlreadyMade);
             }
             let installment = schedule.installments.get(idx).unwrap();
@@ -677,7 +693,8 @@ impl FinancingPoolContract {
         let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
         nft_client.set_defaulted(&admin, &invoice_id);
 
-        events::invoice_defaulted(&env, invoice_id, &admin);
+        let invoice = nft_client.get_invoice(&invoice_id);
+        events::invoice_defaulted(&env, invoice_id, &admin, invoice.amount, invoice.currency.clone());
 
         // Update protocol stats
         let mut stats: ProtocolStats = env.storage().instance().get(&DataKey::ProtocolStats)
@@ -687,7 +704,6 @@ impl FinancingPoolContract {
         env.storage().instance().set(&DataKey::ProtocolStats, &stats);
 
         // Automatically record the default against the SME in the risk registry
-        let invoice = nft_client.get_invoice(&invoice_id);
         if let Some(rr_contract) = env
             .storage()
             .instance()
@@ -1632,6 +1648,76 @@ mod tests {
         assert!(client
             .try_initialize(&admin, &nft, &rr, &treasury, &ac, &10_000u32, &oracle, &5_000u32)
             .is_ok());
+    }
+
+    // ── max_position_bps range guard (require_valid_bps_range) ───────────────
+
+    #[test]
+    fn test_initialize_max_position_bps_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, FinancingPoolContract);
+        let client = FinancingPoolContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let nft = Address::generate(&env);
+        let rr = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let ac = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &0u32);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+    }
+
+    #[test]
+    fn test_initialize_max_position_bps_over_max_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, FinancingPoolContract);
+        let client = FinancingPoolContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let nft = Address::generate(&env);
+        let rr = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let ac = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &10_001u32);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+    }
+
+    #[test]
+    fn test_set_max_position_bps_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, FinancingPoolContract);
+        let client = FinancingPoolContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let nft = Address::generate(&env);
+        let rr = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let ac = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &5_000u32);
+        let result = client.try_set_max_position_bps(&admin, &0u32);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        // Existing config is untouched by the rejected update.
+        assert_eq!(client.get_max_position_bps(), 5_000u32);
+    }
+
+    #[test]
+    fn test_set_max_position_bps_within_range_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, FinancingPoolContract);
+        let client = FinancingPoolContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let nft = Address::generate(&env);
+        let rr = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let ac = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &5_000u32);
+        client.set_max_position_bps(&admin, &7_500u32);
+        assert_eq!(client.get_max_position_bps(), 7_500u32);
     }
 
     // ── get_pool / get_positions ──────────────────────────────────────────────

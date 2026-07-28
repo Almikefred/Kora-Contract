@@ -1,5 +1,67 @@
 # Invoice NFT Contract
 
+<<<<<<< HEAD
+## Overview
+
+The `invoice_nft` contract is the source of truth for every invoice in the Kora protocol. It mints invoice NFTs, owns the invoice lifecycle state machine, and is the sole authority that may advance or block status transitions.
+
+## Status State Machine
+
+```
+Created → Listed → Funded → Repaid
+                          ↘ Defaulted
+```
+
+| Transition   | Function      | Caller           |
+|--------------|---------------|------------------|
+| → Listed     | `set_listed`  | Marketplace      |
+| → Funded     | `set_funded`  | Financing Pool   |
+| → Repaid     | `set_repaid`  | Financing Pool   |
+| → Defaulted  | `set_defaulted` | Admin          |
+
+## Freeze Mechanism
+
+### Design
+
+Freeze enforcement is **owned internally by `invoice_nft`**, not delegated to callers. Every status-mutating function (`set_listed`, `set_funded`, `set_repaid`) calls the private `require_not_frozen` guard before executing. This provides defense-in-depth: no caller — current or future — can advance a frozen invoice's state by forgetting an external pre-check.
+
+This is intentional and important. Earlier designs relied on external callers (e.g., `marketplace.fund_invoice`) to call `is_invoice_frozen` themselves before invoking invoice transitions. That approach is fragile: a single missed call site anywhere in the protocol silently defeats the freeze. The current design closes that class of bypass entirely.
+
+### Admin Operations
+
+| Function           | Who can call | Effect                                      |
+|--------------------|--------------|---------------------------------------------|
+| `freeze_invoice`   | Admin only   | Blocks all status transitions on the invoice |
+| `unfreeze_invoice` | Admin only   | Removes the freeze; transitions resume       |
+| `is_invoice_frozen`| Anyone       | Returns `true` if the invoice is frozen      |
+
+### Error
+
+A frozen invoice returns `KoraError::InvoiceFrozen (17)` on any attempted transition.
+
+### Use Cases
+
+- KYC / AML dispute on the SME or debtor
+- Regulatory hold pending investigation
+- Emergency administrative block
+
+### Storage
+
+Freeze state is stored as a `persistent` boolean under `DataKey::FrozenInvoice(invoice_id)`. The key is removed (not set to false) on unfreeze to reclaim storage.
+
+## Error Codes
+
+| Code | Variant                | Meaning                                  |
+|------|------------------------|------------------------------------------|
+| 10   | `InvoiceNotFound`      | No invoice exists for the given ID       |
+| 11   | `InvoiceAlreadyExists` | Duplicate invoice ID in marketplace      |
+| 12   | `InvalidInvoiceStatus` | Transition not allowed from current state |
+| 13   | `InvoiceExpired`       | Invoice past due date                    |
+| 14   | `InvalidAmount`        | Zero or negative amount                  |
+| 15   | `InvalidDueDate`       | Due date not in the future               |
+| 16   | `InvalidRiskScore`     | Risk score out of 0–100 range            |
+| 17   | `InvoiceFrozen`        | Invoice is administratively frozen       |
+=======
 The `invoice_nft` contract is the canonical source of truth for all invoice state in the Kora Protocol. Each invoice is represented as an immutable NFT with a unique ID, capturing all financial and metadata details of the underlying invoice.
 
 ## Invoice NFT Data Model
@@ -265,6 +327,67 @@ sha256sum invoice-metadata.json        # -> compare hex against invoice.metadata
 
 A `metadata_hash` of length 0 means no commitment was made for that invoice.
 
+#### Dispute mechanism (`flag_metadata_mismatch` / `resolve_metadata_dispute`)
+
+Verifying a `metadata_hash` commitment (above) is an off-chain, manual process. If a
+third party — an investor, verifier, or auditor — performs that verification and finds
+a mismatch, they can flag it on-chain:
+
+```rust
+pub fn flag_metadata_mismatch(
+    env: Env,
+    challenger: Address,
+    invoice_id: u64,
+    evidence_hash: Bytes,
+) -> Result<(), KoraError>
+
+pub fn resolve_metadata_dispute(
+    env: Env,
+    admin: Address,
+    invoice_id: u64,
+    upheld: bool,
+) -> Result<(), KoraError>
+```
+
+- **Any address** may call `flag_metadata_mismatch`, supplying the SHA-256 they
+  independently computed from the fetched document as `evidence_hash`. This requires
+  the invoice to already have a committed `metadata_hash` (`InvalidInvoiceStatus`
+  otherwise) and **automatically freezes the invoice** (blocking `fund_invoice`/`repay`)
+  pending admin review. Emits `metadata_mismatch_flagged`.
+- **Anti-griefing:** at most one dispute may ever be raised per invoice. Once an admin
+  resolves it (upheld or rejected) via `resolve_metadata_dispute`, the invoice cannot be
+  disputed again through this path — a false accusation cannot be repeatedly relitigated,
+  and a confirmed one doesn't need to be. `AlreadyInitialized` is returned for a second
+  attempt, whether the prior dispute is still open or already resolved.
+- **Admin resolution:** `upheld = true` confirms the fraud and leaves the invoice frozen
+  (the admin is expected to follow up via other governance/legal channels). `upheld =
+  false` clears the dispute and unfreezes the invoice, emitting `invoice_unfrozen` and
+  `metadata_dispute_resolved` in both cases.
+
+#### Admin correction (`admin_correct_metadata_hash`)
+
+Distinct from the dispute mechanism above, this addresses an SME's own **honest**
+mistake (e.g. committing the hash of the wrong file version) rather than third-party
+fraud detection:
+
+```rust
+pub fn admin_correct_metadata_hash(
+    env: Env,
+    admin: Address,
+    invoice_id: u64,
+    new_hash: Bytes,
+) -> Result<(), KoraError>
+```
+
+Admin-only, and restricted to `status == Created` — identical to the guard on
+`commit_metadata_hash` and `amend_invoice` — so no investor could possibly have relied
+on the original (incorrect) commitment. Works whether or not a hash was already
+committed. Emits a distinctly-named `metadata_hash_corrected` event carrying both the
+old and new hash, and records a structured `AdminAuditEntry` (`AdminActionType::
+CorrectMetadataHash`, `AuditSource::InvoiceNft`, readable via `get_audit_log`) — this
+admin override is never conflated with the SME's own original commitment in the audit
+trail, precisely because it is a deliberate exception to a stated immutability guarantee.
+
 ---
 
 ### State Transitions
@@ -413,6 +536,50 @@ pub fn invoice_count(env: Env) -> u64
 **Returns:** The cumulative number of invoices created on this contract.
 
 **Security:** No authorization check (public view).
+
+---
+
+```rust
+pub fn reconcile_outstanding_exposure(env: Env, sme: Address) -> i128
+```
+
+**Purpose:** Independently recompute an SME's aggregate exposure from the underlying
+invoice set (summing `amount` across `Created`/`Listed`/`Funded` invoices), bypassing
+the cached `OutstandingExposure` counter used by `get_outstanding_exposure`.
+
+**Returns:** The recomputed total. Should always equal `get_outstanding_exposure(sme)` —
+a mismatch indicates a bug in one of the five exposure-adjusting code paths (`mint_invoice`,
+`mint_invoices_batch`, `amend_invoice`, `withdraw_invoice`, `set_repaid`, `set_defaulted`).
+
+**Security:** No authorization check (public view). Scans every allocated invoice ID
+(bounded by `next_id`) — there is no SME-to-invoice index yet, so cost is linear in the
+total number of invoices minted on the contract, not just this SME's.
+
+---
+
+## Protocol Configuration (`ProtocolConfig`)
+
+```rust
+pub fn set_protocol_config(env: Env, admin: Address, config: ProtocolConfig) -> Result<(), KoraError>
+pub fn get_protocol_config(env: Env) -> ProtocolConfig
+```
+
+`kora_shared::types::ProtocolConfig` is a shared struct — `fee_bps`, `late_penalty_bps`,
+`max_risk_score`, `min_funding_period` — defined for protocol-wide use but historically
+unused by any contract. `invoice_nft` is the first adopter: `set_protocol_config`
+(admin-only) stores it, and `mint_invoice`/`mint_invoices_batch` enforce `max_risk_score`
+as an additional ceiling on top of the fixed 0–100 range `require_valid_risk_score`
+already checks — letting the protocol tighten its risk appetite (e.g. rejecting anything
+above `risk_score: 70`) without a contract upgrade.
+
+**Defaults:** an unconfigured contract behaves exactly as before — `max_risk_score`
+defaults to 100 (no additional restriction) and `fee_bps`/`late_penalty_bps`/
+`min_funding_period` default to 0.
+
+**Out of scope:** `fee_bps`, `late_penalty_bps`, and `min_funding_period` are stored in
+`ProtocolConfig` for forward-compatibility but are **not** read anywhere in this contract.
+They remain owned by `treasury`/`financing_pool`'s own local parameters; wiring them into
+this shared struct is follow-up work.
 
 ---
 
@@ -594,11 +761,16 @@ admin calls invoice_nft.set_defaulted(admin_address, invoice_id)
 - No on-chain verification that the underlying invoice is real
 - Mitigated off-chain by the verifier network's KYC/KYB checks
 
-### TTL Management
-- Invoice NFT storage entries expire if TTL is not extended
-- Protocol operator or keeper bot must periodically extend TTL
-- Failure to do so could result in invoice data loss
+### TTL Management (Fixed in v1.1)
+- **[FIXED]** Invoice storage entries now have their TTL extended on all state transitions:
+  - `mint_invoice()`, `mint_invoices_batch()`, `amend_invoice()`
+  - `set_listed()`, `set_funded()`, `set_repaid()`, `set_defaulted()`
+  - `commit_metadata_hash()`
+- Previously, `set_repaid()` and `commit_metadata_hash()` did not refresh the TTL, leaving repaid invoices (terminal state, rarely touched) vulnerable to expiry
+- TTL extension now uses unified shared constants (`DEFAULT_TTL_THRESHOLD`, `DEFAULT_TTL_BUMP`) from `kora_shared::validation::extend_persistent_ttl`
+- Protocol operator should still monitor persistent storage to ensure TTL stays healthy
 
 ### No Signature Delegation
 - Only the SME can mint their own invoices (no delegation mechanism)
 - Future versions may support signed delegation for agents
+>>>>>>> origin/Kora-Contract46
