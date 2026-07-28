@@ -16,6 +16,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 - **#343 Duplicate `KoraError` discriminant 95** *(breaking ABI change)* — `EmptyBytes` and `Reentrancy` previously both used discriminant 95, causing any reentrancy violation to be silently decoded as `EmptyBytes` by off-chain clients and preventing the crate from compiling (E0081). Discriminants are now unique: `NoContribution = 95`, `NotInitialized = 96`, `EmptyBytes = 97`, `Reentrancy = 98`. **Clients that pattern-match on `KoraError::Reentrancy` by its raw u32 value must update their discriminant from 95 to 98.**
+- **#420 Invoice-lifecycle event schema inconsistencies** *(breaking event-schema change)* — `invoice_defaulted` was missing an `amount` field carried by every sibling invoice event, and none of the seven invoice-lifecycle events (`invoice_created`, `invoice_listed`, `invoice_funded`, `invoice_repaid`, `invoice_amended`, `invoice_withdrawn`, `invoice_defaulted`) included the invoice's `currency`, forcing indexers to make a separate `get_invoice` call to interpret the monetary value. `invoice_defaulted` now carries `amount`, and all seven events now carry `currency` (see `docs/EVENTS.md`). **Off-chain indexers decoding these event tuples by fixed position/arity must update to the new schemas.**
 
 ### Changed
 - **Removed duplicate sme_invoice_counted event** — use sme_invoice_count_incremented instead across all SME profile tracking (see `contracts/shared/src/events.rs` and AUDIT_LOG.md)
