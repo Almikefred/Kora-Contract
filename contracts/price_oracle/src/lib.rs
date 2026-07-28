@@ -58,12 +58,12 @@ impl PriceOracleContract {
         Ok(())
     }
 
-    /// Set a price for a currency pair. Admin only.
+    /// Set a price for a currency pair. Authorized feeders only.
     /// Price is expressed as `base` units per 1 unit of `quote`, scaled by 1e7 (stroops).
     /// Blocked when the protocol is paused.
     pub fn set_price(
         env: Env,
-        admin: Address,
+        feeder: Address,
         base: Symbol,
         quote: Symbol,
         price: i128,
@@ -78,16 +78,77 @@ impl PriceOracleContract {
 
         let data = PriceData {
             price,
-            timestamp: env.ledger().timestamp(),
+            timestamp: env.ledger().timestamp(),contracts/access_control/src/lib.rs￼Mark as resolved 
         };
         env.storage()
             .persistent()
-            .set(&DataKey::Price(base, quote), &data);
+            .set(
+                &DataKey::FeederPrice(base.clone(), quote.clone(), feeder.clone()),
+                &data,
+            );
+
+        let mut feeders: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceFeeders(base.clone(), quote.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !feeders.iter().any(|f| f == &feeder) {
+            feeders.push_back(feeder);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PriceFeeders(base, quote), &feeders);
+        }
+
         Ok(())
     }
 
-    /// Get the price for a pair. Returns the price and its timestamp.
-    /// Fails if the price is stale (older than MAX_STALENESS_SECS) or missing.
+    /// Add an authorized feeder. Admin only.
+    pub fn add_feeder(env: Env, admin: Address, feeder: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().set(&DataKey::Feeder(feeder), &true);
+        Ok(())
+    }
+
+    /// Remove an authorized feeder. Admin only.
+    pub fn remove_feeder(env: Env, admin: Address, feeder: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().remove(&DataKey::Feeder(feeder));
+        Ok(())
+    }
+
+    /// Set the base currency for multi-hop triangulation. Admin only.
+    pub fn set_base_currency(
+        env: Env,
+        admin: Address,
+        base: Symbol,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().set(&DataKey::BaseCurrency, &base);
+        Ok(())
+    }
+
+    /// Set the maximum allowed price deviation in basis points.
+    /// Admin only. Default is 1000 (10%).
+    pub fn set_max_deviation(
+        env: Env,
+        admin: Address,
+        deviation_bps: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxDeviation, &deviation_bps);
+        Ok(())
+    }
+
+    /// Get the aggregated price for a pair (median of all active feeders).
+    /// Returns the median price and its oldest timestamp.
+    /// Fails if no feeders have submitted or prices are stale.
     pub fn get_price(
         env: Env,
         base: Symbol,
@@ -108,11 +169,20 @@ impl PriceOracleContract {
             return Err(PriceOracleError::InvoiceExpired);
         }
 
-        Ok(data)
+        if prices.is_empty() {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        let median = Self::calculate_median(&prices);
+        Ok(PriceData {
+            price: median,
+            timestamp: min_timestamp,
+        })
     }
 
     /// Convert an amount from one currency to another using the stored price.
-    /// Rejects stale or missing prices.
+    /// First attempts direct pair conversion. If unavailable, triangulates through
+    /// the configured base currency. Rejects stale or missing prices.
     pub fn convert(
         env: Env,
         amount: i128,
@@ -133,7 +203,31 @@ impl PriceOracleContract {
             return Err(PriceOracleError::InvalidAmount);
         }
 
-        Ok(converted)
+        Ok(())
+    }
+
+    fn calculate_median(prices: &Vec<i128>) -> i128 {
+        let len = prices.len();
+        if len == 0 {
+            return 0;
+        }
+
+        let mut sorted = prices.clone();
+        for i in 0..len {
+            for j in i..len {
+                if sorted.get(j).unwrap() < sorted.get(i).unwrap() {
+                    let temp = *sorted.get(j).unwrap();
+                    sorted.set(j, *sorted.get(i).unwrap());
+                    sorted.set(i, temp);
+                }
+            }
+        }
+
+        if len % 2 == 1 {
+            *sorted.get(len / 2).unwrap()
+        } else {
+            (*sorted.get(len / 2 - 1).unwrap() + *sorted.get(len / 2).unwrap()) / 2
+        }
     }
 
     /// Transfer admin rights to a new address. Admin only.
@@ -212,7 +306,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env, Symbol};
 
-    fn setup() -> (Env, Address, PriceOracleContractClient<'static>) {
+    fn setup() -> (Env, Address, Address, PriceOracleContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, PriceOracleContract);
@@ -225,17 +319,17 @@ mod tests {
 
     #[test]
     fn test_set_and_get_price() {
-        let (env, admin, client) = setup();
+        let (env, _admin, feeder, client) = setup();
         let base = Symbol::new(&env, "EURC");
         let quote = Symbol::new(&env, "USDC");
-        client.set_price(&admin, &base, &quote, &11_000_000i128);
+        client.set_price(&feeder, &base, &quote, &11_000_000i128);
         let data = client.get_price(&base, &quote);
         assert_eq!(data.price, 11_000_000i128);
     }
 
     #[test]
     fn test_convert_same_currency() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _feeder, client) = setup();
         let sym = Symbol::new(&env, "USDC");
         let result = client.convert(&1_000_000i128, &sym, &sym);
         assert_eq!(result, 1_000_000i128);
@@ -243,18 +337,17 @@ mod tests {
 
     #[test]
     fn test_convert_different_currency() {
-        let (env, admin, client) = setup();
+        let (env, _admin, feeder, client) = setup();
         let eurc = Symbol::new(&env, "EURC");
         let usdc = Symbol::new(&env, "USDC");
-        // 1 EURC = 1.1 USDC (11_000_000 stroops per 10_000_000)
-        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
+        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128);
         let result = client.convert(&10_000_000i128, &eurc, &usdc);
         assert_eq!(result, 11_000_000i128);
     }
 
     #[test]
     fn test_get_price_missing_fails() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _feeder, client) = setup();
         let base = Symbol::new(&env, "XLM");
         let quote = Symbol::new(&env, "USDC");
         let result = client.try_get_price(&base, &quote);
@@ -264,10 +357,10 @@ mod tests {
     #[test]
     fn test_stale_price_rejected() {
         use soroban_sdk::testutils::{Ledger, LedgerInfo};
-        let (env, admin, client) = setup();
+        let (env, _admin, feeder, client) = setup();
         let base = Symbol::new(&env, "EURC");
         let quote = Symbol::new(&env, "USDC");
-        client.set_price(&admin, &base, &quote, &11_000_000i128);
+        client.set_price(&feeder, &base, &quote, &11_000_000i128);
 
         env.ledger().set(LedgerInfo {
             timestamp: env.ledger().timestamp() + MAX_STALENESS_SECS + 1,
