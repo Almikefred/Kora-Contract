@@ -57,7 +57,7 @@ All constants assume ~5 s per ledger.
 |----------|--------------|-----------------|-----------|------------|
 | `treasury` | `PERSISTENT_BUMP_AMOUNT` | 535 680 | 31 days | Admin, FeeBps, Collected, WhitelistedToken |
 | `treasury` | `PERSISTENT_LIFETIME_THRESHOLD` | 267 840 | 15.5 days | Trigger threshold for bump |
-| `risk_registry` | `PERSISTENT_TTL_BUMP` | 518 400 | 30 days | Verifier, VerifierStake, VerifierReputation, SmeProfile, DebtorScore |
+| `risk_registry` | `PERSISTENT_TTL_BUMP` | 518 400 | 30 days | Verifier, VerifierStake, VerifierReputation, SmeProfile, DebtorScoreAttestation, DebtorAttestors |
 | `risk_registry` | `PERSISTENT_TTL_THRESHOLD` | 518 400 | 30 days | Trigger threshold |
 | `invoice_nft` | (see source) | ≥ 518 400 | ≥ 30 days | Invoice entries |
 | `marketplace` | (see source) | ≥ 518 400 | ≥ 30 days | Listing entries |
@@ -78,7 +78,7 @@ Cost scales with two factors: **entry size** (bytes stored) and **extension freq
 
 2. **`Invoice(u64)`** in `invoice_nft` — one entry per minted invoice, held for the full invoice lifetime (potentially years for long-dated trade finance).
 
-3. **`SmeProfile(Address)`** and **`DebtorScore(Bytes)`** in `risk_registry` — long-lived entries for every registered SME and debtor.
+3. **`SmeProfile(Address)`** and **`DebtorScoreAttestation(Bytes, Address)`** in `risk_registry` — long-lived entries for every registered SME and debtor attestation.
 
 ### Lower cost
 

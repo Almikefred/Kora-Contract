@@ -141,7 +141,10 @@ mod tests {
     fn test_raii_nested_guard_fails() {
         let env = Env::default();
         let _guard = ReentrancyGuard::new(&env).unwrap();
-        assert_eq!(ReentrancyGuard::new(&env).unwrap_err(), KoraError::Reentrancy);
+        match ReentrancyGuard::new(&env) {
+            Err(e) => assert_eq!(e, KoraError::Reentrancy),
+            Ok(_) => panic!("expected Reentrancy error"),
+        }
     }
 
     #[test]

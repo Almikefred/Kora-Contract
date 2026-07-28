@@ -94,6 +94,24 @@ pub fn require_valid_risk_score(score: u32) -> Result<(), KoraError> {
     Ok(())
 }
 
+/// Reject risk scores above a protocol-configured ceiling, which may be
+/// stricter than (but never looser than) the hard 100 cap enforced by
+/// `require_valid_risk_score`.
+///
+/// # Examples
+/// ```ignore
+/// use kora_shared::validation::require_risk_score_within_ceiling;
+/// assert!(require_risk_score_within_ceiling(60, 70).is_ok());
+/// assert!(require_risk_score_within_ceiling(70, 70).is_ok());
+/// assert!(require_risk_score_within_ceiling(80, 70).is_err());
+/// ```
+pub fn require_risk_score_within_ceiling(score: u32, ceiling: u32) -> Result<(), KoraError> {
+    if score > ceiling {
+        return Err(KoraError::InvalidRiskScore);
+    }
+    Ok(())
+}
+
 /// Reject fee rates above 10 000 bps (100 %).
 ///
 /// # Examples
@@ -236,6 +254,26 @@ pub fn require_max_length_string(s: &String, max_bytes: u32) -> Result<(), KoraE
 pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), KoraError> {
     if b.len() > max_bytes {
         return Err(KoraError::FieldTooLong);
+    }
+    Ok(())
+}
+
+/// Reject byte slices whose length is not exactly `expected_len`.
+///
+/// # Examples
+/// ```ignore
+/// use kora_shared::validation::require_exact_length;
+/// use soroban_sdk::{Env, Bytes};
+///
+/// let env = Env::default();
+/// let hash = Bytes::from_slice(&env, &[0u8; 32]);
+/// assert!(require_exact_length(&hash, 32).is_ok());
+/// assert!(require_exact_length(&hash, 31).is_err());
+/// ```
+#[inline]
+pub fn require_exact_length(b: &Bytes, expected_len: u32) -> Result<(), KoraError> {
+    if b.len() != expected_len {
+        return Err(KoraError::InvalidLength);
     }
     Ok(())
 }
@@ -1161,9 +1199,9 @@ pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), CommonE
 
 /// Reject byte slices that are not exactly `expected_len` bytes.
 #[inline]
-pub fn require_exact_length(b: &Bytes, expected_len: u32) -> Result<(), KoraError> {
+pub fn require_exact_length(b: &Bytes, expected_len: u32) -> Result<(), CommonError> {
     if b.len() != expected_len {
-        return Err(KoraError::InvalidLength);
+        return Err(CommonError::InvalidLength);
     }
     Ok(())
 }
@@ -1199,9 +1237,9 @@ pub const MAX_BATCH_MINT_SIZE: u32 = 25;
 /// assert!(require_batch_size_within_limit(26).is_err()); // Over limit
 /// ```
 #[inline]
-pub fn require_batch_size_within_limit(batch_size: u32) -> Result<(), KoraError> {
+pub fn require_batch_size_within_limit(batch_size: u32) -> Result<(), CommonError> {
     if batch_size > MAX_BATCH_MINT_SIZE {
-        return Err(KoraError::BatchSizeExceeded);
+        return Err(CommonError::BatchSizeExceeded);
     }
     Ok(())
 }
@@ -1805,7 +1843,7 @@ mod tests {
         assert!(require_batch_size_within_limit(MAX_BATCH_MINT_SIZE + 1).is_err());
         assert_eq!(
             require_batch_size_within_limit(MAX_BATCH_MINT_SIZE + 1).unwrap_err(),
-            KoraError::BatchSizeExceeded
+            CommonError::BatchSizeExceeded
         );
     }
 }
