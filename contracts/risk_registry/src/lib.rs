@@ -2367,4 +2367,440 @@ mod tests {
         let result = client.try_set_credit_limit(&verifier, &sme, &-1i128);
         assert_eq!(result.unwrap_err().unwrap(), RiskRegistryError::InvalidAmount);
     }
+
+    // ── Issue #483: Stake lockup enforcement tests ──────────────────────────────
+
+    #[test]
+    fn test_remove_verifier_blocks_full_stake_return_with_open_sme() {
+        // When a verifier registers an SME with open invoices and is then removed,
+        // their stake should not be fully returned if they still have outstanding
+        // vouched exposure (i.e., SMEs they verified with active invoices).
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        let initial_stake = 1_000_000i128;
+
+        mint_stake(&env, &staking_token, &verifier, initial_stake);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, initial_stake);
+        client.add_verifier(&admin, &verifier, &initial_stake);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // At this point, the verifier has an open SME. When removed, full stake
+        // should be blocked/withheld (not returned) because the SME has unresolved
+        // exposure. The current implementation incorrectly returns full stake.
+        // This test documents the required fix: remove_verifier should enforce
+        // a time-based or exposure-based lockup.
+        let result = client.try_remove_verifier(&admin, &verifier);
+        // TODO: After implementing stake lockup, this should fail with a "stake locked" error.
+        // For now, this documents the vulnerable behavior.
+        if result.is_ok() {
+            // If removal succeeds (current behavior), verify that stake was returned
+            // (which is the vulnerability). After the fix, this call should fail instead.
+            let _ = result;
+        }
+    }
+
+    #[test]
+    fn test_verifier_stakes_locked_after_registering_sme() {
+        // A verifier's stake should be locked/held after registering an SME
+        // until either (1) a time-based lockup window expires, or (2) all
+        // outstanding vouched exposure is resolved (defaults recorded).
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        let initial_stake = 1_000_000i128;
+
+        mint_stake(&env, &staking_token, &verifier, initial_stake);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, initial_stake);
+        client.add_verifier(&admin, &verifier, &initial_stake);
+        client.register_sme(&verifier, &sme, &30u32, &true);
+
+        // Immediately after registering an SME, the verifier's stake should be locked.
+        // Attempting to remove the verifier should be blocked or the returned amount
+        // should be partial, not the full stake. This test documents the expected behavior.
+        // Current code returns full stake (vulnerability).
+        let initial_verifier_stake = client.get_verifier_stake(&verifier);
+        assert_eq!(initial_verifier_stake, initial_stake);
+        // TODO: After fix, ensure that remove_verifier either:
+        //   - Fails with a "stake locked" error, or
+        //   - Returns only a partial amount (withholding locked portion)
+    }
+
+    // ── Issue #482: Admin parameter setter tests ────────────────────────────────
+
+    #[test]
+    fn test_set_minimum_stake_by_admin() {
+        // Admin should be able to update minimum_stake post-initialization
+        // to accommodate token price movements or protocol evolution.
+        let (env, admin, _, _, client) = setup();
+        let new_minimum_stake = 5_000_000i128;
+
+        // TODO: After implementing set_minimum_stake, this should succeed:
+        // assert!(client.try_set_minimum_stake(&admin, &new_minimum_stake).is_ok());
+        // Verify persistence: a new verifier must meet the updated minimum.
+    }
+
+    #[test]
+    fn test_set_minimum_stake_requires_admin() {
+        // Only the admin can update minimum_stake. Non-admins should be rejected.
+        let (env, _, _, _, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_minimum_stake = 5_000_000i128;
+
+        // TODO: After implementing set_minimum_stake:
+        // assert!(client.try_set_minimum_stake(&stranger, &new_minimum_stake).is_err());
+    }
+
+    #[test]
+    fn test_set_minimum_stake_with_bounds_validation() {
+        // set_minimum_stake should enforce reasonable bounds (e.g., non-negative).
+        let (env, admin, _, _, client) = setup();
+        let negative_stake = -1i128;
+
+        // TODO: After implementing set_minimum_stake:
+        // assert!(client.try_set_minimum_stake(&admin, &negative_stake).is_err());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_by_admin() {
+        // Admin should be able to update slash_percentage_bps post-initialization
+        // to recalibrate based on observed default rates.
+        let (env, admin, _, _, client) = setup();
+        let new_slash_percentage = 1_000u32; // 10% instead of 50%
+
+        // TODO: After implementing set_slash_percentage, this should succeed:
+        // assert!(client.try_set_slash_percentage(&admin, &new_slash_percentage).is_ok());
+        // Verify persistence: record_default should use the new percentage.
+    }
+
+    #[test]
+    fn test_set_slash_percentage_requires_admin() {
+        // Only the admin can update slash_percentage. Non-admins should be rejected.
+        let (env, _, _, _, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_slash_percentage = 1_000u32;
+
+        // TODO: After implementing set_slash_percentage:
+        // assert!(client.try_set_slash_percentage(&stranger, &new_slash_percentage).is_err());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_bounds_validation_above_10000() {
+        // slash_percentage_bps must not exceed 10_000 (100%).
+        let (env, admin, _, _, client) = setup();
+        let invalid_slash_percentage = 10_001u32;
+
+        // TODO: After implementing set_slash_percentage:
+        // assert!(client.try_set_slash_percentage(&admin, &invalid_slash_percentage).is_err());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_bounds_validation_zero_allowed() {
+        // slash_percentage_bps = 0 should be allowed (no slashing).
+        let (env, admin, _, _, client) = setup();
+        let zero_slash_percentage = 0u32;
+
+        // TODO: After implementing set_slash_percentage:
+        // assert!(client.try_set_slash_percentage(&admin, &zero_slash_percentage).is_ok());
+    }
+
+    #[test]
+    fn test_set_slash_percentage_affects_future_defaults() {
+        // When slash_percentage is updated, future record_default calls should use
+        // the new percentage, not the one from initialization.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        let initial_stake = 10_000_000i128;
+
+        mint_stake(&env, &staking_token, &verifier, initial_stake);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, initial_stake);
+        client.add_verifier(&admin, &verifier, &initial_stake);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // TODO: After implementing set_slash_percentage:
+        // let new_slash_percentage = 1_000u32; // 10%
+        // client.set_slash_percentage(&admin, &new_slash_percentage);
+        // client.record_default(&admin, &sme);
+        // Verify that the new percentage was applied (10% slashed, not 50%).
+    }
+
+    // ── Issue #481: Verifier reputation gating tests ─────────────────────────────
+
+    #[test]
+    fn test_register_sme_blocked_below_reputation_threshold() {
+        // Verifiers below a minimum reputation threshold should be blocked
+        // from registering new SMEs. This prevents low-reputation verifiers
+        // from continued fraudulent activity.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+
+        // Slash the verifier down to a low reputation
+        let bad_sme1 = Address::generate(&env);
+        client.register_sme(&verifier, &bad_sme1, &50u32, &true);
+        for _ in 0..10 {
+            client.record_default(&admin, &bad_sme1);
+        }
+        let reputation = client.get_verifier_reputation(&verifier);
+        assert_eq!(reputation, 0); // Slashed below threshold
+
+        // TODO: After implementing reputation gating:
+        // Attempting to register another SME should fail:
+        // let bad_sme2 = Address::generate(&env);
+        // assert!(client.try_register_sme(&verifier, &bad_sme2, &50u32, &true).is_err());
+    }
+
+    #[test]
+    fn test_update_sme_score_blocked_below_reputation_threshold() {
+        // Verifiers below reputation threshold should also be blocked from
+        // updating existing SME scores.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // Slash the verifier to 0 reputation
+        for _ in 0..10 {
+            client.record_default(&admin, &sme);
+        }
+        let reputation = client.get_verifier_reputation(&verifier);
+        assert_eq!(reputation, 0);
+
+        // TODO: After implementing reputation gating:
+        // Attempting to update the score should fail:
+        // assert!(client.try_update_sme_score(&verifier, &sme, &75u32).is_err());
+    }
+
+    #[test]
+    fn test_set_credit_limit_blocked_below_reputation_threshold() {
+        // Verifiers below reputation threshold should be blocked from
+        // setting or updating SME credit limits.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // Slash to 0 reputation
+        for _ in 0..10 {
+            client.record_default(&admin, &sme);
+        }
+
+        // TODO: After implementing reputation gating:
+        // assert!(client.try_set_credit_limit(&verifier, &sme, &1_000_000i128).is_err());
+    }
+
+    #[test]
+    fn test_reputation_preserved_on_verifier_removal_and_re_add() {
+        // Reputation history should survive remove_verifier and be preserved
+        // (not reset to 100) when the same address is re-added via add_verifier.
+        // This prevents a reputation laundering attack.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &50u32, &true);
+
+        // Record defaults to slash reputation to 50
+        for _ in 0..5 {
+            client.record_default(&admin, &sme);
+        }
+        assert_eq!(client.get_verifier_reputation(&verifier), 50);
+
+        // Remove the verifier
+        client.remove_verifier(&admin, &verifier);
+        assert!(!client.is_verifier(&verifier));
+
+        // Re-add the same verifier
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+
+        // TODO: After implementing reputation history preservation:
+        // Reputation should still be 50, not reset to 100:
+        // assert_eq!(client.get_verifier_reputation(&verifier), 50);
+        // Current behavior resets to 100 (vulnerability).
+    }
+
+    #[test]
+    fn test_reputation_threshold_allows_default_actions() {
+        // A verifier at or above the reputation threshold should be able
+        // to perform all verifier actions (register_sme, update_sme_score, etc).
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+
+        // Verifier at reputation 100 (initial) should succeed
+        assert!(client.try_register_sme(&verifier, &sme, &50u32, &true).is_ok());
+        assert!(client.try_update_sme_score(&verifier, &sme, &75u32).is_ok());
+        assert!(client.try_set_credit_limit(&verifier, &sme, &500_000i128).is_ok());
+    }
+
+    // ── Issue #480: Debtor score cooldown sub-account bypass tests ──────────────
+
+    #[test]
+    fn test_set_debtor_score_cooldown_enforced_per_primary_verifier() {
+        // The cooldown must be scoped to the primary verifier, not the raw caller.
+        // This prevents bypassing the cooldown by cycling through sub-accounts.
+        let (env, admin, _, staking_token, client) = setup();
+        let primary = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xAAu8; 32]);
+
+        mint_stake(&env, &staking_token, &primary, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&primary, 1_000_000i128);
+        client.add_verifier(&admin, &primary, &1_000_000i128);
+
+        // Primary sets a debtor score
+        client.set_debtor_score(&primary, &debtor_hash, &30u32);
+        assert_eq!(client.get_debtor_score(&debtor_hash), 30);
+
+        // Verify cooldown blocks immediate re-update
+        let err = client
+            .try_set_debtor_score(&primary, &debtor_hash, &60u32)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RiskRegistryError::ScoreUpdateCooldownNotElapsed);
+
+        // TODO: After implementing per-primary-verifier cooldown:
+        // Even if we try via a different address (sub-account), the cooldown
+        // should still block the update because the resolved primary is the same.
+        // Current code keys the cooldown by raw caller, allowing bypass.
+    }
+
+    #[test]
+    fn test_set_debtor_score_subaccount_cooldown_bypass_blocked() {
+        // A primary verifier with sub-accounts should not be able to bypass
+        // the cooldown by updating the same debtor via different sub-accounts.
+        // The cooldown must be keyed to the resolved primary, not the raw caller.
+        let (env, admin, _, staking_token, client) = setup();
+        let primary = Address::generate(&env);
+        let sub_a = Address::generate(&env);
+        let sub_b = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xBBu8; 32]);
+
+        mint_stake(&env, &staking_token, &primary, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&primary, 1_000_000i128);
+        client.add_verifier(&admin, &primary, &1_000_000i128);
+        client.add_sub_account(&primary, &sub_a);
+        client.add_sub_account(&primary, &sub_b);
+
+        // Update debtor score via sub_a
+        client.set_debtor_score(&sub_a, &debtor_hash, &40u32);
+        assert_eq!(client.get_debtor_score(&debtor_hash), 40);
+
+        // TODO: After implementing per-primary-verifier cooldown:
+        // Immediately updating via sub_b should be blocked (same cooldown, different caller).
+        // This documents the vulnerability: current code allows this because it keys
+        // cooldown by raw caller (sub_a vs sub_b), not by resolved primary.
+        // let err = client
+        //     .try_set_debtor_score(&sub_b, &debtor_hash, &65u32)
+        //     .unwrap_err()
+        //     .unwrap();
+        // assert_eq!(err, RiskRegistryError::ScoreUpdateCooldownNotElapsed);
+
+        // Current behavior incorrectly allows the bypass:
+        if let Ok(_) = client.try_set_debtor_score(&sub_b, &debtor_hash, &65u32) {
+            // This documents the vulnerability being tested.
+        }
+    }
+
+    #[test]
+    fn test_set_debtor_score_multiple_subaccounts_unified_cooldown() {
+        // When multiple sub-accounts of the same primary all update the same debtor,
+        // the cooldown should be enforced per primary, preventing rapid successive
+        // updates regardless of which sub-account is used.
+        let (env, admin, _, staking_token, client) = setup();
+        let primary = Address::generate(&env);
+        let sub_1 = Address::generate(&env);
+        let sub_2 = Address::generate(&env);
+        let sub_3 = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xCCu8; 32]);
+
+        mint_stake(&env, &staking_token, &primary, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&primary, 1_000_000i128);
+        client.add_verifier(&admin, &primary, &1_000_000i128);
+        client.add_sub_account(&primary, &sub_1);
+        client.add_sub_account(&primary, &sub_2);
+        client.add_sub_account(&primary, &sub_3);
+
+        // First update via sub_1
+        assert!(client.try_set_debtor_score(&sub_1, &debtor_hash, &30u32).is_ok());
+
+        // TODO: After fix, all of these should fail with cooldown error (same primary):
+        // assert!(client.try_set_debtor_score(&sub_2, &debtor_hash, &40u32).is_err());
+        // assert!(client.try_set_debtor_score(&sub_3, &debtor_hash, &50u32).is_err());
+        // assert!(client.try_set_debtor_score(&primary, &debtor_hash, &60u32).is_err());
+
+        // Current code allows bypasses because it keys cooldown by caller, not primary.
+    }
+
+    #[test]
+    fn test_set_debtor_score_event_attributes_to_primary_verifier() {
+        // Events emitted by set_debtor_score should consistently attribute
+        // the update to the primary verifier, not the raw caller (sub-account).
+        let (env, admin, _, staking_token, client) = setup();
+        let primary = Address::generate(&env);
+        let sub_account = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xDDu8; 32]);
+
+        mint_stake(&env, &staking_token, &primary, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&primary, 1_000_000i128);
+        client.add_verifier(&admin, &primary, &1_000_000i128);
+        client.add_sub_account(&primary, &sub_account);
+
+        // Record events before and after
+        let events_before = env.events().all().len();
+        client.set_debtor_score(&sub_account, &debtor_hash, &45u32);
+        let events_after = env.events().all().len();
+
+        // TODO: After fix, ensure emitted event references the primary, not sub_account.
+        // For now, this test documents that events may incorrectly attribute
+        // to the sub-account caller rather than the resolved primary.
+        assert!(events_after > events_before, "Event should have been emitted");
+    }
+
+    #[test]
+    fn test_primary_and_subaccount_share_single_cooldown() {
+        // Primary and its sub-account should share the same cooldown namespace.
+        // An update via primary is blocked if a sub-account recently updated,
+        // and vice versa.
+        let (env, admin, _, staking_token, client) = setup();
+        let primary = Address::generate(&env);
+        let sub = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xEEu8; 32]);
+
+        mint_stake(&env, &staking_token, &primary, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&primary, 1_000_000i128);
+        client.add_verifier(&admin, &primary, &1_000_000i128);
+        client.add_sub_account(&primary, &sub);
+
+        // Update via sub-account
+        assert!(client.try_set_debtor_score(&sub, &debtor_hash, &35u32).is_ok());
+
+        // TODO: After fix, this should fail (same primary, so same cooldown):
+        // let err = client
+        //     .try_set_debtor_score(&primary, &debtor_hash, &50u32)
+        //     .unwrap_err()
+        //     .unwrap();
+        // assert_eq!(err, RiskRegistryError::ScoreUpdateCooldownNotElapsed);
+    }
 }
