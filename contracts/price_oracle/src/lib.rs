@@ -1,9 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 const MAX_STALENESS_SECS: u64 = 3600;
-const DEFAULT_MAX_PRICE_DEVIATION_BPS: u32 = 1000; // 10% deviation
+const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -15,6 +15,9 @@ pub enum PriceOracleError {
     InvoiceExpired = 4,
     NotAdmin = 5,
     NotInitialized = 6,
+    NoUpgradeProposed = 7,
+    UpgradeTimelockNotElapsed = 8,
+    ProtocolPaused = 9,
 }
 
 #[contracttype]
@@ -27,13 +30,9 @@ pub struct PriceData {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    AccessControl,
     Price(Symbol, Symbol),
-    TokenSymbol(Address),
-    MaxDeviation,
-    Feeder(Address),
-    FeederPrice(Symbol, Symbol, Address),
-    PriceFeeders(Symbol, Symbol),
-    BaseCurrency,
+    UpgradeProposal,
 }
 
 #[contract]
@@ -41,20 +40,27 @@ pub struct PriceOracleContract;
 
 #[contractimpl]
 impl PriceOracleContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), PriceOracleError> {
+    pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), PriceOracleError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PriceOracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::MaxDeviation, &DEFAULT_MAX_PRICE_DEVIATION_BPS);
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
+        Ok(())
+    }
+
+    /// Set the access_control contract address. Admin only.
+    /// Used for post-deployment wiring or migration.
+    pub fn set_access_control(env: Env, admin: Address, access_control: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
         Ok(())
     }
 
     /// Set a price for a currency pair. Authorized feeders only.
     /// Price is expressed as `base` units per 1 unit of `quote`, scaled by 1e7 (stroops).
-    /// Rejects prices that deviate more than MAX_PRICE_DEVIATION_BPS from the current aggregated price.
+    /// Blocked when the protocol is paused.
     pub fn set_price(
         env: Env,
         feeder: Address,
@@ -64,6 +70,7 @@ impl PriceOracleContract {
     ) -> Result<(), PriceOracleError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         if price <= 0 {
             return Err(PriceOracleError::InvalidAmount);
@@ -71,7 +78,7 @@ impl PriceOracleContract {
 
         let data = PriceData {
             price,
-            timestamp: env.ledger().timestamp(),
+            timestamp: env.ledger().timestamp(),contracts/access_control/src/lib.rs￼Mark as resolved 
         };
         env.storage()
             .persistent()
@@ -158,6 +165,7 @@ impl PriceOracleContract {
             .timestamp()
             .saturating_sub(data.timestamp);
         if age > MAX_STALENESS_SECS {
+            return Err(KoraError::InvalidAmount);
             return Err(PriceOracleError::InvoiceExpired);
         }
 
@@ -222,6 +230,45 @@ impl PriceOracleContract {
         }
     }
 
+    /// Transfer admin rights to a new address. Admin only.
+    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
+
+    /// Propose a WASM upgrade with a 24-hour timelock. Admin only.
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &(new_wasm_hash, env.ledger().timestamp()));
+        Ok(())
+    }
+
+    /// Execute a previously proposed upgrade after the 24-hour timelock.
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(PriceOracleError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(PriceOracleError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), PriceOracleError> {
         let admin: Address = env
             .storage()
@@ -234,14 +281,21 @@ impl PriceOracleContract {
         Ok(())
     }
 
-    fn require_feeder(env: &Env, feeder: &Address) -> Result<(), KoraError> {
-        let is_feeder: bool = env
+    fn require_not_paused(env: &Env) -> Result<(), PriceOracleError> {
+        let access_control: Address = env
             .storage()
-            .persistent()
-            .get(&DataKey::Feeder(feeder.clone()))
-            .unwrap_or(false);
-        if !is_feeder {
-            return Err(KoraError::RoleNotAssigned);
+            .instance()
+            .get(&DataKey::AccessControl)
+            .ok_or(PriceOracleError::NotInitialized)?;
+
+        let is_paused: bool = env.invoke_contract(
+            &access_control,
+            &soroban_sdk::Symbol::new(env, "is_paused"),
+            soroban_sdk::vec![env],
+        );
+
+        if is_paused {
+            return Err(PriceOracleError::ProtocolPaused);
         }
         Ok(())
     }
@@ -258,10 +312,9 @@ mod tests {
         let contract_id = env.register_contract(None, PriceOracleContract);
         let client = PriceOracleContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        let feeder = Address::generate(&env);
-        client.initialize(&admin);
-        client.add_feeder(&admin, &feeder);
-        (env, admin, feeder, client)
+        let access_control = Address::generate(&env);
+        client.initialize(&admin, &access_control);
+        (env, admin, client)
     }
 
     #[test]
@@ -325,240 +378,49 @@ mod tests {
     }
 
     #[test]
-    fn test_register_and_resolve_token_symbol() {
-        let (env, admin, _feeder, client) = setup();
-        let token_addr = Address::generate(&env);
-        let symbol = Symbol::new(&env, "USDC");
-        client.register_token_symbol(&admin, &token_addr, &symbol);
-        let resolved = client.resolve_symbol(&token_addr);
-        assert_eq!(resolved, symbol);
+    fn test_transfer_admin_success() {
+        let (env, admin, client) = setup();
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&admin, &new_admin);
+        let result = client.try_set_price(&new_admin, &Symbol::new(&env, "XLM"), &Symbol::new(&env, "USDC"), &10_000_000i128);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_resolve_unregistered_token_fails() {
-        let (env, _admin, _feeder, client) = setup();
-        let token_addr = Address::generate(&env);
-        let result = client.try_resolve_symbol(&token_addr);
+    fn test_transfer_admin_requires_admin() {
+        let (env, admin, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let result = client.try_transfer_admin(&stranger, &new_admin);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_convert_by_address() {
-        let (env, admin, feeder, client) = setup();
-        let eurc_token = Address::generate(&env);
-        let usdc_token = Address::generate(&env);
-        let eurc_symbol = Symbol::new(&env, "EURC");
-        let usdc_symbol = Symbol::new(&env, "USDC");
-
-        client.register_token_symbol(&admin, &eurc_token, &eurc_symbol);
-        client.register_token_symbol(&admin, &usdc_token, &usdc_symbol);
-        client.set_price(&feeder, &eurc_symbol, &usdc_symbol, &11_000_000i128);
-
-        let result = client.convert_by_address(&10_000_000i128, &eurc_token, &usdc_token);
-        assert_eq!(result, 11_000_000i128);
-    }
-
-    #[test]
-    fn test_price_within_deviation_succeeds() {
-        let (env, _admin, feeder, client) = setup();
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-
-        client.set_price(&feeder, &base, &quote, &10_000_000i128);
-
-        // 10% deviation allowed (default), new price 10.5M is within 10%
-        let result = client.try_set_price(&feeder, &base, &quote, &10_500_000i128);
+    fn test_propose_upgrade_success() {
+        let (env, admin, client) = setup();
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]);
+        let result = client.try_propose_upgrade(&admin, &wasm_hash);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_price_exceeding_deviation_rejected() {
-        let (env, _admin, feeder, client) = setup();
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-
-        client.set_price(&feeder, &base, &quote, &10_000_000i128);
-
-        // 10% deviation allowed (default), new price 11.5M exceeds 10%
-        let result = client.try_set_price(&feeder, &base, &quote, &11_500_000i128);
+    fn test_execute_upgrade_requires_timelock() {
+        let (env, admin, client) = setup();
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash);
+        let result = client.try_execute_upgrade(&admin);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_price_override_bypasses_deviation() {
-        let (env, _admin, feeder, client) = setup();
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-
-        client.set_price(&feeder, &base, &quote, &10_000_000i128);
-
-        // Exceeds deviation but override bypasses check
-        let result = client.try_set_price_override(&feeder, &base, &quote, &20_000_000i128);
-        assert!(result.is_ok());
-        let data = client.get_price(&base, &quote);
-        assert_eq!(data.price, 20_000_000i128);
-    }
-
-    #[test]
-    fn test_set_max_deviation() {
-        let (env, admin, feeder, client) = setup();
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-
-        client.set_price(&feeder, &base, &quote, &10_000_000i128);
-
-        // Set deviation to 5% (500 bps)
-        client.set_max_deviation(&admin, &500u32);
-
-        // 7% increase should now fail (was within 10% before)
-        let result = client.try_set_price(&feeder, &base, &quote, &10_700_000i128);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_first_price_always_succeeds() {
-        let (env, _admin, feeder, client) = setup();
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-
-        // No previous price, should succeed regardless of value
-        let result = client.try_set_price(&feeder, &base, &quote, &100_000_000i128);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_multiple_feeders_median_aggregation() {
-        let (env, admin, feeder1, client) = setup();
-        let feeder2 = Address::generate(&env);
-        let feeder3 = Address::generate(&env);
-        client.add_feeder(&admin, &feeder2);
-        client.add_feeder(&admin, &feeder3);
-
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-
-        // Three feeders submit different prices: 10M, 11M, 12M
-        client.set_price(&feeder1, &base, &quote, &10_000_000i128);
-        client.set_price(&feeder2, &base, &quote, &11_000_000i128);
-        client.set_price(&feeder3, &base, &quote, &12_000_000i128);
-
-        // Median should be 11M
-        let data = client.get_price(&base, &quote);
-        assert_eq!(data.price, 11_000_000i128);
-    }
-
-    #[test]
-    fn test_single_malicious_feeder_cannot_control_aggregate() {
-        let (env, admin, feeder1, client) = setup();
-        let malicious_feeder = Address::generate(&env);
-        client.add_feeder(&admin, &malicious_feeder);
-
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-
-        // Honest feeder submits 10M
-        client.set_price(&feeder1, &base, &quote, &10_000_000i128);
-
-        // Malicious feeder tries to submit 1M (1000x lower)
-        client.set_price(&malicious_feeder, &base, &quote, &1_000_000i128);
-
-        // Median of [10M, 1M] is 5.5M, not 1M
-        let data = client.get_price(&base, &quote);
-        assert!(data.price > 1_000_000i128);
-        assert!(data.price < 10_000_000i128);
-    }
-
-    #[test]
-    fn test_add_and_remove_feeder() {
-        let (env, admin, feeder, client) = setup();
-        let new_feeder = Address::generate(&env);
-
-        client.add_feeder(&admin, &new_feeder);
-        let base = Symbol::new(&env, "EURC");
-        let quote = Symbol::new(&env, "USDC");
-        let result = client.try_set_price(&new_feeder, &base, &quote, &10_000_000i128);
-        assert!(result.is_ok());
-
-        client.remove_feeder(&admin, &new_feeder);
-        let result2 = client.try_set_price(&new_feeder, &base, &quote, &11_000_000i128);
-        assert!(result2.is_err());
-    }
-
-    #[test]
-    fn test_multi_hop_conversion_via_base_currency() {
-        let (env, admin, feeder, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let gbpc = Symbol::new(&env, "GBPC");
-        let usdc = Symbol::new(&env, "USDC");
-
-        // Set USDC as base currency
-        client.set_base_currency(&admin, &usdc);
-
-        // Register only EURC->USDC and GBPC->USDC (not direct EURC->GBPC)
-        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128); // 1 EURC = 1.1 USDC
-        client.set_price(&feeder, &gbpc, &usdc, &13_000_000i128); // 1 GBPC = 1.3 USDC
-
-        // Convert EURC to GBPC via USDC triangulation
-        let result = client.convert(&10_000_000i128, &eurc, &gbpc);
-        assert!(result.is_ok());
-
-        // Verify math: 10M EURC * 1.1 = 11M USDC, then 11M / 1.3 ≈ 8.46M GBPC
-        let converted = result.unwrap();
-        assert!(converted > 0);
-        assert!(converted < 11_000_000i128);
-    }
-
-    #[test]
-    fn test_direct_pair_preferred_over_triangulation() {
-        let (env, admin, feeder, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let gbpc = Symbol::new(&env, "GBPC");
-        let usdc = Symbol::new(&env, "USDC");
-
-        client.set_base_currency(&admin, &usdc);
-
-        // Set direct pair and triangulation pairs with different rates
-        client.set_price(&feeder, &eurc, &gbpc, &10_000_000i128); // Direct: 1:1
-        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128); // Via base: 1 EURC = 1.1 USDC
-        client.set_price(&feeder, &gbpc, &usdc, &11_000_000i128); // Via base: 1 GBPC = 1.1 USDC
-
-        // Should use direct pair (10M), not triangulation result (~10M via base)
-        let result = client.convert(&10_000_000i128, &eurc, &gbpc);
-        let converted = result.unwrap();
-        assert_eq!(converted, 10_000_000i128);
-    }
-
-    #[test]
-    fn test_triangulation_fails_without_base_currency() {
-        let (env, _admin, feeder, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let gbpc = Symbol::new(&env, "GBPC");
-        let usdc = Symbol::new(&env, "USDC");
-
-        // No base currency set
-        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128);
-        client.set_price(&feeder, &gbpc, &usdc, &13_000_000i128);
-
-        // Should fail because no direct pair and no base currency
-        let result = client.try_convert(&10_000_000i128, &eurc, &gbpc);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_triangulation_both_legs_checked_for_staleness() {
+    fn test_execute_upgrade_success() {
         use soroban_sdk::testutils::{Ledger, LedgerInfo};
-        let (env, admin, feeder, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let gbpc = Symbol::new(&env, "GBPC");
-        let usdc = Symbol::new(&env, "USDC");
+        let (env, admin, client) = setup();
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash);
 
-        client.set_base_currency(&admin, &usdc);
-        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128);
-        client.set_price(&feeder, &gbpc, &usdc, &13_000_000i128);
-
-        // Advance time to make one leg stale
         env.ledger().set(LedgerInfo {
-            timestamp: env.ledger().timestamp() + MAX_STALENESS_SECS + 1,
+            timestamp: env.ledger().timestamp() + UPGRADE_TIMELOCK_DELAY + 1,
             protocol_version: 21,
             sequence_number: 2,
             network_id: Default::default(),
@@ -568,8 +430,45 @@ mod tests {
             max_entry_ttl: 100_000,
         });
 
-        // Should fail because at least one leg is stale
-        let result = client.try_convert(&10_000_000i128, &eurc, &gbpc);
+        let result = client.try_execute_upgrade(&admin);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_execute_upgrade_no_proposal() {
+        let (env, admin, client) = setup();
+        let result = client.try_execute_upgrade(&admin);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_access_control() {
+        let (env, admin, client) = setup();
+        let new_access_control = Address::generate(&env);
+        client.set_access_control(&admin, &new_access_control).unwrap();
+    }
+
+    #[test]
+    fn test_set_price_when_paused_fails() {
+        let (env, admin, client) = setup();
+        let access_control = Address::generate(&env);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("AC"), &true);
+
+        let result = client.try_set_price(
+            &admin,
+            &Symbol::new(&env, "EURC"),
+            &Symbol::new(&env, "USDC"),
+            &11_000_000i128,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_price_when_not_paused_succeeds() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+        let result = client.try_set_price(&admin, &base, &quote, &11_000_000i128);
+        assert!(result.is_ok());
     }
 }

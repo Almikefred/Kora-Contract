@@ -134,7 +134,7 @@ fi
 
 # ── Risk Registry ────────────────────────────────────────────────────────────
 # Persistent keys: Admin, InvoiceNft, Verifier(addr), SmeProfile(addr),
-#                  DebtorScore(hash)
+#                  DebtorScoreAttestation(hash, addr), DebtorAttestors(hash)
 # get_admin and get_sme_profile both call bump_persistent internally.
 # We touch the admin key; SME profiles are bumped on every read via
 # get_sme_profile which calls bump_persistent.
