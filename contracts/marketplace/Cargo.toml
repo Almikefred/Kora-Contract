@@ -14,7 +14,6 @@ kora-access-control = { path = "../access_control" }
 kora-financing-pool = { path = "../financing_pool" }
 kora-treasury = { path = "../treasury" }
 kora-risk-registry = { path = "../risk_registry" }
-kora-price-oracle = { path = "../price_oracle" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
@@ -23,3 +22,4 @@ kora-invoice-nft = { path = "../invoice_nft" }
 kora-access-control = { path = "../access_control" }
 kora-financing-pool = { path = "../financing_pool" }
 kora-treasury = { path = "../treasury" }
+kora-risk-registry = { path = "../risk_registry" }
