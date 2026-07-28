@@ -327,6 +327,67 @@ sha256sum invoice-metadata.json        # -> compare hex against invoice.metadata
 
 A `metadata_hash` of length 0 means no commitment was made for that invoice.
 
+#### Dispute mechanism (`flag_metadata_mismatch` / `resolve_metadata_dispute`)
+
+Verifying a `metadata_hash` commitment (above) is an off-chain, manual process. If a
+third party — an investor, verifier, or auditor — performs that verification and finds
+a mismatch, they can flag it on-chain:
+
+```rust
+pub fn flag_metadata_mismatch(
+    env: Env,
+    challenger: Address,
+    invoice_id: u64,
+    evidence_hash: Bytes,
+) -> Result<(), KoraError>
+
+pub fn resolve_metadata_dispute(
+    env: Env,
+    admin: Address,
+    invoice_id: u64,
+    upheld: bool,
+) -> Result<(), KoraError>
+```
+
+- **Any address** may call `flag_metadata_mismatch`, supplying the SHA-256 they
+  independently computed from the fetched document as `evidence_hash`. This requires
+  the invoice to already have a committed `metadata_hash` (`InvalidInvoiceStatus`
+  otherwise) and **automatically freezes the invoice** (blocking `fund_invoice`/`repay`)
+  pending admin review. Emits `metadata_mismatch_flagged`.
+- **Anti-griefing:** at most one dispute may ever be raised per invoice. Once an admin
+  resolves it (upheld or rejected) via `resolve_metadata_dispute`, the invoice cannot be
+  disputed again through this path — a false accusation cannot be repeatedly relitigated,
+  and a confirmed one doesn't need to be. `AlreadyInitialized` is returned for a second
+  attempt, whether the prior dispute is still open or already resolved.
+- **Admin resolution:** `upheld = true` confirms the fraud and leaves the invoice frozen
+  (the admin is expected to follow up via other governance/legal channels). `upheld =
+  false` clears the dispute and unfreezes the invoice, emitting `invoice_unfrozen` and
+  `metadata_dispute_resolved` in both cases.
+
+#### Admin correction (`admin_correct_metadata_hash`)
+
+Distinct from the dispute mechanism above, this addresses an SME's own **honest**
+mistake (e.g. committing the hash of the wrong file version) rather than third-party
+fraud detection:
+
+```rust
+pub fn admin_correct_metadata_hash(
+    env: Env,
+    admin: Address,
+    invoice_id: u64,
+    new_hash: Bytes,
+) -> Result<(), KoraError>
+```
+
+Admin-only, and restricted to `status == Created` — identical to the guard on
+`commit_metadata_hash` and `amend_invoice` — so no investor could possibly have relied
+on the original (incorrect) commitment. Works whether or not a hash was already
+committed. Emits a distinctly-named `metadata_hash_corrected` event carrying both the
+old and new hash, and records a structured `AdminAuditEntry` (`AdminActionType::
+CorrectMetadataHash`, `AuditSource::InvoiceNft`, readable via `get_audit_log`) — this
+admin override is never conflated with the SME's own original commitment in the audit
+trail, precisely because it is a deliberate exception to a stated immutability guarantee.
+
 ---
 
 ### State Transitions
@@ -475,6 +536,50 @@ pub fn invoice_count(env: Env) -> u64
 **Returns:** The cumulative number of invoices created on this contract.
 
 **Security:** No authorization check (public view).
+
+---
+
+```rust
+pub fn reconcile_outstanding_exposure(env: Env, sme: Address) -> i128
+```
+
+**Purpose:** Independently recompute an SME's aggregate exposure from the underlying
+invoice set (summing `amount` across `Created`/`Listed`/`Funded` invoices), bypassing
+the cached `OutstandingExposure` counter used by `get_outstanding_exposure`.
+
+**Returns:** The recomputed total. Should always equal `get_outstanding_exposure(sme)` —
+a mismatch indicates a bug in one of the five exposure-adjusting code paths (`mint_invoice`,
+`mint_invoices_batch`, `amend_invoice`, `withdraw_invoice`, `set_repaid`, `set_defaulted`).
+
+**Security:** No authorization check (public view). Scans every allocated invoice ID
+(bounded by `next_id`) — there is no SME-to-invoice index yet, so cost is linear in the
+total number of invoices minted on the contract, not just this SME's.
+
+---
+
+## Protocol Configuration (`ProtocolConfig`)
+
+```rust
+pub fn set_protocol_config(env: Env, admin: Address, config: ProtocolConfig) -> Result<(), KoraError>
+pub fn get_protocol_config(env: Env) -> ProtocolConfig
+```
+
+`kora_shared::types::ProtocolConfig` is a shared struct — `fee_bps`, `late_penalty_bps`,
+`max_risk_score`, `min_funding_period` — defined for protocol-wide use but historically
+unused by any contract. `invoice_nft` is the first adopter: `set_protocol_config`
+(admin-only) stores it, and `mint_invoice`/`mint_invoices_batch` enforce `max_risk_score`
+as an additional ceiling on top of the fixed 0–100 range `require_valid_risk_score`
+already checks — letting the protocol tighten its risk appetite (e.g. rejecting anything
+above `risk_score: 70`) without a contract upgrade.
+
+**Defaults:** an unconfigured contract behaves exactly as before — `max_risk_score`
+defaults to 100 (no additional restriction) and `fee_bps`/`late_penalty_bps`/
+`min_funding_period` default to 0.
+
+**Out of scope:** `fee_bps`, `late_penalty_bps`, and `min_funding_period` are stored in
+`ProtocolConfig` for forward-compatibility but are **not** read anywhere in this contract.
+They remain owned by `treasury`/`financing_pool`'s own local parameters; wiring them into
+this shared struct is follow-up work.
 
 ---
 

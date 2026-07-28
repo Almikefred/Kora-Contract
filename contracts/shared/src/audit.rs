@@ -90,6 +90,9 @@ pub enum AdminActionType {
     ExecuteWithdrawalCap,
     TreasuryProposeUpgrade,
     TreasuryExecuteUpgrade,
+    SetAccessControl,
+    DeclareEmergency,
+    RevokeEmergency,
     // ── RiskRegistry ─────────────────────────────────────────────────────────
     AddVerifier,
     RemoveVerifier,
@@ -98,6 +101,7 @@ pub enum AdminActionType {
     RegistryProposeUpgrade,
     RegistryExecuteUpgrade,
     // ── InvoiceNft ───────────────────────────────────────────────────────────
+    CorrectMetadataHash,
     InvoiceNftSetRiskRegistry,
     InvoiceNftSetAuthorizedCallers,
     InvoiceNftSetDefaulted,
@@ -124,4 +128,9 @@ pub struct AdminAuditEntry {
     pub action: AdminActionType,
     /// Contract that originated the action.
     pub source: AuditSource,
+    /// Token involved in the action, when financially meaningful (e.g. `withdraw`'s token).
+    pub token: Option<Address>,
+    /// Amount involved in the action, when financially meaningful (e.g. withdrawn amount,
+    /// new fee bps, new withdrawal cap). `None` for actions with no natural amount.
+    pub amount: Option<i128>,
 }
