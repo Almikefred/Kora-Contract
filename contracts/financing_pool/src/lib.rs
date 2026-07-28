@@ -3,10 +3,8 @@
 use kora_shared::{
     errors::CommonError,
     events,
-    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer},
-    validation::{bps_of, bps_of_normalized, require_valid_bps_range, UPGRADE_TIMELOCK_DELAY},
     types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer, ProtocolStats},
-    validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of, bps_of_normalized, require_valid_bps_range, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Symbol, Vec,
@@ -78,20 +76,6 @@ pub enum DataKey {
     ProtocolStats,
     /// Installment repayment schedule for a pool, keyed by invoice ID.
     InstallmentSchedule(u64),
-    /// Optional installment repayment schedule for a pool.
-    InstallmentSchedule(u64),
-    /// Aggregate protocol-wide metrics.
-    ProtocolStats,
-}
-
-/// Aggregate protocol-wide metrics tracked across all pools.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProtocolStats {
-    pub pools_opened: u32,
-    pub total_repaid: i128,
-    pub pools_defaulted: u32,
-    pub active_pools: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -1299,37 +1283,6 @@ impl FinancingPoolContract {
         Ok(())
     }
 
-    /// Paginated view of investor positions for an invoice.
-    ///
-    /// Returns at most `limit` positions starting at `offset` (0-based index
-    /// into the position list ordered by investor address key).  An `offset`
-    /// beyond the last position returns an empty vec; `limit` is capped at 100
-    /// to bound per-call CPU cost.
-    pub fn get_positions_page(
-        env: Env,
-        invoice_id: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<Position> {
-        let limit = limit.min(100);
-        let positions: Map<Address, Position> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Positions(invoice_id))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let all: Vec<Position> = positions.values();
-        let total = all.len();
-        let start = offset.min(total) as usize;
-        let end = (start + limit as usize).min(total as usize);
-
-        let mut page: Vec<Position> = Vec::new(&env);
-        for i in start..end {
-            page.push_back(all.get(i as u32).unwrap());
-        }
-        page
-    }
-
     /// Returns the total number of investor positions recorded for an invoice.
     ///
     /// **Parameters:**
@@ -1461,15 +1414,23 @@ impl FinancingPoolContract {
             None => return Ok(amount),
         };
 
-        let oracle_client =
-            kora_price_oracle::PriceOracleContractClient::new(env, &oracle_addr);
-
         // Use the invoice currency symbol directly; pool token symbol is
         // derived from the token contract but for oracle lookup we use the
         // same symbol convention.  If the oracle has no pair registered
         // for (from, to), the convert call will fail — this is intentional
         // to reject operations without a valid price.
         let pool_currency = Symbol::new(env, "USDC");
+
+        // No conversion needed when the invoice is already denominated in the
+        // pool's currency — skip the oracle call entirely so pools can operate
+        // without a price_oracle wired up (or with a dummy address) as long as
+        // they never handle cross-currency invoices.
+        if invoice_currency == &pool_currency {
+            return Ok(amount);
+        }
+
+        let oracle_client =
+            kora_price_oracle::PriceOracleContractClient::new(env, &oracle_addr);
 
         Ok(oracle_client.convert(&amount, invoice_currency, &pool_currency))
     }
@@ -1665,7 +1626,7 @@ mod tests {
         let ac = Address::generate(&env);
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &0u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
     }
 
     #[test]
@@ -1681,7 +1642,7 @@ mod tests {
         let ac = Address::generate(&env);
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &10_001u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
     }
 
     #[test]
@@ -1698,7 +1659,7 @@ mod tests {
         let oracle = Address::generate(&env);
         client.initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &5_000u32);
         let result = client.try_set_max_position_bps(&admin, &0u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
         // Existing config is untouched by the rejected update.
         assert_eq!(client.get_max_position_bps(), 5_000u32);
     }

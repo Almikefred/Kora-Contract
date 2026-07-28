@@ -2439,14 +2439,9 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::{Bid, DecaySchedule, Listing, RiskTier},
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
-};
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
-    types::{Listing, RiskTier},
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
     validation::{bps_of, bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 
 // ~30 days in ledgers at ~5 s/ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -2462,30 +2457,35 @@ pub const DEFAULT_MIN_FUNDING_BUFFER: u64 = 3 * 86_400;
 pub enum MarketplaceError {
     AlreadyInitialized = 1,
     ArithmeticOverflow = 2,
-    CancellationPending = 3,
-    ComplianceNotAttested = 4,
-    ExceedsFundingTarget = 5,
-    FundingDeadlinePassed = 6,
-    FundingNotExpired = 7,
-    InvalidAddress = 8,
-    InvalidAmount = 9,
-    InvalidDueDate = 10,
-    InvalidFeeRate = 11,
-    InvoiceAlreadyExists = 12,
-    InvoiceFrozen = 13,
-    ListingAlreadyCancelled = 14,
-    ListingFullyFunded = 15,
-    ListingNotFound = 16,
-    NoCancellationPending = 17,
-    NoContribution = 18,
-    NoUpgradeProposed = 19,
-    NotAdmin = 20,
-    NotInitialized = 21,
-    ProtocolPaused = 22,
-    RefundAlreadyClaimed = 23,
-    TokenNotWhitelisted = 24,
-    Unauthorized = 25,
-    UpgradeTimelockNotElapsed = 26,
+    BidAlreadyExists = 3,
+    BidNotFound = 4,
+    BiddingWindowActive = 5,
+    BiddingWindowClosed = 6,
+    CancellationPending = 7,
+    ComplianceNotAttested = 8,
+    ExceedsFundingTarget = 9,
+    FundingDeadlinePassed = 10,
+    FundingDeadlineTooCloseToDueDate = 11,
+    FundingNotExpired = 12,
+    InvalidAddress = 13,
+    InvalidAmount = 14,
+    InvalidDueDate = 15,
+    InvalidFeeRate = 16,
+    InvoiceAlreadyExists = 17,
+    InvoiceFrozen = 18,
+    ListingAlreadyCancelled = 19,
+    ListingFullyFunded = 20,
+    ListingNotFound = 21,
+    NoCancellationPending = 22,
+    NoContribution = 23,
+    NoUpgradeProposed = 24,
+    NotAdmin = 25,
+    NotInitialized = 26,
+    ProtocolPaused = 27,
+    RefundAlreadyClaimed = 28,
+    TokenNotWhitelisted = 29,
+    Unauthorized = 30,
+    UpgradeTimelockNotElapsed = 31,
 }
 
 impl From<CommonError> for MarketplaceError {
@@ -2534,14 +2534,14 @@ pub enum DataKey {
     /// Legacy individual risk_registry key (never written; present only so
     /// load_config's legacy migration path can look it up and fail cleanly).
     RiskRegistry,
-    /// Referrer address recorded at listing time, if any.
-    Referrer(u64),
-    /// Pending two-phase cancellation request (who requested it).
-    CancellationRequest(u64),
-    /// Marks a listing's cancellation as admin-confirmed, unblocking refunds.
-    CancellationConfirmed(u64),
     /// Minimum discount (bps of face_value) required to list an invoice.
     MinDiscountBps,
+    /// Minimum seconds between a listing's funding_deadline and the invoice's due_date (#441).
+    MinFundingBuffer,
+    /// Dutch-auction price decay schedule for a listing, if any (#439).
+    DecaySchedule(u64),
+    /// Reverse-auction bid: Bid(invoice_id, investor) (#440).
+    Bid(u64, Address),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -2617,11 +2617,11 @@ impl MarketplaceContract {
         env: Env,
         admin: Address,
         buffer_seconds: u64,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), MarketplaceError> {
         admin.require_auth();
         let config = Self::load_config(&env)?;
         if config.admin != admin {
-            return Err(KoraError::NotAdmin);
+            return Err(MarketplaceError::NotAdmin);
         }
         env.storage()
             .instance()
@@ -2679,13 +2679,13 @@ impl MarketplaceContract {
     /// basis points of face_value, that a listing must offer. Admin only.
     ///
     /// **Errors:**
-    /// - `KoraError::NotAdmin` — Caller is not the admin.
-    /// - `KoraError::InvalidFeeRate` — `min_discount_bps` > 10 000.
-    pub fn set_min_discount_bps(env: Env, admin: Address, min_discount_bps: u32) -> Result<(), KoraError> {
+    /// - `MarketplaceError::NotAdmin` — Caller is not the admin.
+    /// - `MarketplaceError::InvalidFeeRate` — `min_discount_bps` > 10 000.
+    pub fn set_min_discount_bps(env: Env, admin: Address, min_discount_bps: u32) -> Result<(), MarketplaceError> {
         admin.require_auth();
         let config = Self::load_config(&env)?;
         if config.admin != admin {
-            return Err(KoraError::NotAdmin);
+            return Err(MarketplaceError::NotAdmin);
         }
         require_valid_fee_bps(min_discount_bps)?;
         env.storage().instance().set(&DataKey::MinDiscountBps, &min_discount_bps);
@@ -2797,7 +2797,7 @@ impl MarketplaceContract {
         token: Address,
         funding_deadline: u64,
         referrer: Option<Address>,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), MarketplaceError> {
         Self::list_invoice_inner(
             env,
             seller,
@@ -2829,17 +2829,17 @@ impl MarketplaceContract {
         min_asking_price: i128,
         decay_start_ts: u64,
         decay_end_ts: u64,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), MarketplaceError> {
         // Validate decay schedule parameters
         require_non_zero_amount(min_asking_price)?;
         if min_asking_price >= asking_price {
-            return Err(KoraError::InvalidAmount);
+            return Err(MarketplaceError::InvalidAmount);
         }
         if decay_start_ts >= decay_end_ts {
-            return Err(KoraError::InvalidDueDate);
+            return Err(MarketplaceError::InvalidDueDate);
         }
         if decay_end_ts > funding_deadline {
-            return Err(KoraError::InvalidDueDate);
+            return Err(MarketplaceError::InvalidDueDate);
         }
 
         let schedule = DecaySchedule {
@@ -2877,9 +2877,9 @@ impl MarketplaceContract {
         funding_deadline: u64,
         referrer: Option<Address>,
         bidding_deadline: u64,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), MarketplaceError> {
         if bidding_deadline >= funding_deadline {
-            return Err(KoraError::InvalidDueDate);
+            return Err(MarketplaceError::InvalidDueDate);
         }
         kora_shared::validation::require_future_timestamp(&env, bidding_deadline)?;
 
@@ -2909,7 +2909,6 @@ impl MarketplaceContract {
         referrer: Option<Address>,
         bidding_deadline: Option<u64>,
         decay_schedule: Option<DecaySchedule>,
-    ) -> Result<(), KoraError> {
     ) -> Result<(), MarketplaceError> {
         seller.require_auth();
         Self::require_not_paused(&env)?;
@@ -2919,19 +2918,24 @@ impl MarketplaceContract {
         require_within_max_amount(asking_price)?;
         require_within_max_amount(face_value)?;
 
-        // asking_price must be strictly less than face_value (discount must exist)
-        if asking_price >= face_value {
-            return Err(MarketplaceError::InvalidAmount);
-        }
+        // asking_price must be strictly less than face_value (discount must exist).
+        // Decay-schedule listings are exempt: they start undiscounted at face_value
+        // and decay toward `min_asking_price` over time, so the discount is
+        // enforced there instead (`min_asking_price < asking_price`).
+        if decay_schedule.is_none() {
+            if asking_price >= face_value {
+                return Err(MarketplaceError::InvalidAmount);
+            }
 
-        // Enforce a minimum discount so listings offer investors meaningful yield.
-        let min_discount_bps = Self::get_min_discount_bps(env.clone());
-        let min_discount = bps_of(face_value, min_discount_bps)?;
-        let discount = face_value
-            .checked_sub(asking_price)
-            .ok_or(KoraError::ArithmeticOverflow)?;
-        if discount < min_discount {
-            return Err(KoraError::InvalidAmount);
+            // Enforce a minimum discount so listings offer investors meaningful yield.
+            let min_discount_bps = Self::get_min_discount_bps(env.clone());
+            let min_discount = bps_of(face_value, min_discount_bps)?;
+            let discount = face_value
+                .checked_sub(asking_price)
+                .ok_or(MarketplaceError::ArithmeticOverflow)?;
+            if discount < min_discount {
+                return Err(MarketplaceError::InvalidAmount);
+            }
         }
 
         Self::require_whitelisted_token(&env, &token)?;
@@ -2959,7 +2963,7 @@ impl MarketplaceContract {
         let invoice = nft_client.get_invoice(&invoice_id);
 
         if invoice.amount != face_value {
-            return Err(KoraError::InvalidAmount);
+            return Err(MarketplaceError::InvalidAmount);
         }
 
         // ── #441: Validate funding_deadline is in the future ──────────────────
@@ -2975,10 +2979,10 @@ impl MarketplaceContract {
 
         let deadline_with_buffer = funding_deadline
             .checked_add(min_buffer)
-            .ok_or(KoraError::ArithmeticOverflow)?;
+            .ok_or(MarketplaceError::ArithmeticOverflow)?;
 
         if deadline_with_buffer > invoice.due_date {
-            return Err(KoraError::FundingDeadlineTooCloseToDueDate);
+            return Err(MarketplaceError::FundingDeadlineTooCloseToDueDate);
         }
 
         // Referrer may not be the seller (self-referral)
@@ -3007,9 +3011,6 @@ impl MarketplaceContract {
                 schedule.floor_price,
                 schedule.decay_end_ts,
             );
-        let invoice = nft_client.get_invoice(&invoice_id);
-        if invoice.amount != face_value {
-            return Err(MarketplaceError::InvalidAmount);
         }
 
         let listing = Listing {
@@ -3027,7 +3028,7 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::Listing(invoice_id), &listing);
         Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
-        events::invoice_listed(&env, invoice_id, &seller, asking_price);
+        events::invoice_listed(&env, invoice_id, &seller, asking_price, invoice.currency.clone());
         Ok(())
     }
 
@@ -3062,7 +3063,7 @@ impl MarketplaceContract {
         // ── #440: Reject direct funding while bidding window is open ──────────
         if let Some(bid_dl) = listing.bidding_deadline {
             if env.ledger().timestamp() <= bid_dl {
-                return Err(KoraError::BiddingWindowActive);
+                return Err(MarketplaceError::BiddingWindowActive);
             }
         }
 
@@ -3133,7 +3134,7 @@ impl MarketplaceContract {
             .set(&DataKey::Listing(invoice_id), &listing);
         Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
 
-        events::invoice_funded(&env, invoice_id, &investor, amount);
+        events::invoice_funded(&env, invoice_id, &investor, amount, invoice.currency.clone());
         if fee > 0 {
             events::fee_collected(&env, &investor, invoice_id, fee, &listing.token);
         }
@@ -3396,7 +3397,7 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .get(&DataKey::Listing(invoice_id))
-            .ok_or(KoraError::ListingNotFound)
+            .ok_or(MarketplaceError::ListingNotFound)
     }
 
     // ── Dutch Auction / Price Decay (#439) ────────────────────────────────────
@@ -3406,15 +3407,12 @@ impl MarketplaceContract {
     /// If no decay schedule is set, returns `listing.asking_price` unchanged.
     /// If a schedule is active, performs linear interpolation between
     /// `start_price` and `floor_price` based on the current ledger timestamp.
-    pub fn get_current_price(env: Env, invoice_id: u64) -> Result<i128, KoraError> {
+    pub fn get_current_price(env: Env, invoice_id: u64) -> Result<i128, MarketplaceError> {
         let listing: Listing = env
-            .ok_or(MarketplaceError::ListingNotFound)
-    pub fn get_listing(env: Env, invoice_id: u64) -> Result<Listing, KoraError> {
-        let listing = env
             .storage()
             .persistent()
             .get(&DataKey::Listing(invoice_id))
-            .ok_or(KoraError::ListingNotFound)?;
+            .ok_or(MarketplaceError::ListingNotFound)?;
         Ok(Self::current_asking_price_impl(&env, &listing))
     }
 
@@ -3443,7 +3441,7 @@ impl MarketplaceContract {
         invoice_id: u64,
         bid_price: i128,
         amount: i128,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), MarketplaceError> {
         investor.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -3456,37 +3454,37 @@ impl MarketplaceContract {
             .storage()
             .persistent()
             .get(&DataKey::Listing(invoice_id))
-            .ok_or(KoraError::ListingNotFound)?;
+            .ok_or(MarketplaceError::ListingNotFound)?;
 
         if !listing.is_active {
-            return Err(KoraError::ListingAlreadyCancelled);
+            return Err(MarketplaceError::ListingAlreadyCancelled);
         }
 
         // Must be in bidding mode
         let bidding_deadline = listing
             .bidding_deadline
-            .ok_or(KoraError::BiddingWindowClosed)?;
+            .ok_or(MarketplaceError::BiddingWindowClosed)?;
 
         // Must be inside the bidding window
         if env.ledger().timestamp() > bidding_deadline {
-            return Err(KoraError::BiddingWindowClosed);
+            return Err(MarketplaceError::BiddingWindowClosed);
         }
 
         // bid_price must not exceed the current effective asking price
         let current_price = Self::current_asking_price_impl(&env, &listing);
         if bid_price > current_price {
-            return Err(KoraError::InvalidAmount);
+            return Err(MarketplaceError::InvalidAmount);
         }
 
         // amount must not exceed the face_value
         if amount > listing.face_value {
-            return Err(KoraError::ExceedsFundingTarget);
+            return Err(MarketplaceError::ExceedsFundingTarget);
         }
 
         // One bid per investor per listing
         let bid_key = DataKey::Bid(invoice_id, investor.clone());
         if env.storage().persistent().has(&bid_key) {
-            return Err(KoraError::BidAlreadyExists);
+            return Err(MarketplaceError::BidAlreadyExists);
         }
 
         let bid = Bid {
@@ -3520,7 +3518,7 @@ impl MarketplaceContract {
         caller: Address,
         invoice_id: u64,
         bid_investors: Vec<Address>,
-    ) -> Result<(), KoraError> {
+    ) -> Result<(), MarketplaceError> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -3528,32 +3526,32 @@ impl MarketplaceContract {
             .storage()
             .persistent()
             .get(&DataKey::Listing(invoice_id))
-            .ok_or(KoraError::ListingNotFound)?;
+            .ok_or(MarketplaceError::ListingNotFound)?;
 
         if !listing.is_active {
-            return Err(KoraError::ListingAlreadyCancelled);
+            return Err(MarketplaceError::ListingAlreadyCancelled);
         }
 
         let config = Self::load_config(&env)?;
 
         // Only seller or admin may accept bids
         if caller != listing.seller && caller != config.admin {
-            return Err(KoraError::Unauthorized);
+            return Err(MarketplaceError::Unauthorized);
         }
 
         // Must be in bidding mode and bidding window must have closed
         let bidding_deadline = listing
             .bidding_deadline
-            .ok_or(KoraError::BiddingWindowClosed)?;
+            .ok_or(MarketplaceError::BiddingWindowClosed)?;
 
         if env.ledger().timestamp() <= bidding_deadline {
-            return Err(KoraError::BiddingWindowActive);
+            return Err(MarketplaceError::BiddingWindowActive);
         }
 
         let nft_client =
             kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
         if nft_client.is_invoice_frozen(&invoice_id) {
-            return Err(KoraError::InvoiceFrozen);
+            return Err(MarketplaceError::InvoiceFrozen);
         }
 
         let token_client = token::Client::new(&env, &listing.token);
@@ -3579,7 +3577,7 @@ impl MarketplaceContract {
                 .storage()
                 .persistent()
                 .get(&bid_key)
-                .ok_or(KoraError::BidNotFound)?;
+                .ok_or(MarketplaceError::BidNotFound)?;
 
             let remaining = safe_sub(effective_price, listing.funded_amount)?;
             // Accept the smaller of bid.amount and remaining capacity
@@ -3592,7 +3590,7 @@ impl MarketplaceContract {
             let fee = bps_of_normalized(accept_amount, effective_fee_bps, token_decimals)?;
             let net = accept_amount
                 .checked_sub(fee)
-                .ok_or(KoraError::ArithmeticOverflow)?;
+                .ok_or(MarketplaceError::ArithmeticOverflow)?;
 
             if fee > 0 {
                 token_client.transfer(&investor, &config.treasury, &fee);
@@ -3620,7 +3618,7 @@ impl MarketplaceContract {
             // Consume the bid
             env.storage().persistent().remove(&bid_key);
 
-            events::invoice_funded(&env, invoice_id, &investor, accept_amount);
+            events::invoice_funded(&env, invoice_id, &investor, accept_amount, invoice.currency.clone());
             events::bid_accepted(
                 &env,
                 invoice_id,
@@ -3664,8 +3662,6 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .get(&DataKey::Bid(invoice_id, investor))
-        Self::bump_listing(&env, invoice_id);
-        Ok(listing)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -3779,12 +3775,41 @@ impl MarketplaceContract {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn load_config(env: &Env) -> Result<MarketplaceConfig, MarketplaceError> {
-        env.storage()
+        if let Some(config) = env.storage().instance().get(&DataKey::Config) {
+            return Ok(config);
+        }
+
+        // Legacy migration path: read individual keys and consolidate.
+        let admin: Address = env
+            .storage()
             .instance()
-            .get(&DataKey::Config)
-            .ok_or(MarketplaceError::NotInitialized)
+            .get(&DataKey::Admin)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        let invoice_nft: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoiceNft)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        let financing_pool: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FinancingPool)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        let access_control: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccessControl)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
             .get(&DataKey::FeeBps)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(MarketplaceError::NotInitialized)?;
         // risk_registry was never part of the legacy per-key storage format —
         // contracts still on that format must be re-initialized to consolidate
         // into `Config` before risk_registry-dependent calls can succeed.
@@ -3792,7 +3817,7 @@ impl MarketplaceContract {
             .storage()
             .instance()
             .get(&DataKey::RiskRegistry)
-            .ok_or(KoraError::NotInitialized)?;
+            .ok_or(MarketplaceError::NotInitialized)?;
 
         let config = MarketplaceConfig {
             admin,
@@ -3915,8 +3940,6 @@ mod tests {
         let ac_client = kora_access_control::AccessControlContractClient::new(&env, &ac_id);
         ac_client.initialize(&admin);
 
-        let ac_id = env.register_contract(None, AccessControlContract);
-
         let nft_id = env.register_contract(None, InvoiceNftContract);
         let nft = InvoiceNftContractClient::new(&env, &nft_id);
         nft.initialize(&admin, &ac_id);
@@ -3930,7 +3953,6 @@ mod tests {
         let registry_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
         let registry = registry_id.clone();
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&env, &registry_id);
-        let staking_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
         let token_admin = Address::generate(&env);
         let staking_token = env.register_stellar_asset_contract_v2(token_admin).address();
         registry_client.initialize(&admin, &nft_id, &staking_token, &1_000_000i128, &5_000u32);
@@ -3950,12 +3972,9 @@ mod tests {
         let seller = Address::generate(&env);
 
         // Default seller must be compliance-attested for list_invoice to succeed.
-        let verifier = Address::generate(&env);
-        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         // list_invoice requires the seller to be a compliance-attested SME.
         let verifier = Address::generate(&env);
-        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token)
-            .mint(&verifier, &1_000_000i128);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         registry_client.add_verifier(&admin, &verifier, &1_000_000i128);
         registry_client.register_sme(&verifier, &seller, &50u32, &true);
 
@@ -3978,7 +3997,6 @@ mod tests {
             &Symbol::new(&t.env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &30u32, &None,
             &30u32,
             &None,
         )
@@ -3996,7 +4014,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         id
     }
@@ -4174,7 +4191,7 @@ mod tests {
         let new_token = Address::generate(&t.env);
         t.mp.whitelist_token(&t.admin, &new_token);
         let result = t.mp.try_remove_token_whitelist(&stranger, &new_token);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::NotAdmin);
         assert!(t.mp.is_token_whitelisted(&new_token));
     }
 
@@ -4183,7 +4200,7 @@ mod tests {
         let t = deploy();
         let new_token = Address::generate(&t.env);
         let result = t.mp.try_remove_token_whitelist(&t.admin, &new_token);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::TokenNotWhitelisted);
     }
 
     #[test]
@@ -4202,8 +4219,9 @@ mod tests {
             &10_000i128,
             &t.token,
             &deadline,
+            &None::<Address>,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::TokenNotWhitelisted);
     }
 
     #[test]
@@ -4218,6 +4236,8 @@ mod tests {
         let listing = t.mp.get_listing(&id);
         assert!(listing.is_active);
         let investor = Address::generate(&t.env);
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token)
+            .mint(&investor, &1_000_000i128);
         let result = t.mp.try_fund_invoice(&investor, &id, &1_000_000i128);
         assert!(result.is_ok());
     }
@@ -4259,7 +4279,6 @@ mod tests {
             &bad_token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::TokenNotWhitelisted);
     }
@@ -4271,9 +4290,7 @@ mod tests {
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline, &None::<Address>);
-            t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
     #[test]
@@ -4283,9 +4300,7 @@ mod tests {
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline, &None::<Address>);
-            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
     #[test]
@@ -4301,7 +4316,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
     }
@@ -4326,7 +4340,7 @@ mod tests {
             &deadline,
             &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
     }
 
     #[test]
@@ -4376,7 +4390,7 @@ mod tests {
             &deadline,
             &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
     }
 
     #[test]
@@ -4413,7 +4427,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
     }
@@ -4424,10 +4437,8 @@ mod tests {
         let _id = mint_invoice(&t);
         let past = t.env.ledger().timestamp() - 1;
         let result =
-            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past, &None::<Address>);
-            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past, &None);
+            t.mp.try_list_invoice(&t.seller, &1u64, &9_000_000_000i128, &10_000_000_000i128, &t.token, &past, &None::<Address>);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidDueDate);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
 
     #[test]
@@ -4443,7 +4454,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         assert_eq!(
             result.unwrap_err().unwrap(),
@@ -4457,9 +4467,7 @@ mod tests {
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline, &None::<Address>);
-            t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline, &None);
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
     #[test]
@@ -4485,7 +4493,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::ComplianceNotAttested);
     }
@@ -4519,7 +4526,6 @@ mod tests {
                 &Symbol::new(&t.env, "USDC"),
                 &due_date,
                 &ipfs_cid,
-                &30u32, &None,
                 &30u32,
                 &None,
             )
@@ -4533,7 +4539,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         ).is_ok());
     }
 
@@ -4559,7 +4564,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         let listing = t.mp.get_listing(&1u64);
         assert_eq!(listing.asking_price, 9_500_000_000i128);
@@ -4620,7 +4624,6 @@ mod tests {
             &t.token,
             &deadline,
             &None::<Address>,
-            &None,
         );
         t.env.ledger().set(LedgerInfo {
             timestamp: deadline + 1,
@@ -5190,7 +5193,7 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().unwrap(),
-            KoraError::FundingDeadlineTooCloseToDueDate
+            MarketplaceError::FundingDeadlineTooCloseToDueDate
         );
     }
 
@@ -5211,7 +5214,7 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().unwrap(),
-            KoraError::FundingDeadlineTooCloseToDueDate
+            MarketplaceError::FundingDeadlineTooCloseToDueDate
         );
     }
 
@@ -5273,7 +5276,7 @@ mod tests {
         let t = deploy();
         let stranger = Address::generate(&t.env);
         let result = t.mp.try_set_min_funding_buffer(&stranger, &86_400u64);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::NotAdmin);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::NotAdmin);
     }
 
     // ── Issue #439: Dutch auction / price decay ───────────────────────────────
@@ -5419,7 +5422,7 @@ mod tests {
             &(now + 100),
             &(now + 200),
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
     }
 
     // ── Issue #440: Reverse-auction bidding ───────────────────────────────────
@@ -5490,7 +5493,7 @@ mod tests {
             &9_000_000_000i128,
             &5_000_000_000i128,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowClosed);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::BiddingWindowClosed);
     }
 
     /// fund_invoice while bidding window is open → BiddingWindowActive.
@@ -5502,7 +5505,7 @@ mod tests {
 
         let investor = Address::generate(&t.env);
         let result = t.mp.try_fund_invoice(&investor, &id, &1_000_000i128);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowActive);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::BiddingWindowActive);
     }
 
     /// Duplicate bid from same investor → BidAlreadyExists.
@@ -5520,7 +5523,7 @@ mod tests {
             &9_000_000_000i128,
             &5_000_000_000i128,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::BidAlreadyExists);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::BidAlreadyExists);
     }
 
     /// bid_price exceeds current_asking_price → InvalidAmount.
@@ -5537,7 +5540,7 @@ mod tests {
             &9_500_000_001i128, // > asking_price
             &5_000_000_000i128,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::InvalidAmount);
     }
 
     /// accept_bids before bidding window closes → BiddingWindowActive.
@@ -5552,7 +5555,7 @@ mod tests {
 
         let investors = soroban_sdk::vec![&t.env, investor.clone()];
         let result = t.mp.try_accept_bids(&t.seller, &id, &investors);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowActive);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::BiddingWindowActive);
     }
 
     /// Non-seller/non-admin cannot accept bids.
@@ -5577,7 +5580,7 @@ mod tests {
         let stranger = Address::generate(&t.env);
         let investors = soroban_sdk::vec![&t.env, stranger.clone()];
         let result = t.mp.try_accept_bids(&stranger, &id, &investors);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::Unauthorized);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
     }
 
     /// submit_bid on a non-bidding listing → BiddingWindowClosed.
@@ -5592,6 +5595,6 @@ mod tests {
             &9_000_000_000i128,
             &5_000_000_000i128,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::BiddingWindowClosed);
+        assert_eq!(result.unwrap_err().unwrap(), MarketplaceError::BiddingWindowClosed);
     }
 }

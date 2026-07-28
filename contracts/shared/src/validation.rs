@@ -1199,9 +1199,9 @@ pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), CommonE
 
 /// Reject byte slices that are not exactly `expected_len` bytes.
 #[inline]
-pub fn require_exact_length(b: &Bytes, expected_len: u32) -> Result<(), KoraError> {
+pub fn require_exact_length(b: &Bytes, expected_len: u32) -> Result<(), CommonError> {
     if b.len() != expected_len {
-        return Err(KoraError::InvalidLength);
+        return Err(CommonError::InvalidLength);
     }
     Ok(())
 }
@@ -1237,9 +1237,9 @@ pub const MAX_BATCH_MINT_SIZE: u32 = 25;
 /// assert!(require_batch_size_within_limit(26).is_err()); // Over limit
 /// ```
 #[inline]
-pub fn require_batch_size_within_limit(batch_size: u32) -> Result<(), KoraError> {
+pub fn require_batch_size_within_limit(batch_size: u32) -> Result<(), CommonError> {
     if batch_size > MAX_BATCH_MINT_SIZE {
-        return Err(KoraError::BatchSizeExceeded);
+        return Err(CommonError::BatchSizeExceeded);
     }
     Ok(())
 }
@@ -1843,7 +1843,7 @@ mod tests {
         assert!(require_batch_size_within_limit(MAX_BATCH_MINT_SIZE + 1).is_err());
         assert_eq!(
             require_batch_size_within_limit(MAX_BATCH_MINT_SIZE + 1).unwrap_err(),
-            KoraError::BatchSizeExceeded
+            CommonError::BatchSizeExceeded
         );
     }
 }

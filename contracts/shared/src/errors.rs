@@ -1,6 +1,12 @@
 use soroban_sdk::contracterror;
 
-#[contracterror]
+/// Master registry of every error code used across the protocol. Not exported as a
+/// contract error type itself (Soroban's `#[contracterror]` macro caps an exported
+/// enum's spec at 50 variants — this one has grown past that). Each contract now
+/// returns its own small local `#[contracterror]` enum instead; this one exists so
+/// `kora-xtask check-error-variants` has a single source of truth to validate
+/// `KoraError::<Variant>` references against.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum KoraError {
@@ -21,6 +27,7 @@ pub enum KoraError {
     InvalidRiskScore = 16,
     InvalidCid = 17,
     InvoiceFrozen = 18,
+    BatchSizeExceeded = 19,
 
     // Marketplace
     ListingNotFound = 20,
@@ -46,6 +53,8 @@ pub enum KoraError {
     // Risk
     SMENotRegistered = 50,
     ComplianceNotAttested = 53,
+    // SME profile exists but has not been marked `verified` by a risk_registry verifier
+    SMENotVerified = 129,
 
     // General
     ArithmeticOverflow = 90,
@@ -81,7 +90,6 @@ pub enum KoraError {
     // invoice_nft: currency symbol is not on the allowlist
     CurrencyNotAllowed = 122,
 }
-use soroban_sdk::contracterror;
 
 /// Common validation/arithmetic errors shared by every contract's
 /// `kora_shared::validation` and `kora_shared::reentrancy` helpers.
