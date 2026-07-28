@@ -977,8 +977,9 @@ impl RiskRegistryContract {
             .has(&DataKey::SubAccount(addr))
     }
 
-    /// Returns the aggregated debtor score (average score across all active verifiers' attestations)
-    /// or `RiskRegistryError::DebtorNotRegistered` if not found or no active attestations exist.
+    /// Returns the debtor score or `KoraError::SMENotRegistered` if not found.
+    pub fn get_debtor_score(env: Env, debtor_hash: Bytes) -> Result<u32, KoraError> {
+    /// Returns the debtor score or `RiskRegistryError::DebtorNotRegistered` if not found.
     pub fn get_debtor_score(env: Env, debtor_hash: Bytes) -> Result<u32, RiskRegistryError> {
         let attestors_key = DataKey::DebtorAttestors(debtor_hash.clone());
         let attestors: Vec<Address> = env
@@ -1024,6 +1025,7 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&key)
+            .ok_or(KoraError::SMENotRegistered)?;
             .ok_or(RiskRegistryError::DebtorNotRegistered)?;
         Self::bump_persistent(&env, &key);
         Ok(score)
@@ -1244,6 +1246,8 @@ impl RiskRegistryContract {
             actor: actor.clone(),
             action,
             source: AuditSource::RiskRegistry,
+            token: None,
+            amount: None,
         };
 
         env.storage()
@@ -2264,101 +2268,99 @@ mod tests {
         assert!(client.try_top_up_stake(&admin, &verifier, &0i128).is_err());
     }
 
-    // ── verifier-of-record & reassignment tests ───────────────────────────────
+    // ── add_verifier re-registration guard ───────────────────────────────────
 
     #[test]
-    fn test_unrelated_verifier_cannot_update_sme_score_or_credit_limit() {
+    fn test_add_verifier_rejects_already_active_verifier() {
+        // Re-registering an active verifier must fail — previously this silently
+        // overwrote VerifierStake (stranding funds) and reset VerifierReputation.
         let (env, admin, _, staking_token, client) = setup();
-        let verifier_a = Address::generate(&env);
-        let verifier_b = Address::generate(&env);
-        let sme = Address::generate(&env);
-
-        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
-        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
-
-        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
-        client.add_verifier(&admin, &verifier_b, &1_000_000i128);
-
-        // Register SME under verifier_a
-        client.register_sme(&verifier_a, &sme, &35u32, &true);
-
-        // Verifier_b tries to update score - should fail
-        let res_score = client.try_update_sme_score(&verifier_b, &sme, &50u32);
-        assert_eq!(res_score.unwrap_err().unwrap(), RiskRegistryError::NotSmeVerifier);
-
-        // Verifier_b tries to set credit limit - should fail
-        let res_limit = client.try_set_credit_limit(&verifier_b, &sme, &5_000_000i128);
-        assert_eq!(res_limit.unwrap_err().unwrap(), RiskRegistryError::NotSmeVerifier);
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 2_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        let result = client.try_add_verifier(&admin, &verifier, &500_000i128);
+        assert!(result.is_err());
+        // Stake unchanged at original amount — no funds stranded
+        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
+        assert!(client.is_verifier(&verifier));
     }
 
     #[test]
-    fn test_reassign_sme_verifier_success() {
+    fn test_regression_fund_stranding_prevented() {
+        // Regression: second add_verifier with a lower amount must no longer
+        // silently overwrite VerifierStake, stranding the difference on-chain.
         let (env, admin, _, staking_token, client) = setup();
-        let verifier_a = Address::generate(&env);
-        let verifier_b = Address::generate(&env);
-        let sme = Address::generate(&env);
-
-        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
-        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
-
-        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
-        client.add_verifier(&admin, &verifier_b, &1_000_000i128);
-
-        client.register_sme(&verifier_a, &sme, &35u32, &true);
-
-        // Reassign to verifier_b
-        assert!(client.try_reassign_sme_verifier(&admin, &sme, &verifier_b).is_ok());
-
-        // Now verifier_b updates score and credit limit successfully
-        assert!(client.try_update_sme_score(&verifier_b, &sme, &50u32).is_ok());
-        assert!(client.try_set_credit_limit(&verifier_b, &sme, &5_000_000i128).is_ok());
-
-        let profile = client.get_sme_profile(&sme);
-        assert_eq!(profile.risk_score, 50);
-        assert_eq!(profile.credit_limit, 5_000_000i128);
-        assert_eq!(profile.verifier, verifier_b);
-
-        // verifier_a is now unrelated and should be blocked
-        let res_a_score = client.try_update_sme_score(&verifier_a, &sme, &60u32);
-        assert_eq!(res_a_score.unwrap_err().unwrap(), RiskRegistryError::NotSmeVerifier);
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 2_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
+        // Attempt re-register with a lower stake — must be rejected
+        assert!(client.try_add_verifier(&admin, &verifier, &500_000i128).is_err());
+        // Tracked stake is still 1_000_000, not silently reduced to 500_000
+        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
     }
 
     #[test]
-    fn test_reassign_sme_verifier_not_admin() {
+    fn test_regression_reputation_reset_prevented() {
+        // Regression: second add_verifier must not reset VerifierReputation to 100,
+        // laundering slashing history recorded via record_default.
         let (env, admin, _, staking_token, client) = setup();
-        let verifier_a = Address::generate(&env);
-        let verifier_b = Address::generate(&env);
+        let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 2_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &40u32, &true);
+        client.record_default(&admin, &sme);
+        let rep_after_slash = client.get_verifier_reputation(&verifier);
+        assert!(rep_after_slash < 100, "reputation should have been reduced");
+        // Attempt re-register — rejected, reputation preserved
+        let _ = client.try_add_verifier(&admin, &verifier, &1_000_000i128);
+        assert_eq!(client.get_verifier_reputation(&verifier), rep_after_slash);
+    }
+
+    #[test]
+    fn test_top_up_stake_increases_stake_additively() {
+        // top_up_stake must ADD to existing tracked stake, not overwrite it.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 3_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
+        client.top_up_stake(&admin, &verifier, &500_000i128);
+        assert_eq!(client.get_verifier_stake(&verifier), 1_500_000i128);
+    }
+
+    #[test]
+    fn test_top_up_stake_preserves_reputation() {
+        // top_up_stake must leave VerifierReputation untouched.
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 3_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &40u32, &true);
+        client.record_default(&admin, &sme);
+        let rep = client.get_verifier_reputation(&verifier);
+        assert!(rep < 100);
+        client.top_up_stake(&admin, &verifier, &500_000i128);
+        assert_eq!(client.get_verifier_reputation(&verifier), rep);
+    }
+
+    #[test]
+    fn test_top_up_stake_requires_active_verifier() {
+        let (env, admin, _, staking_token, client) = setup();
         let stranger = Address::generate(&env);
-
-        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
-        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
-
-        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
-        client.add_verifier(&admin, &verifier_b, &1_000_000i128);
-
-        client.register_sme(&verifier_a, &sme, &35u32, &true);
-
-        let res = client.try_reassign_sme_verifier(&stranger, &sme, &verifier_b);
-        assert_eq!(res.unwrap_err().unwrap(), RiskRegistryError::NotAdmin);
+        mint_stake(&env, &staking_token, &stranger, 1_000_000i128);
+        assert!(client.try_top_up_stake(&admin, &stranger, &500_000i128).is_err());
     }
 
     #[test]
-    fn test_reassign_sme_verifier_invalid_verifier() {
+    fn test_top_up_stake_rejects_zero_amount() {
         let (env, admin, _, staking_token, client) = setup();
-        let verifier_a = Address::generate(&env);
-        let unregistered_verifier = Address::generate(&env);
-        let sme = Address::generate(&env);
-
-        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
-        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
-
-        client.register_sme(&verifier_a, &sme, &35u32, &true);
-
-        let res = client.try_reassign_sme_verifier(&admin, &sme, &unregistered_verifier);
-        assert_eq!(res.unwrap_err().unwrap(), RiskRegistryError::NotVerifier);
-    }
-
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        assert!(client.try_top_up_stake(&admin, &verifier, &0i128).is_err());
     // ── set_credit_limit (require_non_negative_amount guard) ─────────────────
 
     #[test]

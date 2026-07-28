@@ -232,6 +232,20 @@ contract — `is_verified_sme` returns `false` for expired keys.
 
 ---
 
+## Protocol Configuration (`ProtocolConfig`)
+
+`kora_shared::types::ProtocolConfig` is a shared struct (`fee_bps`, `late_penalty_bps`,
+`max_risk_score`, `min_funding_period`) intended as the canonical protocol-wide config.
+As of this writing, `risk_registry` does **not** store or read a `ProtocolConfig` —
+`max_risk_score` enforcement lives in `invoice_nft` (see
+[invoice-nft.md](invoice-nft.md#protocol-configuration-protocolconfig)), the first and
+only adopter so far. `fee_bps`, `late_penalty_bps`, and `min_funding_period` remain
+unenforced anywhere and are owned by `treasury`/`financing_pool` via their own local
+parameters — wiring them into a single shared `ProtocolConfig` is follow-up work, not
+part of this contract today.
+
+---
+
 ## Related Documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — full contract dependency graph
