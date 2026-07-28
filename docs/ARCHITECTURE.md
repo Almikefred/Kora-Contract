@@ -162,7 +162,8 @@ Verifier-managed SME and debtor scoring.
 **Storage:**
 - `Verifier(Address)` → `bool` (persistent)
 - `SmeProfile(Address)` → `SmeProfile` (persistent)
-- `DebtorScore(Bytes)` → `u32` (persistent, keyed by debtor hash)
+- `DebtorScoreAttestation(Bytes, Address)` → `u32` (persistent, per-verifier attestation)
+- `DebtorAttestors(Bytes)` → `Vec<Address>` (persistent, list of attesting verifiers per debtor)
 - `Admin` (instance)
 
 Verifiers are trusted off-chain entities (e.g., credit bureaus, KYC providers) who have been whitelisted by the admin. They assign risk scores to SMEs and debtors. The marketplace can optionally gate listings based on minimum risk score.
