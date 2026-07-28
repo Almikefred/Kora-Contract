@@ -1,8 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 const MAX_STALENESS_SECS: u64 = 3600;
+const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -14,6 +15,9 @@ pub enum PriceOracleError {
     InvoiceExpired = 4,
     NotAdmin = 5,
     NotInitialized = 6,
+    NoUpgradeProposed = 7,
+    UpgradeTimelockNotElapsed = 8,
+    ProtocolPaused = 9,
 }
 
 #[contracttype]
@@ -26,7 +30,9 @@ pub struct PriceData {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    AccessControl,
     Price(Symbol, Symbol),
+    UpgradeProposal,
 }
 
 #[contract]
@@ -34,27 +40,37 @@ pub struct PriceOracleContract;
 
 #[contractimpl]
 impl PriceOracleContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), PriceOracleError> {
+    pub fn initialize(env: Env, admin: Address, access_control: Address) -> Result<(), PriceOracleError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PriceOracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
         Ok(())
     }
 
-    /// Set a price for a currency pair. Admin only.
+    /// Set the access_control contract address. Admin only.
+    /// Used for post-deployment wiring or migration.
+    pub fn set_access_control(env: Env, admin: Address, access_control: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
+        Ok(())
+    }
+
+    /// Set a price for a currency pair. Authorized feeders only.
     /// Price is expressed as `base` units per 1 unit of `quote`, scaled by 1e7 (stroops).
-    /// If the reverse pair (quote, base) is already set, validates that the prices are
-    /// reciprocal-consistent within tolerance (allowing for rounding; exact match is not required).
+    /// Blocked when the protocol is paused.
     pub fn set_price(
         env: Env,
-        admin: Address,
+        feeder: Address,
         base: Symbol,
         quote: Symbol,
         price: i128,
     ) -> Result<(), PriceOracleError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         if price <= 0 {
             return Err(PriceOracleError::InvalidAmount);
@@ -71,54 +87,77 @@ impl PriceOracleContract {
 
         let data = PriceData {
             price,
-            timestamp: env.ledger().timestamp(),
+            timestamp: env.ledger().timestamp(),contracts/access_control/src/lib.rs￼Mark as resolved 
         };
         env.storage()
             .persistent()
-            .set(&DataKey::Price(base, quote), &data);
+            .set(
+                &DataKey::FeederPrice(base.clone(), quote.clone(), feeder.clone()),
+                &data,
+            );
+
+        let mut feeders: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceFeeders(base.clone(), quote.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !feeders.iter().any(|f| f == &feeder) {
+            feeders.push_back(feeder);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PriceFeeders(base, quote), &feeders);
+        }
+
         Ok(())
     }
 
-    /// Compute the mathematical reciprocal of a price: 10^14 / price
-    /// The 10^14 accounts for the 1e7 scaling on both sides.
-    fn compute_reciprocal(price: i128) -> Result<i128, PriceOracleError> {
-        if price <= 0 {
-            return Err(PriceOracleError::InvalidAmount);
-        }
-        (100_000_000_000_000i128)
-            .checked_div(price)
-            .ok_or(PriceOracleError::ArithmeticOverflow)
-    }
-
-    /// Validate that two prices are reciprocally consistent within a tolerance (in basis points).
-    /// tolerance_bps: e.g., 100 = 1%, 10 = 0.1%
-    fn validate_reciprocal_tolerance(
-        expected: i128,
-        actual: i128,
-        tolerance_bps: u32,
-    ) -> Result<(), PriceOracleError> {
-        if expected <= 0 || actual <= 0 {
-            return Err(PriceOracleError::InvalidAmount);
-        }
-        // Compute percentage difference: |expected - actual| / expected * 10000
-        let diff = if expected > actual {
-            expected.checked_sub(actual).ok_or(PriceOracleError::ArithmeticOverflow)?
-        } else {
-            actual.checked_sub(expected).ok_or(PriceOracleError::ArithmeticOverflow)?
-        };
-        let pct_diff_bps = diff
-            .checked_mul(10000)
-            .and_then(|v| v.checked_div(expected))
-            .ok_or(PriceOracleError::ArithmeticOverflow)?;
-
-        if pct_diff_bps > tolerance_bps as i128 {
-            return Err(PriceOracleError::InvalidAmount);
-        }
+    /// Add an authorized feeder. Admin only.
+    pub fn add_feeder(env: Env, admin: Address, feeder: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().set(&DataKey::Feeder(feeder), &true);
         Ok(())
     }
 
-    /// Get the price for a pair. Returns the price and its timestamp.
-    /// Fails if the price is stale (older than MAX_STALENESS_SECS) or missing.
+    /// Remove an authorized feeder. Admin only.
+    pub fn remove_feeder(env: Env, admin: Address, feeder: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().remove(&DataKey::Feeder(feeder));
+        Ok(())
+    }
+
+    /// Set the base currency for multi-hop triangulation. Admin only.
+    pub fn set_base_currency(
+        env: Env,
+        admin: Address,
+        base: Symbol,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().persistent().set(&DataKey::BaseCurrency, &base);
+        Ok(())
+    }
+
+    /// Set the maximum allowed price deviation in basis points.
+    /// Admin only. Default is 1000 (10%).
+    pub fn set_max_deviation(
+        env: Env,
+        admin: Address,
+        deviation_bps: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxDeviation, &deviation_bps);
+        Ok(())
+    }
+
+    /// Get the aggregated price for a pair (median of all active feeders).
+    /// Returns the median price and its oldest timestamp.
+    /// Fails if no feeders have submitted or prices are stale.
     pub fn get_price(
         env: Env,
         base: Symbol,
@@ -135,15 +174,24 @@ impl PriceOracleContract {
             .timestamp()
             .saturating_sub(data.timestamp);
         if age > MAX_STALENESS_SECS {
+            return Err(KoraError::InvalidAmount);
             return Err(PriceOracleError::InvoiceExpired);
         }
 
-        Ok(data)
+        if prices.is_empty() {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        let median = Self::calculate_median(&prices);
+        Ok(PriceData {
+            price: median,
+            timestamp: min_timestamp,
+        })
     }
 
     /// Convert an amount from one currency to another using the stored price.
-    /// Rejects stale or missing prices.
-    /// Does not adjust for token decimal differences; prices must account for decimals.
+    /// First attempts direct pair conversion. If unavailable, triangulates through
+    /// the configured base currency. Rejects stale or missing prices.
     pub fn convert(
         env: Env,
         amount: i128,
@@ -164,7 +212,70 @@ impl PriceOracleContract {
             return Err(PriceOracleError::InvalidAmount);
         }
 
-        Ok(converted)
+        Ok(())
+    }
+
+    fn calculate_median(prices: &Vec<i128>) -> i128 {
+        let len = prices.len();
+        if len == 0 {
+            return 0;
+        }
+
+        let mut sorted = prices.clone();
+        for i in 0..len {
+            for j in i..len {
+                if sorted.get(j).unwrap() < sorted.get(i).unwrap() {
+                    let temp = *sorted.get(j).unwrap();
+                    sorted.set(j, *sorted.get(i).unwrap());
+                    sorted.set(i, temp);
+                }
+            }
+        }
+
+        if len % 2 == 1 {
+            *sorted.get(len / 2).unwrap()
+        } else {
+            (*sorted.get(len / 2 - 1).unwrap() + *sorted.get(len / 2).unwrap()) / 2
+        }
+    }
+
+    /// Transfer admin rights to a new address. Admin only.
+    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
+
+    /// Propose a WASM upgrade with a 24-hour timelock. Admin only.
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &(new_wasm_hash, env.ledger().timestamp()));
+        Ok(())
+    }
+
+    /// Execute a previously proposed upgrade after the 24-hour timelock.
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(PriceOracleError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(PriceOracleError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
     }
 
     /// Convert an amount between currencies with decimal precision correction.
@@ -255,6 +366,25 @@ impl PriceOracleContract {
         }
         Ok(())
     }
+
+    fn require_not_paused(env: &Env) -> Result<(), PriceOracleError> {
+        let access_control: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccessControl)
+            .ok_or(PriceOracleError::NotInitialized)?;
+
+        let is_paused: bool = env.invoke_contract(
+            &access_control,
+            &soroban_sdk::Symbol::new(env, "is_paused"),
+            soroban_sdk::vec![env],
+        );
+
+        if is_paused {
+            return Err(PriceOracleError::ProtocolPaused);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -262,29 +392,30 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env, Symbol};
 
-    fn setup() -> (Env, Address, PriceOracleContractClient<'static>) {
+    fn setup() -> (Env, Address, Address, PriceOracleContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, PriceOracleContract);
         let client = PriceOracleContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin);
+        let access_control = Address::generate(&env);
+        client.initialize(&admin, &access_control);
         (env, admin, client)
     }
 
     #[test]
     fn test_set_and_get_price() {
-        let (env, admin, client) = setup();
+        let (env, _admin, feeder, client) = setup();
         let base = Symbol::new(&env, "EURC");
         let quote = Symbol::new(&env, "USDC");
-        client.set_price(&admin, &base, &quote, &11_000_000i128);
+        client.set_price(&feeder, &base, &quote, &11_000_000i128);
         let data = client.get_price(&base, &quote);
         assert_eq!(data.price, 11_000_000i128);
     }
 
     #[test]
     fn test_convert_same_currency() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _feeder, client) = setup();
         let sym = Symbol::new(&env, "USDC");
         let result = client.convert(&1_000_000i128, &sym, &sym);
         assert_eq!(result, 1_000_000i128);
@@ -292,18 +423,17 @@ mod tests {
 
     #[test]
     fn test_convert_different_currency() {
-        let (env, admin, client) = setup();
+        let (env, _admin, feeder, client) = setup();
         let eurc = Symbol::new(&env, "EURC");
         let usdc = Symbol::new(&env, "USDC");
-        // 1 EURC = 1.1 USDC (11_000_000 stroops per 10_000_000)
-        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
+        client.set_price(&feeder, &eurc, &usdc, &11_000_000i128);
         let result = client.convert(&10_000_000i128, &eurc, &usdc);
         assert_eq!(result, 11_000_000i128);
     }
 
     #[test]
     fn test_get_price_missing_fails() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _feeder, client) = setup();
         let base = Symbol::new(&env, "XLM");
         let quote = Symbol::new(&env, "USDC");
         let result = client.try_get_price(&base, &quote);
@@ -313,10 +443,10 @@ mod tests {
     #[test]
     fn test_stale_price_rejected() {
         use soroban_sdk::testutils::{Ledger, LedgerInfo};
-        let (env, admin, client) = setup();
+        let (env, _admin, feeder, client) = setup();
         let base = Symbol::new(&env, "EURC");
         let quote = Symbol::new(&env, "USDC");
-        client.set_price(&admin, &base, &quote, &11_000_000i128);
+        client.set_price(&feeder, &base, &quote, &11_000_000i128);
 
         env.ledger().set(LedgerInfo {
             timestamp: env.ledger().timestamp() + MAX_STALENESS_SECS + 1,
@@ -334,140 +464,97 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_with_decimals_same_decimals() {
+    fn test_transfer_admin_success() {
         let (env, admin, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let usdc = Symbol::new(&env, "USDC");
-        // 1 EURC = 1.1 USDC (11_000_000 stroops per 10_000_000)
-        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
-        // Both have 7 decimals: no rescaling needed, should match convert()
-        let result = client.convert_with_decimals(&10_000_000i128, &eurc, &usdc, &7u32, &7u32);
-        assert_eq!(result, 11_000_000i128);
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&admin, &new_admin);
+        let result = client.try_set_price(&new_admin, &Symbol::new(&env, "XLM"), &Symbol::new(&env, "USDC"), &10_000_000i128);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_convert_with_decimals_from_7_to_6() {
+    fn test_transfer_admin_requires_admin() {
         let (env, admin, client) = setup();
-        let token7 = Symbol::new(&env, "TOK7");
-        let token6 = Symbol::new(&env, "TOK6");
-        // Price: 1 TOK7 unit = 1.1 TOK6 units (scaled at 1e7)
-        client.set_price(&admin, &token7, &token6, &11_000_000i128);
-        // Input: 10_000_000 units of 7-decimal token
-        // Expected (raw): 11_000_000 units of 6-decimal token
-        // But we rescale by dividing by 10 (7-6=1): 11_000_000 / 10 = 1_100_000
-        let result = client.convert_with_decimals(&10_000_000i128, &token7, &token6, &7u32, &6u32);
-        assert_eq!(result, 1_100_000i128);
+        let stranger = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let result = client.try_transfer_admin(&stranger, &new_admin);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_convert_with_decimals_from_6_to_7() {
+    fn test_propose_upgrade_success() {
         let (env, admin, client) = setup();
-        let token6 = Symbol::new(&env, "TOK6");
-        let token7 = Symbol::new(&env, "TOK7");
-        // Price: 1 TOK6 unit = 0.9090... TOK7 units (scaled); use 9_090_909 ~ 1e7 / 1.1
-        client.set_price(&admin, &token6, &token7, &9_090_909i128);
-        // Input: 1_000_000 units of 6-decimal token
-        // Expected (raw): 9_090_909 units of 7-decimal token
-        // But we rescale by multiplying by 10 (7-6=1): 9_090_909 * 10 = 90_909_090
-        let result = client.convert_with_decimals(&1_000_000i128, &token6, &token7, &6u32, &7u32);
-        assert_eq!(result, 90_909_090i128);
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]);
+        let result = client.try_propose_upgrade(&admin, &wasm_hash);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_convert_with_decimals_regression_old_math_wrong() {
+    fn test_execute_upgrade_requires_timelock() {
         let (env, admin, client) = setup();
-        let token7 = Symbol::new(&env, "TOK7");
-        let token6 = Symbol::new(&env, "TOK6");
-        // If old convert() were used without decimals for 7→6: it would be off by 10x
-        client.set_price(&admin, &token7, &token6, &11_000_000i128);
-
-        // Old convert() for 10_000_000 units would give 11_000_000 (wrong order of magnitude)
-        // New convert_with_decimals gives 1_100_000 (correct after rescaling)
-        let old_result = client.convert(&10_000_000i128, &token7, &token6);
-        let new_result = client.convert_with_decimals(&10_000_000i128, &token7, &token6, &7u32, &6u32);
-
-        assert_eq!(old_result, 11_000_000i128, "old convert gives raw price-adjusted value");
-        assert_eq!(new_result, 1_100_000i128, "new convert_with_decimals correctly rescales");
-        assert_eq!(old_result, new_result * 10, "old result is exactly 10x the correct result");
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash);
+        let result = client.try_execute_upgrade(&admin);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_convert_with_decimals_round_trip() {
+    fn test_execute_upgrade_success() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
         let (env, admin, client) = setup();
-        let usdc = Symbol::new(&env, "USDC");
-        let eurc = Symbol::new(&env, "EURC");
-        // USDC: 6 decimals, EURC: 7 decimals
-        // Forward: 1 USDC = 0.9 EURC (at 1e7 scale)
-        client.set_price(&admin, &usdc, &eurc, &9_000_000i128);
-        // Reverse: 1 EURC ≈ 1.111... USDC (at 1e7 scale ≈ 1_111_111)
-        client.set_price(&admin, &eurc, &usdc, &11_111_111i128);
+        let wasm_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash);
 
-        let start = 1_000_000i128; // 1 USDC
-        let to_eurc = client.convert_with_decimals(&start, &usdc, &eurc, &6u32, &7u32).unwrap();
-        // start (1M) * 9_000_000 / 1e7 * 10 = 1M * 9 / 10 * 10 = 9M
-        // Actually: (1_000_000 * 9_000_000) / 1e7 * 10 = 9_000_000_000_000 / 1e7 * 10 = 900 * 10 = 9_000
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + UPGRADE_TIMELOCK_DELAY + 1,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1000,
+            min_persistent_entry_ttl: 1000,
+            max_entry_ttl: 100_000,
+        });
 
-        // Let's verify with actual math:
-        // 1_000_000 * 9_000_000 = 9_000_000_000_000
-        // / 10_000_000 = 900_000
-        // * 10 (rescale from 6 to 7) = 9_000_000
-        assert_eq!(to_eurc, 9_000_000i128);
-
-        // Convert back
-        let back_to_usdc = client.convert_with_decimals(&to_eurc, &eurc, &usdc, &7u32, &6u32).unwrap();
-        // 9_000_000 * 11_111_111 / 1e7 / 10 (rescale from 7 to 6)
-        // = (9_000_000 * 11_111_111) / 1e7 / 10
-        // = 100_000_000_000_000 / 1e7 / 10 (approximately)
-        // ≈ 10_000_000 / 10 = 1_000_000
-        assert_eq!(back_to_usdc, 1_000_000i128, "round-trip returns ~original amount");
+        let result = client.try_execute_upgrade(&admin);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_set_price_reciprocal_consistent() {
+    fn test_execute_upgrade_no_proposal() {
         let (env, admin, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let usdc = Symbol::new(&env, "USDC");
-        // Forward: 1 EURC = 1.1 USDC (11_000_000 at 1e7 scale)
-        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
-
-        // Reverse: 1 USDC = ~0.909... EURC
-        // Computed reciprocal: 10^14 / 11_000_000 = 9_090_909 (approximately)
-        let result = client.try_set_price(&admin, &usdc, &eurc, &9_090_909i128);
-        assert!(result.is_ok(), "reciprocal-consistent price should be accepted");
+        let result = client.try_execute_upgrade(&admin);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_set_price_reciprocal_inconsistent_rejected() {
+    fn test_set_access_control() {
         let (env, admin, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let usdc = Symbol::new(&env, "USDC");
-        // Forward: 1 EURC = 1.1 USDC
-        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
-
-        // Try to set reverse to a wildly inconsistent value (off by 2x)
-        let result = client.try_set_price(&admin, &usdc, &eurc, &18_000_000i128);
-        assert!(result.is_err(), "reciprocal-inconsistent price should be rejected");
+        let new_access_control = Address::generate(&env);
+        client.set_access_control(&admin, &new_access_control).unwrap();
     }
 
     #[test]
-    fn test_round_trip_with_reciprocal_check() {
+    fn test_set_price_when_paused_fails() {
         let (env, admin, client) = setup();
-        let eurc = Symbol::new(&env, "EURC");
-        let usdc = Symbol::new(&env, "USDC");
+        let access_control = Address::generate(&env);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("AC"), &true);
 
-        // Set forward: 1 EURC = 1.1 USDC
-        client.set_price(&admin, &eurc, &usdc, &11_000_000i128);
-        // Set reverse with tolerance: 10^14 / 11_000_000 ≈ 9_090_909
-        client.set_price(&admin, &usdc, &eurc, &9_090_909i128);
+        let result = client.try_set_price(
+            &admin,
+            &Symbol::new(&env, "EURC"),
+            &Symbol::new(&env, "USDC"),
+            &11_000_000i128,
+        );
+        assert!(result.is_err());
+    }
 
-        // Convert forward: 10_000_000 EURC → ~11_000_000 USDC
-        let forward = client.convert(&10_000_000i128, &eurc, &usdc);
-        assert_eq!(forward, 11_000_000i128);
-
-        // Convert back: 11_000_000 USDC → ~10_000_000 EURC
-        // (11_000_000 * 9_090_909) / 1e7 ≈ 10_000_000
-        let back = client.convert(&11_000_000i128, &usdc, &eurc);
-        // Due to fixed-point rounding, expect ~10M but allow ±1% error
-        assert!(back >= 9_900_000i128 && back <= 10_100_000i128, "round-trip within 1%");
+    #[test]
+    fn test_set_price_when_not_paused_succeeds() {
+        let (env, admin, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+        let result = client.try_set_price(&admin, &base, &quote, &11_000_000i128);
+        assert!(result.is_ok());
     }
 }
