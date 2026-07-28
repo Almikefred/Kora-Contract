@@ -104,6 +104,7 @@ impl PriceOracleContract {
             .timestamp()
             .saturating_sub(data.timestamp);
         if age > MAX_STALENESS_SECS {
+            return Err(KoraError::InvalidAmount);
             return Err(PriceOracleError::InvoiceExpired);
         }
 

@@ -118,6 +118,18 @@ set_credit_limit(verifier, sme, credit_limit)
   `invoice_nft::get_outstanding_exposure(sme)` and rejects the mint if
   `outstanding + new_amount > credit_limit`.
 
+### Verifier-of-Record Model & Reassignment
+
+To prevent unauthorized changes, both `update_sme_score` and `set_credit_limit` enforce that the calling verifier (or their resolved primary verifier address) is the designated **verifier-of-record** stored in the SME's profile (`SmeProfile.verifier`). Any attempt by an unrelated verifier to modify these parameters will fail with `RiskRegistryError::NotSmeVerifier`.
+
+If a verifier is removed or custody needs to be transferred, the admin can reassign the verifier-of-record for an SME:
+
+```
+reassign_sme_verifier(admin, sme, new_verifier)
+```
+- `new_verifier` must be an active, registered verifier.
+- Reassignment updates `SmeProfile.verifier` to the new address and emits the `sme_verifier_reassigned` event.
+
 ---
 
 ## Risk Tier Thresholds
@@ -144,6 +156,8 @@ Debtors are the counterparties who owe payment on the underlying invoices. To pr
 privacy, debtor PII is never stored on-chain — only a **SHA-256 hash** of the debtor
 identity is used as the key.
 
+Debtor risk scores are tracked per-verifier as independent attestations rather than a single overwritable global value:
+
 ```
 set_debtor_score(verifier, debtor_hash, score)
 ```
@@ -151,16 +165,19 @@ set_debtor_score(verifier, debtor_hash, score)
 - `debtor_hash` must be exactly 32 bytes (the raw SHA-256 digest).
 - `score` is 0–100, following the same `RiskTier` mapping as SME scores.
 - Only registered verifiers may set debtor scores.
+- Updates are saved as independent attestations keyed by `(debtor_hash, verifier)`, with a per-verifier cooldown (`MIN_SCORE_UPDATE_INTERVAL = 3,600s`) enforced per attestation.
 
-Query:
+Queries:
 
 ```
-get_debtor_score(debtor_hash) → Result<u32, KoraError::DebtorNotRegistered>
+get_debtor_score(debtor_hash) → Result<u32, RiskRegistryError::DebtorNotRegistered>
 ```
+Computes and returns the aggregated average score across all active verifiers' attestations for `debtor_hash`. Unregistered/removed verifiers are excluded from the aggregate computation.
 
-Debtor scores are currently informational — they are not enforced by any contract
-logic in v1 but are available for off-chain risk dashboards and future marketplace
-tier-based fee differentiation.
+```
+get_debtor_score_attestation(verifier, debtor_hash) → Result<u32, RiskRegistryError::DebtorNotRegistered>
+```
+Returns an individual verifier's specific score attestation for `debtor_hash`.
 
 ---
 
@@ -185,7 +202,8 @@ activity volume for risk analysis.
 | `get_verifier_stake(verifier)` | Remaining stake in token units (0 if not registered) |
 | `get_verifier_reputation(verifier)` | Reputation score 0–100 (0 if not registered) |
 | `is_verifier(verifier)` | `true` if the address is a registered verifier |
-| `get_debtor_score(debtor_hash)` | Debtor score, or `KoraError::DebtorNotRegistered` |
+| `get_debtor_score(debtor_hash)` | Aggregated average debtor score across active verifiers, or `RiskRegistryError::DebtorNotRegistered` |
+| `get_debtor_score_attestation(verifier, debtor_hash)` | Specific verifier's score attestation, or `RiskRegistryError::DebtorNotRegistered` |
 | `get_admin()` | Current admin address |
 
 All read functions are authorization-free and safe to call from any context.
@@ -211,6 +229,20 @@ contract — `is_verified_sme` returns `false` for expired keys.
 - Debtor PII never appears on-chain; only SHA-256 hashes are stored.
 - Reentrancy protection (`ReentrancyGuard`) is applied on `update_sme_score` which
   performs an inter-contract read.
+
+---
+
+## Protocol Configuration (`ProtocolConfig`)
+
+`kora_shared::types::ProtocolConfig` is a shared struct (`fee_bps`, `late_penalty_bps`,
+`max_risk_score`, `min_funding_period`) intended as the canonical protocol-wide config.
+As of this writing, `risk_registry` does **not** store or read a `ProtocolConfig` —
+`max_risk_score` enforcement lives in `invoice_nft` (see
+[invoice-nft.md](invoice-nft.md#protocol-configuration-protocolconfig)), the first and
+only adopter so far. `fee_bps`, `late_penalty_bps`, and `min_funding_period` remain
+unenforced anywhere and are owned by `treasury`/`financing_pool` via their own local
+parameters — wiring them into a single shared `ProtocolConfig` is follow-up work, not
+part of this contract today.
 
 ---
 

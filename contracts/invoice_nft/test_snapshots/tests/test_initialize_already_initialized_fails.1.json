@@ -100,8 +100,6 @@
                         "key": {
                           "vec": [
                             {
-<<<<<<< HEAD
-=======
                               "symbol": "MigrationVersion"
                             }
                           ]
@@ -114,7 +112,6 @@
                         "key": {
                           "vec": [
                             {
->>>>>>> origin/Kora-Contract46
                               "symbol": "NextId"
                             }
                           ]
