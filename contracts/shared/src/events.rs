@@ -609,21 +609,48 @@ pub fn position_sold(env: &Env, invoice_id: u64, seller: &Address, buyer: &Addre
 
 // ── Treasury Cap Events ───────────────────────────────────────────────────────
 
-/// Schema: (actor=admin, new_cap, timestamp)
-pub fn withdrawal_cap_proposed(env: &Env, admin: &Address, new_cap: i128) {
+/// Schema: (actor=admin, token, new_cap, timestamp)
+pub fn withdrawal_cap_proposed(env: &Env, admin: &Address, token: &Address, new_cap: i128) {
     emit(
         env,
         symbol_short!("WTH_CAP_P"),
-        (admin.clone(), new_cap, env.ledger().timestamp()),
+        (admin.clone(), token.clone(), new_cap, env.ledger().timestamp()),
     );
 }
 
-/// Schema: (actor=admin, old_cap, new_cap, timestamp)
-pub fn withdrawal_cap_updated(env: &Env, admin: &Address, old_cap: i128, new_cap: i128) {
+/// Schema: (actor=admin, token, old_cap, new_cap, timestamp)
+pub fn withdrawal_cap_updated(env: &Env, admin: &Address, token: &Address, old_cap: i128, new_cap: i128) {
     emit(
         env,
         symbol_short!("WTH_CAP_U"),
-        (admin.clone(), old_cap, new_cap, env.ledger().timestamp()),
+        (admin.clone(), token.clone(), old_cap, new_cap, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, timestamp)
+pub fn emergency_declared(env: &Env, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("EMRG_DECL"),
+        (admin.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, timestamp)
+pub fn emergency_revoked(env: &Env, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("EMRG_REVK"),
+        (admin.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, access_control, timestamp)
+pub fn access_control_updated(env: &Env, admin: &Address, access_control: &Address) {
+    emit(
+        env,
+        symbol_short!("AC_SET"),
+        (admin.clone(), access_control.clone(), env.ledger().timestamp()),
     );
 }
 

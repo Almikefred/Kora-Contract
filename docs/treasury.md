@@ -73,12 +73,23 @@ Drains the entire token balance in one call. Used in crisis scenarios. Steps:
 1. `admin.require_auth()`
 2. Admin identity check
 3. Token whitelist check
-4. **Acquire reentrancy guard**
-5. Read live balance
-6. If balance > 0: transfer full balance to recipient and emit `EmergencyWithdrawn`
-7. If balance = 0: silent no-op (not an error)
+4. **Emergency declared check** — `EmergencyDeclared` must be `true` (see below)
+5. **Acquire reentrancy guard**
+6. Read live balance
+7. If balance > 0: transfer full balance to recipient and emit `EmergencyWithdrawn`
+8. If balance = 0: silent no-op (not an error)
 
 Note: `emergency_withdraw` does **not** enforce the rolling rate-limit — it is intentionally unrestricted for emergency use. The reentrancy guard still applies.
+
+**Emergency declaration gate (#453):** Prior to this fix, `emergency_withdraw` was callable at any time by the admin, making the rolling withdrawal cap on `withdraw` fully bypassable — a compromised admin key could simply call `emergency_withdraw` instead of `withdraw` and drain the full balance in one transaction. `emergency_withdraw` is now gated behind a distinct, auditable `EmergencyDeclared` flag:
+
+```
+declare_emergency(admin)   // sets EmergencyDeclared = true, audited + evented
+emergency_withdraw(...)    // now callable
+revoke_emergency(admin)    // sets EmergencyDeclared = false, re-locking the drain path
+```
+
+This gate is deliberately **independent of the protocol-wide pause flag**. `emergency_withdraw` exists to evacuate funds during an incident — exactly when the protocol is most likely to already be paused — so tying it to `!is_paused()` would make it unusable precisely when needed. `withdraw`, by contrast, *is* blocked while paused (see "Pause Enforcement" below).
 
 ---
 
@@ -96,25 +107,47 @@ The guard is acquired **after** all authorization and validation checks, so fail
 
 ## Rolling Withdrawal Rate-Limit
 
-To cap the blast radius of a compromised admin key, withdrawals are subject to a configurable 24-hour rolling cap.
+To cap the blast radius of a compromised admin key, withdrawals are subject to a configurable 24-hour rolling cap — **tracked independently per whitelisted token (#452)**.
 
 | Storage key | Type | Default | Meaning |
 |-------------|------|---------|---------|
-| `WithdrawalCap` | `i128` | `0` | Max withdrawable per 24 h epoch. `0` = uncapped |
-| `EpochStart` | `u64` | init time | Timestamp of the current epoch start |
-| `EpochWithdrawn` | `i128` | `0` | Amount withdrawn so far in the current epoch |
+| `WithdrawalCap(token)` | `i128` | `0` | Max withdrawable per 24 h epoch, for this token. `0` = uncapped |
+| `EpochStart(token)` | `u64` | first withdrawal time | Timestamp of this token's current epoch start |
+| `EpochWithdrawn(token)` | `i128` | `0` | Amount withdrawn so far in this token's current epoch |
 
-**Epoch reset:** if `now − EpochStart ≥ 86 400 s`, the epoch counters reset automatically at the next withdrawal.
+Exhausting Token A's cap has no effect on Token B's quota — each token has its own independent rolling cap and epoch, since fee accounting (`Collected(Address)`) is already per-token and unrelated tokens carry unrelated risk profiles and unit values.
 
-**Changing the cap** uses a two-step timelock:
+**Epoch reset:** if `now − EpochStart(token) ≥ 86 400 s`, that token's epoch counters reset automatically at its next withdrawal.
+
+**Changing the cap** uses a two-step timelock, per token:
 
 ```
-propose_withdrawal_cap(admin, new_cap)   // stores (new_cap, timestamp)
+propose_withdrawal_cap(admin, token, new_cap)   // stores (new_cap, timestamp) for `token`
 // wait ≥ UPGRADE_TIMELOCK_DELAY seconds
-execute_withdrawal_cap(admin)            // applies new_cap
+execute_withdrawal_cap(admin, token)            // applies new_cap for `token`
 ```
 
 Executing before the timelock elapses returns `WithdrawalCapTimelockNotElapsed`. Executing without a pending proposal returns `NoCapChangeProposed`.
+
+**Migration note:** this replaced a single global `WithdrawalCap`/`EpochStart`/`EpochWithdrawn`. There is no automatic carry-over of a prior global cap value to any specific token — every whitelisted token defaults to **uncapped** (`0`) until the admin explicitly proposes and executes a per-token cap for it via the flow above. Operators relying on the previous global cap for blast-radius protection must re-configure a cap for each whitelisted token after upgrading.
+
+---
+
+## Pause Enforcement (#454)
+
+Treasury can optionally be wired to the protocol's `access_control` contract:
+
+```
+set_access_control(admin, access_control)   // one-time or updatable admin setter
+```
+
+Once set, `withdraw` calls `require_not_paused()` and is rejected with `KoraError::ProtocolPaused` while the protocol is paused. If `access_control` has never been configured (e.g. a test environment), the pause check is skipped rather than erroring.
+
+| Function | Blocked while paused? |
+|----------|------------------------|
+| `withdraw` | Yes |
+| `emergency_withdraw` | No — gated instead by `EmergencyDeclared` (see above); intentionally independent of the pause flag so the emergency path remains usable during an incident |
+| `collect_fee` | No (intentionally exempt) — it is only ever invoked mid-transaction by `marketplace.fund_invoice`, which already gates its own entry point with its own `require_not_paused`. Re-checking here would let a treasury-only pause silently break marketplace's funding flow for no added security benefit, mirroring the documented pause exceptions for repayment paths in `invoice_nft` / `financing_pool`. |
 
 ---
 
@@ -130,16 +163,21 @@ Executing before the timelock elapses returns `WithdrawalCapTimelockNotElapsed`.
 |----------|------|-------------|
 | `initialize(admin, fee_bps)` | None (one-time) | Set admin and fee rate |
 | `set_fee_bps(admin, fee_bps)` | Admin | Update protocol fee |
+| `set_access_control(admin, access_control)` | Admin | Wire up pause enforcement (#454) |
 | `whitelist_token(admin, token)` | Admin | Allow token for fee operations |
 | `collect_fee(token, amount)` | None | Record incoming fee (called by marketplace) |
-| `withdraw(admin, token, recipient, amount)` | Admin | Withdraw fees with rate-limit |
-| `emergency_withdraw(admin, token, recipient)` | Admin | Drain full balance |
-| `propose_withdrawal_cap(admin, new_cap)` | Admin | Propose new 24 h cap |
-| `execute_withdrawal_cap(admin)` | Admin | Apply cap after timelock |
+| `withdraw(admin, token, recipient, amount)` | Admin | Withdraw fees with rate-limit; blocked while paused |
+| `emergency_withdraw(admin, token, recipient)` | Admin | Drain full balance; requires `declare_emergency` first |
+| `declare_emergency(admin)` | Admin | Unlock `emergency_withdraw` (#453) |
+| `revoke_emergency(admin)` | Admin | Re-lock `emergency_withdraw` |
+| `is_emergency_declared()` | None | Whether emergency mode is currently declared |
+| `is_paused()` | None | Whether this treasury sees the protocol as paused |
+| `propose_withdrawal_cap(admin, token, new_cap)` | Admin | Propose new per-token 24 h cap (#452) |
+| `execute_withdrawal_cap(admin, token)` | Admin | Apply per-token cap after timelock |
 | `get_fee_bps()` | None | Read current fee rate |
 | `get_balance(token)` | None | Live token balance |
 | `get_collected(token)` | None | Informational ledger total |
-| `get_withdrawal_cap()` | None | Current 24 h cap (0 = uncapped) |
+| `get_withdrawal_cap(token)` | None | Current per-token 24 h cap (0 = uncapped) |
 | `get_admin()` | None | Current admin address |
 | `propose_upgrade(admin, wasm_hash)` | Admin | Propose contract upgrade |
 | `execute_upgrade(admin)` | Admin | Apply upgrade after timelock |
@@ -155,10 +193,12 @@ Executing before the timelock elapses returns `WithdrawalCapTimelockNotElapsed`.
 | `Collected(Address)` | persistent | `i128` | Cumulative fees per token |
 | `WhitelistedToken(Address)` | persistent | `bool` | Token whitelist flag |
 | `UpgradeProposal` | instance | `(BytesN<32>, u64)` | Pending upgrade hash + timestamp |
-| `WithdrawalCap` | instance | `i128` | 24 h withdrawal cap |
-| `WithdrawalCapProposal` | instance | `(i128, u64)` | Pending cap change + timestamp |
-| `EpochStart` | instance | `u64` | Current epoch start timestamp |
-| `EpochWithdrawn` | instance | `i128` | Amount withdrawn in current epoch |
+| `WithdrawalCap(Address)` | instance | `i128` | 24 h withdrawal cap, per token (#452) |
+| `WithdrawalCapProposal(Address)` | instance | `(i128, u64)` | Pending cap change + timestamp, per token |
+| `EpochStart(Address)` | instance | `u64` | Current epoch start timestamp, per token |
+| `EpochWithdrawn(Address)` | instance | `i128` | Amount withdrawn in current epoch, per token |
+| `AccessControl` | instance | `Address` | Optional `access_control` reference for pause enforcement (#454) |
+| `EmergencyDeclared` | instance | `bool` | Gate for `emergency_withdraw` (#453) |
 
 Persistent entries are TTL-bumped to ~31 days (`535 680` ledgers) on every write. Instance storage is tied to the contract instance and does not expire independently.
 
@@ -169,11 +209,13 @@ Persistent entries are TTL-bumped to ~31 days (`535 680` ledgers) on every write
 ### Threat: stolen admin key
 
 **Mitigations in place:**
-- Rolling 24 h withdrawal cap limits the maximum extractable amount per epoch
+- Rolling 24 h withdrawal cap limits the maximum extractable amount per epoch, per token (#452)
 - Cap changes require a timelock — an attacker cannot immediately raise the cap
 - Contract upgrades require a timelock — an attacker cannot swap in malicious code immediately
+- `withdraw` is blocked while the protocol is paused (#454), giving admins a way to halt fund egress on detection
+- `emergency_withdraw` — previously always callable, which fully bypassed the rate-limit cap — now requires a distinct, auditable `declare_emergency` call first (#453)
 
-**Residual risk:** with cap disabled (`WithdrawalCap = 0`), a compromised key can drain all funds in one transaction. The cap should always be set in production.
+**Residual risk:** with a token's cap disabled (`WithdrawalCap(token) = 0`), a compromised key can drain that token's full balance in one transaction via `withdraw`, and any whitelisted token's balance via `emergency_withdraw` once `declare_emergency` has been called (by design, `declare_emergency`/`emergency_withdraw` share the single admin key rather than a stronger multisig — see #453's acceptance criteria for the multisig follow-up this doesn't yet cover). Per-token caps should always be set in production, and `access_control` should be configured via `set_access_control`.
 
 ### Threat: reentrancy via malicious token
 
