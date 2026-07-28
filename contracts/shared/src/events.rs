@@ -697,9 +697,18 @@ pub fn reserve_disbursed(env: &Env, caller: &Address, token: &Address, recipient
 pub fn sme_credit_limit_set(env: &Env, verifier: &Address, sme: &Address, credit_limit: i128) {
     emit(
         env,
-        symbol_short!("SME_CLSET"),
         symbol_short!("SME_CL"),
         (verifier.clone(), sme.clone(), credit_limit, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, sme, new_verifier, timestamp)
+/// Emitted when the admin reassigns an SME to a new verifier-of-record.
+pub fn sme_verifier_reassigned(env: &Env, admin: &Address, sme: &Address, new_verifier: &Address) {
+    emit(
+        env,
+        symbol_short!("SME_REAS"),
+        (admin.clone(), sme.clone(), new_verifier.clone(), env.ledger().timestamp()),
     );
 }
 

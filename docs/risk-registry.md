@@ -144,6 +144,8 @@ Debtors are the counterparties who owe payment on the underlying invoices. To pr
 privacy, debtor PII is never stored on-chain — only a **SHA-256 hash** of the debtor
 identity is used as the key.
 
+Debtor risk scores are tracked per-verifier as independent attestations rather than a single overwritable global value:
+
 ```
 set_debtor_score(verifier, debtor_hash, score)
 ```
@@ -151,16 +153,19 @@ set_debtor_score(verifier, debtor_hash, score)
 - `debtor_hash` must be exactly 32 bytes (the raw SHA-256 digest).
 - `score` is 0–100, following the same `RiskTier` mapping as SME scores.
 - Only registered verifiers may set debtor scores.
+- Updates are saved as independent attestations keyed by `(debtor_hash, verifier)`, with a per-verifier cooldown (`MIN_SCORE_UPDATE_INTERVAL = 3,600s`) enforced per attestation.
 
-Query:
+Queries:
 
 ```
-get_debtor_score(debtor_hash) → Result<u32, KoraError::DebtorNotRegistered>
+get_debtor_score(debtor_hash) → Result<u32, RiskRegistryError::DebtorNotRegistered>
 ```
+Computes and returns the aggregated average score across all active verifiers' attestations for `debtor_hash`. Unregistered/removed verifiers are excluded from the aggregate computation.
 
-Debtor scores are currently informational — they are not enforced by any contract
-logic in v1 but are available for off-chain risk dashboards and future marketplace
-tier-based fee differentiation.
+```
+get_debtor_score_attestation(verifier, debtor_hash) → Result<u32, RiskRegistryError::DebtorNotRegistered>
+```
+Returns an individual verifier's specific score attestation for `debtor_hash`.
 
 ---
 
@@ -185,7 +190,8 @@ activity volume for risk analysis.
 | `get_verifier_stake(verifier)` | Remaining stake in token units (0 if not registered) |
 | `get_verifier_reputation(verifier)` | Reputation score 0–100 (0 if not registered) |
 | `is_verifier(verifier)` | `true` if the address is a registered verifier |
-| `get_debtor_score(debtor_hash)` | Debtor score, or `KoraError::DebtorNotRegistered` |
+| `get_debtor_score(debtor_hash)` | Aggregated average debtor score across active verifiers, or `RiskRegistryError::DebtorNotRegistered` |
+| `get_debtor_score_attestation(verifier, debtor_hash)` | Specific verifier's score attestation, or `RiskRegistryError::DebtorNotRegistered` |
 | `get_admin()` | Current admin address |
 
 All read functions are authorization-free and safe to call from any context.
