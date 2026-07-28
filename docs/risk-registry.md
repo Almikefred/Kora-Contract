@@ -118,6 +118,18 @@ set_credit_limit(verifier, sme, credit_limit)
   `invoice_nft::get_outstanding_exposure(sme)` and rejects the mint if
   `outstanding + new_amount > credit_limit`.
 
+### Verifier-of-Record Model & Reassignment
+
+To prevent unauthorized changes, both `update_sme_score` and `set_credit_limit` enforce that the calling verifier (or their resolved primary verifier address) is the designated **verifier-of-record** stored in the SME's profile (`SmeProfile.verifier`). Any attempt by an unrelated verifier to modify these parameters will fail with `RiskRegistryError::NotSmeVerifier`.
+
+If a verifier is removed or custody needs to be transferred, the admin can reassign the verifier-of-record for an SME:
+
+```
+reassign_sme_verifier(admin, sme, new_verifier)
+```
+- `new_verifier` must be an active, registered verifier.
+- Reassignment updates `SmeProfile.verifier` to the new address and emits the `sme_verifier_reassigned` event.
+
 ---
 
 ## Risk Tier Thresholds
