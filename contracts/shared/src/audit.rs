@@ -12,6 +12,7 @@ pub enum AuditSource {
     AccessControl,
     Treasury,
     RiskRegistry,
+    InvoiceNft,
 }
 
 /// Canonical discriminant for every admin-gated operation across the protocol.
@@ -39,18 +40,9 @@ pub enum AdminActionType {
     ExecuteWithdrawalCap,
     TreasuryProposeUpgrade,
     TreasuryExecuteUpgrade,
-    // ── Treasury: recipient allowlist (#457) ────────────────────────────────
-    ProposeRecipient,
-    ExecuteRecipient,
-    // ── Treasury: insurance/loss reserve (#458) ─────────────────────────────
-    SetReserveAllocation,
-    SetReserveCaller,
-    DisburseFromReserve,
-    // ── Treasury: multisig quorum gate (#455) ───────────────────────────────
     SetAccessControl,
-    ProposeTreasuryAction,
-    ApproveTreasuryAction,
-    ExecuteTreasuryAction,
+    DeclareEmergency,
+    RevokeEmergency,
     // ── RiskRegistry ─────────────────────────────────────────────────────────
     AddVerifier,
     RemoveVerifier,
@@ -58,6 +50,18 @@ pub enum AdminActionType {
     RegistryTransferAdmin,
     RegistryProposeUpgrade,
     RegistryExecuteUpgrade,
+    // ── InvoiceNft ───────────────────────────────────────────────────────────
+    CorrectMetadataHash,
+    InvoiceNftSetRiskRegistry,
+    InvoiceNftSetAuthorizedCallers,
+    InvoiceNftSetDefaulted,
+    InvoiceNftFreezeInvoice,
+    InvoiceNftUnfreezeInvoice,
+    InvoiceNftAddAllowedCurrency,
+    InvoiceNftRemoveAllowedCurrency,
+    InvoiceNftProposeUpgrade,
+    InvoiceNftExecuteUpgrade,
+    InvoiceNftMigrate,
 }
 
 /// A single entry in the on-chain admin audit log.
