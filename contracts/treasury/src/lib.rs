@@ -234,6 +234,12 @@ impl TreasuryContract {
     /// - `amount` — The amount to withdraw (must be > 0 and ≤ `MAX_AMOUNT`).
     ///
     /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAmount` — `amount` is ≤ 0 or exceeds `MAX_AMOUNT`.
+    /// - `KoraError::TokenNotWhitelisted` — Token is not whitelisted.
+    /// - `KoraError::WithdrawalRateLimitExceeded` — Would exceed the rolling 24 h cap.
+    /// - `KoraError::Reentrancy` — Reentrancy guard triggered.
+    /// - `KoraError::InsufficientFunds` — Contract balance is less than `amount`.
     /// - `TreasuryError::NotAdmin` — Caller is not the admin.
     /// - `TreasuryError::InvalidAmount` — `amount` is ≤ 0 or exceeds `MAX_AMOUNT`.
     /// - `TreasuryError::TokenNotWhitelisted` — Token is not whitelisted.
@@ -267,6 +273,7 @@ impl TreasuryContract {
         let balance = token_client.balance(&env.current_contract_address());
 
         if balance < amount {
+            return Err(KoraError::InsufficientFunds);
             return Err(TreasuryError::InsufficientPoolBalance);
         }
 
@@ -370,6 +377,9 @@ impl TreasuryContract {
     /// - `admin` — Must be the current admin address.
     ///
     /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::NoUpgradeProposed` — No withdrawal cap proposal is pending.
+    /// - `KoraError::UpgradeTimelockNotElapsed` — 24-hour timelock has not yet passed.
     /// - `TreasuryError::NotAdmin` — Caller is not the admin.
     /// - `TreasuryError::NoCapChangeProposed` — No withdrawal cap proposal is pending.
     /// - `TreasuryError::WithdrawalCapTimelockNotElapsed` — 24-hour timelock has not yet passed.
@@ -383,6 +393,9 @@ impl TreasuryContract {
             .storage()
             .instance()
             .get(&DataKey::WithdrawalCapProposal)
+            .ok_or(KoraError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::UpgradeTimelockNotElapsed);
             .ok_or(TreasuryError::NoCapChangeProposed)?;
         if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
             return Err(TreasuryError::WithdrawalCapTimelockNotElapsed);

@@ -251,7 +251,7 @@ impl MarketplaceContract {
             .persistent()
             .has(&DataKey::Listing(invoice_id))
         {
-            return Err(KoraError::InvoiceAlreadyExists);
+            return Err(KoraError::AlreadyInitialized);
         }
 
         let _guard = ReentrancyGuard::new(&env)?;
@@ -602,7 +602,7 @@ impl MarketplaceContract {
             .get::<_, bool>(&refund_key)
             .unwrap_or(false)
         {
-            return Err(KoraError::RefundAlreadyClaimed);
+            return Err(KoraError::AlreadyInitialized);
         }
 
         // Look up the investor's net contribution
@@ -614,7 +614,7 @@ impl MarketplaceContract {
             .unwrap_or(0);
 
         if net_contributed <= 0 {
-            return Err(KoraError::NoContribution);
+            return Err(KoraError::InsufficientFunds);
         }
 
         // CEI: mark before external call
@@ -1185,7 +1185,7 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err().unwrap(),
-            KoraError::InvoiceAlreadyExists
+            KoraError::AlreadyInitialized
         );
     }
 

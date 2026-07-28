@@ -48,6 +48,7 @@ pub enum AdminActionType {
     RegistryProposeUpgrade,
     RegistryExecuteUpgrade,
     // ── InvoiceNft ───────────────────────────────────────────────────────────
+    CorrectMetadataHash,
     InvoiceNftSetRiskRegistry,
     InvoiceNftSetAuthorizedCallers,
     InvoiceNftSetDefaulted,

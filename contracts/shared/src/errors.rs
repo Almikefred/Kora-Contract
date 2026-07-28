@@ -15,9 +15,7 @@ pub enum KoraError {
 
     // Invoice
     InvoiceNotFound = 10,
-    InvoiceAlreadyExists = 11,
     InvalidInvoiceStatus = 12,
-    InvoiceExpired = 13,
     InvalidAmount = 14,
     InvalidDueDate = 15,
     InvalidRiskScore = 16,
@@ -27,37 +25,26 @@ pub enum KoraError {
     // Marketplace
     ListingNotFound = 20,
     ListingAlreadyCancelled = 21,
-    ListingExpired = 22,
     FundingDeadlinePassed = 23,
     InsufficientFunds = 24,
     ExceedsFundingTarget = 25,
-    AlreadyFullyFunded = 26,
     ListingFullyFunded = 27,
     FundingNotExpired = 28,
-    RefundAlreadyClaimed = 29,
-    NoContribution = 95,
 
     // Pool
     PoolNotFound = 30,
     PoolAlreadyClosed = 31,
-    RepaymentAlreadyMade = 32,
-    InsufficientPoolBalance = 33,
     PositionNotFound = 34,
     SaleAlreadyListed = 35,
     SaleNotFound = 36,
 
     // Treasury
     InvalidFeeRate = 40,
-    WithdrawalFailed = 41,
     TokenNotWhitelisted = 42,
     WithdrawalRateLimitExceeded = 43,
-    WithdrawalCapTimelockNotElapsed = 44,
-    NoCapChangeProposed = 45,
 
     // Risk
     SMENotRegistered = 50,
-    DebtorNotRegistered = 51,
-    RiskScoreOutOfRange = 52,
     ComplianceNotAttested = 53,
 
     // General
@@ -77,16 +64,11 @@ pub enum KoraError {
     // Upgrade
     NoUpgradeProposed = 100,
     UpgradeTimelockNotElapsed = 101,
-    // Field value exceeds the allowed maximum length (was mistakenly = 95; fixed to 103)
-    FieldTooLong = 103,
     // Parameter governance
     ParameterProposalNotFound = 110,
     ParameterProposalAlreadyExecuted = 111,
     NotMultisigSigner = 112,
-    AlreadyVoted = 113,
     GovernanceThresholdNotMet = 114,
-    GovernanceTimelockNotElapsed = 115,
-    InvalidParameterValue = 116,
     // Cooldown between debtor risk score updates per (verifier, debtor_hash) pair
     ScoreUpdateCooldownNotElapsed = 117,
     // Marketplace two-phase cancellation
