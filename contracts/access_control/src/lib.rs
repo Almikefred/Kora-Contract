@@ -1024,6 +1024,8 @@ impl AccessControlContract {
             actor: actor.clone(),
             action,
             source: AuditSource::AccessControl,
+            token: None,
+            amount: None,
         };
 
         env.storage()

@@ -654,6 +654,43 @@ pub fn access_control_updated(env: &Env, admin: &Address, access_control: &Addre
     );
 }
 
+// ── Treasury Recipient Allowlist Events (#457) ───────────────────────────────
+
+/// Schema: (actor=admin, recipient, timestamp)
+pub fn recipient_proposed(env: &Env, admin: &Address, recipient: &Address) {
+    emit(
+        env,
+        symbol_short!("RCP_PROP"),
+        (admin.clone(), recipient.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, recipient, timestamp)
+pub fn recipient_allowed(env: &Env, admin: &Address, recipient: &Address) {
+    emit(
+        env,
+        symbol_short!("RCP_ALLOW"),
+        (admin.clone(), recipient.clone(), env.ledger().timestamp()),
+    );
+}
+
+// ── Treasury Insurance Reserve Events (#458) ─────────────────────────────────
+
+/// Schema: (actor=caller, token, recipient, amount, timestamp)
+pub fn reserve_disbursed(env: &Env, caller: &Address, token: &Address, recipient: &Address, amount: i128) {
+    emit(
+        env,
+        symbol_short!("RSRV_DISB"),
+        (
+            caller.clone(),
+            token.clone(),
+            recipient.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 // ── Risk Registry — Credit Limit ─────────────────────────────────────────────
 
 /// Schema: (actor=verifier, sme, credit_limit, timestamp)

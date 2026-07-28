@@ -1044,6 +1044,8 @@ impl RiskRegistryContract {
             actor: actor.clone(),
             action,
             source: AuditSource::RiskRegistry,
+            token: None,
+            amount: None,
         };
 
         env.storage()
