@@ -227,6 +227,20 @@ impl RiskRegistryContract {
         Self::require_admin(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &verifier)?;
 
+        // Guard: reject re-registration of an already-active verifier.
+        // Re-registering would silently overwrite VerifierStake (stranding funds if
+        // the new amount is lower) and reset VerifierReputation to 100, laundering
+        // any slashing history accumulated via record_default. Use top_up_stake to
+        // legitimately increase an existing verifier's collateral.
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Verifier(verifier.clone()))
+            .unwrap_or(false)
+        {
+            return Err(RiskRegistryError::AlreadyInitialized);
+        }
+
         let minimum_stake: i128 = env
             .storage()
             .persistent()
@@ -259,6 +273,71 @@ impl RiskRegistryContract {
         Self::bump_persistent(&env, &DataKey::VerifierStake(verifier.clone()));
         Self::bump_persistent(&env, &DataKey::VerifierReputation(verifier.clone()));
         events::verifier_added(&env, &admin, &verifier);
+        Self::append_audit_entry(&env, &admin, AdminActionType::AddVerifier);
+        Ok(())
+    }
+
+    /// Increase an existing active verifier's stake without resetting their reputation.
+    ///
+    /// This is the correct path for legitimately increasing a verifier's collateral.
+    /// Unlike `add_verifier`, this adds to the existing tracked stake (never overwrites)
+    /// and does not touch `VerifierReputation`.
+    ///
+    /// **Parameters:**
+    /// - `admin` — Must be the current admin address.
+    /// - `verifier` — An already-active verifier address.
+    /// - `additional_amount` — Extra stake to deposit (must be > 0).
+    ///
+    /// **Errors:**
+    /// - `RiskRegistryError::NotAdmin` — Caller is not the admin.
+    /// - `RiskRegistryError::NotVerifier` — Address is not an active verifier.
+    /// - `RiskRegistryError::InvalidAmount` — `additional_amount` ≤ 0.
+    /// - `RiskRegistryError::ArithmeticOverflow` — Stake addition overflowed.
+    pub fn top_up_stake(
+        env: Env,
+        admin: Address,
+        verifier: Address,
+        additional_amount: i128,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        if additional_amount <= 0 {
+            return Err(RiskRegistryError::InvalidAmount);
+        }
+
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Verifier(verifier.clone()))
+            .unwrap_or(false)
+        {
+            return Err(RiskRegistryError::NotVerifier);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakingToken)
+            .ok_or(RiskRegistryError::NotInitialized)?;
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+        token_client.transfer(&verifier, &env.current_contract_address(), &additional_amount);
+
+        let current_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierStake(verifier.clone()))
+            .unwrap_or(0);
+
+        let new_stake = current_stake
+            .checked_add(additional_amount)
+            .ok_or(RiskRegistryError::ArithmeticOverflow)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStake(verifier.clone()), &new_stake);
+        Self::bump_persistent(&env, &DataKey::VerifierStake(verifier.clone()));
         Self::append_audit_entry(&env, &admin, AdminActionType::AddVerifier);
         Ok(())
     }
@@ -1164,8 +1243,6 @@ mod tests {
         let verifier = Address::generate(&env);
         mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
         assert!(client.try_add_verifier(&admin, &verifier, &1_000_000i128).is_ok());
-        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
-        client.add_verifier(&admin, &verifier, &1_000_000i128);
         assert!(client.is_verifier(&verifier));
     }
 
@@ -1219,9 +1296,6 @@ mod tests {
         mint_stake(&env, &staking_token, &v1, 1_000_000i128);
         client.add_verifier(&admin, &v1, &1_000_000i128);
         mint_stake(&env, &staking_token, &v2, 1_000_000i128);
-        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&v1, &1_000_000i128);
-        client.add_verifier(&admin, &v1, &1_000_000i128);
-        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&v2, &1_000_000i128);
         client.add_verifier(&admin, &v2, &1_000_000i128);
         client.register_sme(&v1, &sme1, &30u32, &true);
         client.register_sme(&v2, &sme2, &60u32, &true);
@@ -1936,9 +2010,6 @@ mod tests {
         mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
         client.add_verifier(&admin, &verifier_a, &1_000_000i128);
         mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
-        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier_a, &1_000_000i128);
-        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
-        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier_b, &1_000_000i128);
         client.add_verifier(&admin, &verifier_b, &1_000_000i128);
         // verifier_a sets the score; its cooldown now ticks.
         client.set_debtor_score(&verifier_a, &debtor_hash, &40u32);
