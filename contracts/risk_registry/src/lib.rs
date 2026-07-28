@@ -893,6 +893,8 @@ impl RiskRegistryContract {
             .has(&DataKey::SubAccount(addr))
     }
 
+    /// Returns the debtor score or `KoraError::SMENotRegistered` if not found.
+    pub fn get_debtor_score(env: Env, debtor_hash: Bytes) -> Result<u32, KoraError> {
     /// Returns the debtor score or `RiskRegistryError::DebtorNotRegistered` if not found.
     pub fn get_debtor_score(env: Env, debtor_hash: Bytes) -> Result<u32, RiskRegistryError> {
         let key = DataKey::DebtorScore(debtor_hash);
@@ -900,6 +902,7 @@ impl RiskRegistryContract {
             .storage()
             .persistent()
             .get(&key)
+            .ok_or(KoraError::SMENotRegistered)?;
             .ok_or(RiskRegistryError::DebtorNotRegistered)?;
         Self::bump_persistent(&env, &key);
         Ok(score)
@@ -1120,6 +1123,8 @@ impl RiskRegistryContract {
             actor: actor.clone(),
             action,
             source: AuditSource::RiskRegistry,
+            token: None,
+            amount: None,
         };
 
         env.storage()
