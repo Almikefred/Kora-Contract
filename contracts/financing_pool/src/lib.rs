@@ -262,6 +262,16 @@ impl FinancingPoolContract {
             .unwrap_or(5_000)
     }
 
+    /// Returns the configured price oracle address. Lets other protocol
+    /// contracts (e.g. marketplace, for cross-currency funding) reuse the
+    /// same oracle instance instead of wiring a separate reference. (#449)
+    pub fn get_price_oracle(env: Env) -> Result<Address, KoraError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PriceOracle)
+            .ok_or(KoraError::NotInitialized)
+    }
+
     /// Register an investor position for a funded invoice. Admin only.
     ///
     /// Called by the marketplace (via admin) after each investor contribution to record
@@ -430,6 +440,7 @@ impl FinancingPoolContract {
 
         if pool.is_closed {
             env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+            return Err(KoraError::PoolAlreadyClosed);
             return Err(FinancingPoolError::RepaymentAlreadyMade);
         }
 
@@ -458,6 +469,7 @@ impl FinancingPoolContract {
             if idx >= len {
                 // All installments already satisfied — pool should have been closed.
                 env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::PoolAlreadyClosed);
                 return Err(FinancingPoolError::RepaymentAlreadyMade);
             }
             let installment = schedule.installments.get(idx).unwrap();

@@ -160,6 +160,7 @@ pub fn repayment_made(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
 pub fn installment_paid(env: &Env, invoice_id: u64, payer: &Address, index: u32, amount: i128) {
     emit(
         env,
+        symbol_short!("INSTLPAID"),
         symbol_short!("INSTMT_PD"),
         (payer.clone(), invoice_id, index, amount, env.ledger().timestamp()),
     );
@@ -218,6 +219,7 @@ pub fn fee_collected(
 ) {
     emit(
         env,
+        symbol_short!("FEE_COLL"),
         symbol_short!("FEE_COL"),
         (
             investor.clone(),
@@ -280,6 +282,7 @@ pub fn protocol_paused(env: &Env, by: &Address) {
 pub fn protocol_unpaused(env: &Env, by: &Address) {
     emit(
         env,
+        symbol_short!("AC_UNPSD"),
         symbol_short!("UNPAUSED"),
         (by.clone(), env.ledger().timestamp()),
     );
@@ -358,6 +361,7 @@ pub fn position_recorded(
 ) {
     emit(
         env,
+        symbol_short!("POS_RECD"),
         symbol_short!("POS_RECRD"),
         (
             admin.clone(),
@@ -376,6 +380,7 @@ pub fn position_recorded(
 pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
+        symbol_short!("VRF_ADDED"),
         symbol_short!("VRF_ADD"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
@@ -385,6 +390,7 @@ pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
 pub fn verifier_removed(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
+        symbol_short!("VRF_RMVD"),
         symbol_short!("VRF_REM"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
@@ -403,6 +409,7 @@ pub fn sme_registered(env: &Env, verifier: &Address, sme: &Address, risk_score: 
 pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score: u32) {
     emit(
         env,
+        symbol_short!("SME_SCORE"),
         symbol_short!("SME_UPD"),
         (verifier.clone(), sme.clone(), new_score, env.ledger().timestamp()),
     );
@@ -421,6 +428,7 @@ pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_def
 pub fn sme_invoice_count_incremented(env: &Env, sme: &Address, new_total: u32) {
     emit(
         env,
+        symbol_short!("SME_INVCT"),
         symbol_short!("SME_INV"),
         (sme.clone(), new_total, env.ledger().timestamp()),
     );
@@ -473,6 +481,7 @@ pub fn sub_account_removed(env: &Env, primary: &Address, sub_account: &Address) 
 pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
     emit(
         env,
+        symbol_short!("AC_UPG_PR"),
         symbol_short!("UPG_PROP"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
@@ -482,6 +491,7 @@ pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
 pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
     emit(
         env,
+        symbol_short!("AC_UPG_EX"),
         symbol_short!("UPG_EXEC"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
@@ -494,6 +504,7 @@ pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
 pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
     emit(
         env,
+        symbol_short!("MSIG_CFG"),
         symbol_short!("MS_CFG"),
         (threshold, signer_count, env.ledger().timestamp()),
     );
@@ -503,6 +514,7 @@ pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
 pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
     emit(
         env,
+        symbol_short!("ACT_PROP"),
         symbol_short!("MS_PROP"),
         (proposal_id, proposer.clone(), env.ledger().timestamp()),
     );
@@ -512,6 +524,7 @@ pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
 pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval_count: u32) {
     emit(
         env,
+        symbol_short!("ACT_APPR"),
         symbol_short!("MS_APPR"),
         (
             proposal_id,
@@ -526,6 +539,7 @@ pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval
 pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
     emit(
         env,
+        symbol_short!("ACT_EXEC"),
         symbol_short!("MS_EXEC"),
         (proposal_id, executor.clone(), env.ledger().timestamp()),
     );
@@ -537,6 +551,7 @@ pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
 pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
     emit(
         env,
+        symbol_short!("REFUND_CL"),
         symbol_short!("REFUND"),
         (
             investor.clone(),
@@ -567,21 +582,85 @@ pub fn position_sold(env: &Env, invoice_id: u64, seller: &Address, buyer: &Addre
 
 // ── Treasury Cap Events ───────────────────────────────────────────────────────
 
-/// Schema: (actor=admin, new_cap, timestamp)
-pub fn withdrawal_cap_proposed(env: &Env, admin: &Address, new_cap: i128) {
+/// Schema: (actor=admin, token, new_cap, timestamp)
+pub fn withdrawal_cap_proposed(env: &Env, admin: &Address, token: &Address, new_cap: i128) {
     emit(
         env,
         symbol_short!("WTH_CAP_P"),
-        (admin.clone(), new_cap, env.ledger().timestamp()),
+        (admin.clone(), token.clone(), new_cap, env.ledger().timestamp()),
     );
 }
 
-/// Schema: (actor=admin, old_cap, new_cap, timestamp)
-pub fn withdrawal_cap_updated(env: &Env, admin: &Address, old_cap: i128, new_cap: i128) {
+/// Schema: (actor=admin, token, old_cap, new_cap, timestamp)
+pub fn withdrawal_cap_updated(env: &Env, admin: &Address, token: &Address, old_cap: i128, new_cap: i128) {
     emit(
         env,
         symbol_short!("WTH_CAP_U"),
-        (admin.clone(), old_cap, new_cap, env.ledger().timestamp()),
+        (admin.clone(), token.clone(), old_cap, new_cap, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, timestamp)
+pub fn emergency_declared(env: &Env, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("EMRG_DECL"),
+        (admin.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, timestamp)
+pub fn emergency_revoked(env: &Env, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("EMRG_REVK"),
+        (admin.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, access_control, timestamp)
+pub fn access_control_updated(env: &Env, admin: &Address, access_control: &Address) {
+    emit(
+        env,
+        symbol_short!("AC_SET"),
+        (admin.clone(), access_control.clone(), env.ledger().timestamp()),
+    );
+}
+
+// ── Treasury Recipient Allowlist Events (#457) ───────────────────────────────
+
+/// Schema: (actor=admin, recipient, timestamp)
+pub fn recipient_proposed(env: &Env, admin: &Address, recipient: &Address) {
+    emit(
+        env,
+        symbol_short!("RCP_PROP"),
+        (admin.clone(), recipient.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, recipient, timestamp)
+pub fn recipient_allowed(env: &Env, admin: &Address, recipient: &Address) {
+    emit(
+        env,
+        symbol_short!("RCP_ALLOW"),
+        (admin.clone(), recipient.clone(), env.ledger().timestamp()),
+    );
+}
+
+// ── Treasury Insurance Reserve Events (#458) ─────────────────────────────────
+
+/// Schema: (actor=caller, token, recipient, amount, timestamp)
+pub fn reserve_disbursed(env: &Env, caller: &Address, token: &Address, recipient: &Address, amount: i128) {
+    emit(
+        env,
+        symbol_short!("RSRV_DISB"),
+        (
+            caller.clone(),
+            token.clone(),
+            recipient.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
     );
 }
 
@@ -591,8 +670,18 @@ pub fn withdrawal_cap_updated(env: &Env, admin: &Address, old_cap: i128, new_cap
 pub fn sme_credit_limit_set(env: &Env, verifier: &Address, sme: &Address, credit_limit: i128) {
     emit(
         env,
-        symbol_short!("SME_CLSET"),
+        symbol_short!("SME_CL"),
         (verifier.clone(), sme.clone(), credit_limit, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, sme, new_verifier, timestamp)
+/// Emitted when the admin reassigns an SME to a new verifier-of-record.
+pub fn sme_verifier_reassigned(env: &Env, admin: &Address, sme: &Address, new_verifier: &Address) {
+    emit(
+        env,
+        symbol_short!("SME_REAS"),
+        (admin.clone(), sme.clone(), new_verifier.clone(), env.ledger().timestamp()),
     );
 }
 
@@ -627,6 +716,42 @@ pub fn cancellation_requested(env: &Env, invoice_id: u64, caller: &Address) {
     );
 }
 
+// ── Metadata Hash Dispute Events ──────────────────────────────────────────────
+
+/// Schema: (actor=challenger, invoice_id, timestamp)
+pub fn metadata_mismatch_flagged(env: &Env, invoice_id: u64, challenger: &Address) {
+    emit(
+        env,
+        symbol_short!("MTD_DISP"),
+        (challenger.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, invoice_id, upheld, timestamp)
+pub fn metadata_dispute_resolved(env: &Env, invoice_id: u64, admin: &Address, upheld: bool) {
+    emit(
+        env,
+        symbol_short!("MTD_RES"),
+        (admin.clone(), invoice_id, upheld, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, invoice_id, old_hash, new_hash, timestamp)
+pub fn metadata_hash_corrected(
+    env: &Env,
+    invoice_id: u64,
+    admin: &Address,
+    old_hash: &Bytes,
+    new_hash: &Bytes,
+) {
+    emit(
+        env,
+        symbol_short!("MTD_CORR"),
+        (
+            admin.clone(),
+            invoice_id,
+            old_hash.clone(),
+            new_hash.clone(),
 // ── Dutch Auction / Decay Schedule Events (#439) ──────────────────────────────
 
 /// Schema: (actor=seller, invoice_id, floor_price, decay_end_ts, timestamp)
@@ -712,6 +837,44 @@ pub fn admin_action_audited(env: &Env, entry: &AdminAuditEntry) {
             entry.action.clone(),
             entry.source.clone(),
             entry.timestamp,
+        ),
+    );
+}
+
+// ── Audit Events ─────────────────────────────────────────────────────────────
+
+/// Emitted on every admin action — canonical off-chain history source.
+pub fn adm_audit(env: &Env, sequence: u64, action: soroban_sdk::String, actor: &Address, timestamp: u64) {
+    emit(
+        env,
+        symbol_short!("ADM_AUDT"),
+        (sequence, action, actor.clone(), timestamp),
+    );
+}
+
+/// Emitted right before a ring-buffer wraparound begins overwriting old entries.
+/// Carries the rolling checksum that commits the full history up to this point,
+/// and the raw entry that is about to be discarded — giving off-chain systems an
+/// unambiguous, permanent archival signal.
+pub fn audit_checkpoint(
+    env: &Env,
+    total_entries: u64,
+    checksum: soroban_sdk::BytesN<32>,
+    discarded_action: soroban_sdk::String,
+    discarded_actor: &Address,
+    discarded_timestamp: u64,
+    discarded_sequence: u64,
+) {
+    emit(
+        env,
+        symbol_short!("AUDT_CHK"),
+        (
+            total_entries,
+            checksum,
+            discarded_action,
+            discarded_actor.clone(),
+            discarded_timestamp,
+            discarded_sequence,
         ),
     );
 }

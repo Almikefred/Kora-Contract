@@ -129,7 +129,10 @@ gross_amount (from investor)
 - `FundingDeadlinePassed` — current time > funding_deadline
 - `InvalidAmount` — amount <= 0
 - `ExceedsFundingTarget` — amount would exceed asking_price
+- `ContributionBelowMinimum` — amount is below the configured minimum contribution floor and does not exactly complete the remaining funding target (#451)
 - `ArithmeticOverflow` — fee or net calculation overflowed
+
+**Minimum contribution floor (#451):** contributions below `get_min_contribution()` (admin-configurable via `set_min_contribution`, defaults to 10_000_000 — ~1 unit for a 7-decimal stablecoin) are rejected, unless `amount` exactly equals the listing's remaining funding target. This closes off cheap dust-contribution storage-griefing of a listing: without a floor, an attacker could create unbounded distinct `Contribution(invoice_id, investor)` entries at near-zero cost by submitting many tiny contributions from many distinct addresses.
 
 ### cancel_listing
 
