@@ -297,6 +297,7 @@ impl InvoiceNftContract {
                         created_at: old.created_at,
                         funded_at: old.funded_at,
                         repaid_at: old.repaid_at,
+                        metadata_hash: Bytes::new(&env),
                         notes: None,
                     };
                     env.storage().persistent().set(&key, &upgraded);

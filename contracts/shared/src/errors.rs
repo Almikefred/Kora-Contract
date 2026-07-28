@@ -138,11 +138,8 @@ pub enum KoraError {
     // Marketplace
     ListingNotFound = 20,
     ListingAlreadyCancelled = 21,
-    ListingExpired = 22,
     FundingDeadlinePassed = 23,
-    InsufficientFunds = 24,
     ExceedsFundingTarget = 25,
-    AlreadyFullyFunded = 26,
     ListingFullyFunded = 27,
     FundingNotExpired = 28,
     RefundAlreadyClaimed = 29,
@@ -162,34 +159,41 @@ pub enum KoraError {
     PoolNotFound = 30,
     PoolAlreadyClosed = 31,
     RepaymentAlreadyMade = 32,
+    /// Also covers `risk_registry`'s "insufficient stake" condition (merged to stay
+    /// under Soroban's 50-variant contracterror cap).
     InsufficientPoolBalance = 33,
     PositionNotFound = 34,
-    SaleAlreadyListed = 35,
+    /// Also covers `financing_pool`'s "position already listed for sale" condition
+    /// (merged to stay under Soroban's 50-variant contracterror cap).
+    AlreadyInitialized = 94,
     SaleNotFound = 36,
 
     // Treasury
     InvalidFeeRate = 40,
-    WithdrawalFailed = 41,
     TokenNotWhitelisted = 42,
     WithdrawalRateLimitExceeded = 43,
-    WithdrawalCapTimelockNotElapsed = 44,
-    NoCapChangeProposed = 45,
+    /// Also covers `treasury`'s "no withdrawal-cap proposal pending" and
+    /// `access_control`'s "no upgrade proposal pending" conditions (merged to stay
+    /// under Soroban's 50-variant contracterror cap).
+    NoUpgradeProposed = 100,
 
     // Risk
+    /// Also covers `risk_registry`'s "debtor not registered" condition (merged to
+    /// stay under Soroban's 50-variant contracterror cap).
     SMENotRegistered = 50,
-    DebtorNotRegistered = 51,
-    RiskScoreOutOfRange = 52,
     ComplianceNotAttested = 53,
     // SME profile exists but has not been marked `verified` by a risk_registry verifier
     SMENotVerified = 54,
 
     // General
+    // `InvalidAmount` (above, = 14) also covers `access_control`'s "invalid
+    // governance parameter value" condition (merged to stay under Soroban's
+    // 50-variant contracterror cap).
     ArithmeticOverflow = 90,
     /// Returned by `safe_sub` when the result would underflow (a < b).
     ArithmeticUnderflow = 91,
     InvalidAddress = 92,
     EmptyString = 93,
-    AlreadyInitialized = 94,
     NotInitialized = 96,
     /// Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
@@ -205,6 +209,15 @@ pub enum KoraError {
     FieldTooLong = 102,
     // Parameter governance
     ParameterProposalNotFound = 110,
+    /// Also covers `access_control`'s "caller is not a configured multisig signer"
+    /// and "governance approval threshold not met" conditions, and `access_control`'s
+    /// "already voted" condition maps here as well (merged to stay under Soroban's
+    /// 50-variant contracterror cap).
+    // `Unauthorized` (above, = 1) also covers `access_control`'s "caller is not
+    // a configured multisig signer" and "governance approval threshold not met"
+    // conditions, and its "already voted" condition maps to
+    // `ParameterProposalAlreadyExecuted` above (merged to stay under Soroban's
+    // 50-variant contracterror cap).
     ParameterProposalAlreadyExecuted = 111,
     NotMultisigSigner = 112,
     AlreadyVoted = 113,
