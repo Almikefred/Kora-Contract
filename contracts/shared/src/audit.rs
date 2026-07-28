@@ -12,6 +12,7 @@ pub enum AuditSource {
     AccessControl,
     Treasury,
     RiskRegistry,
+    InvoiceNft,
 }
 
 /// Canonical discriminant for every admin-gated operation across the protocol.
@@ -49,6 +50,18 @@ pub enum AdminActionType {
     RegistryTransferAdmin,
     RegistryProposeUpgrade,
     RegistryExecuteUpgrade,
+    // ── InvoiceNft ───────────────────────────────────────────────────────────
+    CorrectMetadataHash,
+    InvoiceNftSetRiskRegistry,
+    InvoiceNftSetAuthorizedCallers,
+    InvoiceNftSetDefaulted,
+    InvoiceNftFreezeInvoice,
+    InvoiceNftUnfreezeInvoice,
+    InvoiceNftAddAllowedCurrency,
+    InvoiceNftRemoveAllowedCurrency,
+    InvoiceNftProposeUpgrade,
+    InvoiceNftExecuteUpgrade,
+    InvoiceNftMigrate,
 }
 
 /// A single entry in the on-chain admin audit log.
