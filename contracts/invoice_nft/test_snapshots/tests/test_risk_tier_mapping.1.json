@@ -2230,6 +2230,82 @@
         {
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "SmeInvoiceIds"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "SmeInvoiceIds"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "vec": [
+                    {
+                      "u64": 1
+                    },
+                    {
+                      "u64": 2
+                    },
+                    {
+                      "u64": 3
+                    },
+                    {
+                      "u64": 4
+                    },
+                    {
+                      "u64": 5
+                    },
+                    {
+                      "u64": 6
+                    },
+                    {
+                      "u64": 7
+                    },
+                    {
+                      "u64": 8
+                    },
+                    {
+                      "u64": 9
+                    },
+                    {
+                      "u64": 10
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          100000
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
             "key": "ledger_key_contract_instance",
             "durability": "persistent"
           }
@@ -2841,6 +2917,9 @@
                   }
                 },
                 {
+                  "symbol": "USDC"
+                },
+                {
                   "u64": 1700000000
                 }
               ]
@@ -3172,6 +3251,9 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+                },
+                {
+                  "symbol": "USDC"
                 },
                 {
                   "u64": 1700000000
@@ -3507,6 +3589,9 @@
                   }
                 },
                 {
+                  "symbol": "USDC"
+                },
+                {
                   "u64": 1700000000
                 }
               ]
@@ -3838,6 +3923,9 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+                },
+                {
+                  "symbol": "USDC"
                 },
                 {
                   "u64": 1700000000
@@ -4173,6 +4261,9 @@
                   }
                 },
                 {
+                  "symbol": "USDC"
+                },
+                {
                   "u64": 1700000000
                 }
               ]
@@ -4504,6 +4595,9 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+                },
+                {
+                  "symbol": "USDC"
                 },
                 {
                   "u64": 1700000000
@@ -4839,6 +4933,9 @@
                   }
                 },
                 {
+                  "symbol": "USDC"
+                },
+                {
                   "u64": 1700000000
                 }
               ]
@@ -5170,6 +5267,9 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+                },
+                {
+                  "symbol": "USDC"
                 },
                 {
                   "u64": 1700000000
@@ -5505,6 +5605,9 @@
                   }
                 },
                 {
+                  "symbol": "USDC"
+                },
+                {
                   "u64": 1700000000
                 }
               ]
@@ -5836,6 +5939,9 @@
                     "hi": 0,
                     "lo": 1000000000
                   }
+                },
+                {
+                  "symbol": "USDC"
                 },
                 {
                   "u64": 1700000000

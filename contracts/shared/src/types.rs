@@ -129,6 +129,34 @@ pub struct Bid {
     pub submitted_at: u64,
 }
 
+/// A single scheduled repayment installment.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Installment {
+    pub amount: i128,
+    pub due_date: u64,
+    pub paid: bool,
+}
+
+/// An installment repayment schedule attached to a financing pool.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InstallmentSchedule {
+    pub installments: Vec<Installment>,
+    /// Index of the next unpaid installment.
+    pub next_index: u32,
+}
+
+/// Protocol-wide aggregate statistics tracked by the financing pool.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolStats {
+    pub pools_opened: u32,
+    pub total_repaid: i128,
+    pub pools_defaulted: u32,
+    pub active_pools: u32,
+}
+
 /// A single investor position in a pool
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -181,31 +209,6 @@ pub struct PositionSaleOffer {
     pub invoice_id: u64,
     pub token: Address,
     pub price: i128,
-}
-
-/// A single scheduled repayment installment.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Installment {
-    pub due_date: u64,  // Unix timestamp by which this installment must be paid
-    pub amount: i128,   // Amount due for this installment (in pool token stroops)
-    pub paid: bool,     // Whether this installment has been satisfied
-}
-
-/// An optional repayment schedule attached to a Pool.
-///
-/// When present, `repay()` validates each call against the current unpaid
-/// installment in order.  The final installment closing the pool triggers
-/// yield distribution exactly as in lump-sum repayment.
-///
-/// Invariant: `sum(installment.amount for all installments)` == `Pool.total_owed`
-/// at the time the schedule is set.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct InstallmentSchedule {
-    pub installments: Vec<Installment>,
-    /// Index of the next installment that must be paid (0-based).
-    pub next_index: u32,
 }
 
 /// Protocol-wide aggregate statistics for the financing pool, used by
@@ -282,6 +285,7 @@ pub struct Proposal {
     pub proposer: Address,
     pub approvals: Vec<Address>,
     pub executed: bool,
+    pub cancelled: bool,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -316,5 +320,20 @@ pub struct ParameterProposal {
     pub approvals: Vec<Address>, // signers that have voted in favour
     pub created_at: u64,
     pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+/// A multisig signer recovery proposal for lost-key scenarios.
+/// Allows reconfiguring the signer set after a long timelock if quorum becomes unreachable.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecoveryProposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub new_signers: Vec<Address>,
+    pub new_threshold: u32,
+    pub created_at: u64,
+    pub objections: Vec<Address>, // signers that have objected to recovery
     pub executed: bool,
 }

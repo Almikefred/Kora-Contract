@@ -3,10 +3,8 @@
 use kora_shared::{
     errors::CommonError,
     events,
-    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer},
-    validation::{bps_of, bps_of_normalized, require_valid_bps_range, UPGRADE_TIMELOCK_DELAY},
     types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer, ProtocolStats},
-    validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of, bps_of_normalized, require_valid_bps_range, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Symbol, Vec,
@@ -78,20 +76,6 @@ pub enum DataKey {
     ProtocolStats,
     /// Installment repayment schedule for a pool, keyed by invoice ID.
     InstallmentSchedule(u64),
-    /// Optional installment repayment schedule for a pool.
-    InstallmentSchedule(u64),
-    /// Aggregate protocol-wide metrics.
-    ProtocolStats,
-}
-
-/// Aggregate protocol-wide metrics tracked across all pools.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProtocolStats {
-    pub pools_opened: u32,
-    pub total_repaid: i128,
-    pub pools_defaulted: u32,
-    pub active_pools: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -278,45 +262,14 @@ impl FinancingPoolContract {
             .unwrap_or(5_000)
     }
 
-    /// Update the late-repayment penalty applied to overdue invoices.
-    /// Admin only. Can be synchronized with access_control governance if configured.
-    ///
-    /// **Parameters:**
-    /// - `admin` — Must be the current admin address.
-    /// - `late_penalty_bps` — Late-repayment penalty in basis points (0–10 000).
-    ///
-    /// **Errors:**
-    /// - `FinancingPoolError::NotAdmin` — Caller is not the admin.
-    /// - `FinancingPoolError::InvalidFeeRate` — `late_penalty_bps` > 10 000.
-    ///
-    /// **Security:** Requires `admin.require_auth()`. Once parameter governance is active
-    /// in access_control, this direct setter may be blocked to enforce governance exclusivity.
-    /// Governed value (if present) takes precedence when applying penalties.
-    pub fn set_late_penalty_bps(env: Env, admin: Address, late_penalty_bps: u32) -> Result<(), FinancingPoolError> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
-        require_valid_fee_bps(late_penalty_bps)?;
-        env.storage().instance().set(&DataKey::LatePenaltyBps, &late_penalty_bps);
-        Ok(())
-    }
-
-    /// Returns the current late-repayment penalty in basis points.
-    /// Checks access_control governance first if available; falls back to locally stored value.
-    ///
-    /// **Returns:** The penalty in bps (default 200 = 2% if not explicitly set).
-    ///
-    /// **Security:** Read-only view. No authorization required.
-    /// This function is the integration point for parameter governance.
-    pub fn get_late_penalty_bps(env: Env) -> u32 {
-        // TODO: When access_control cross-contract calls are integrated, add:
-        // let access_control = Address::from_contract_id(&env, &env.storage().persistent().get(&DataKey::AccessControl).unwrap());
-        // if let Ok(governed_value) = AccessControlContractClient::new(&env, &access_control).get_parameter(...) {
-        //     return governed_value;
-        // }
+    /// Returns the configured price oracle address. Lets other protocol
+    /// contracts (e.g. marketplace, for cross-currency funding) reuse the
+    /// same oracle instance instead of wiring a separate reference. (#449)
+    pub fn get_price_oracle(env: Env) -> Result<Address, KoraError> {
         env.storage()
             .instance()
-            .get(&DataKey::LatePenaltyBps)
-            .unwrap_or(200)
+            .get(&DataKey::PriceOracle)
+            .ok_or(KoraError::NotInitialized)
     }
 
     /// Register an investor position for a funded invoice. Admin only.
@@ -487,6 +440,7 @@ impl FinancingPoolContract {
 
         if pool.is_closed {
             env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+            return Err(KoraError::PoolAlreadyClosed);
             return Err(FinancingPoolError::RepaymentAlreadyMade);
         }
 
@@ -515,6 +469,7 @@ impl FinancingPoolContract {
             if idx >= len {
                 // All installments already satisfied — pool should have been closed.
                 env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::PoolAlreadyClosed);
                 return Err(FinancingPoolError::RepaymentAlreadyMade);
             }
             let installment = schedule.installments.get(idx).unwrap();
@@ -1328,37 +1283,6 @@ impl FinancingPoolContract {
         Ok(())
     }
 
-    /// Paginated view of investor positions for an invoice.
-    ///
-    /// Returns at most `limit` positions starting at `offset` (0-based index
-    /// into the position list ordered by investor address key).  An `offset`
-    /// beyond the last position returns an empty vec; `limit` is capped at 100
-    /// to bound per-call CPU cost.
-    pub fn get_positions_page(
-        env: Env,
-        invoice_id: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<Position> {
-        let limit = limit.min(100);
-        let positions: Map<Address, Position> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Positions(invoice_id))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let all: Vec<Position> = positions.values();
-        let total = all.len();
-        let start = offset.min(total) as usize;
-        let end = (start + limit as usize).min(total as usize);
-
-        let mut page: Vec<Position> = Vec::new(&env);
-        for i in start..end {
-            page.push_back(all.get(i as u32).unwrap());
-        }
-        page
-    }
-
     /// Returns the total number of investor positions recorded for an invoice.
     ///
     /// **Parameters:**
@@ -1490,15 +1414,23 @@ impl FinancingPoolContract {
             None => return Ok(amount),
         };
 
-        let oracle_client =
-            kora_price_oracle::PriceOracleContractClient::new(env, &oracle_addr);
-
         // Use the invoice currency symbol directly; pool token symbol is
         // derived from the token contract but for oracle lookup we use the
         // same symbol convention.  If the oracle has no pair registered
         // for (from, to), the convert call will fail — this is intentional
         // to reject operations without a valid price.
         let pool_currency = Symbol::new(env, "USDC");
+
+        // No conversion needed when the invoice is already denominated in the
+        // pool's currency — skip the oracle call entirely so pools can operate
+        // without a price_oracle wired up (or with a dummy address) as long as
+        // they never handle cross-currency invoices.
+        if invoice_currency == &pool_currency {
+            return Ok(amount);
+        }
+
+        let oracle_client =
+            kora_price_oracle::PriceOracleContractClient::new(env, &oracle_addr);
 
         Ok(oracle_client.convert(&amount, invoice_currency, &pool_currency))
     }
@@ -1694,7 +1626,7 @@ mod tests {
         let ac = Address::generate(&env);
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &0u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
     }
 
     #[test]
@@ -1710,7 +1642,7 @@ mod tests {
         let ac = Address::generate(&env);
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &10_001u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
     }
 
     #[test]
@@ -1727,7 +1659,7 @@ mod tests {
         let oracle = Address::generate(&env);
         client.initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &5_000u32);
         let result = client.try_set_max_position_bps(&admin, &0u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
         // Existing config is untouched by the rejected update.
         assert_eq!(client.get_max_position_bps(), 5_000u32);
     }
