@@ -218,6 +218,67 @@ impl MarketplaceContract {
         Self::min_contribution_floor(&env)
     }
 
+    /// Set the maximum fraction of `asking_price` any single investor may hold
+    /// across all their `fund_invoice` calls on a given listing, expressed in
+    /// basis points. Admin only. Pass `0` to disable (uncapped). (#435)
+    ///
+    /// **Errors:** `NotAdmin`
+    pub fn set_max_investor_share_bps(
+        env: Env,
+        admin: Address,
+        max_bps: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        require_valid_fee_bps(max_bps)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxInvestorShareBps, &max_bps);
+        Ok(())
+    }
+
+    /// Returns the current per-investor concentration cap in basis points.
+    /// `0` means uncapped (default).
+    pub fn get_max_investor_share_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxInvestorShareBps)
+            .unwrap_or(0)
+    }
+
+    /// Mark an investor address as accredited, enabling them to call
+    /// `fund_invoice`. Admin only. (#436)
+    ///
+    /// **Errors:** `NotAdmin`
+    pub fn set_investor_accredited(
+        env: Env,
+        admin: Address,
+        investor: Address,
+        accredited: bool,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvestorAccredited(investor.clone()), &accredited);
+        Self::bump_persistent(&env, &DataKey::InvestorAccredited(investor));
+        Ok(())
+    }
+
+    /// Returns whether `investor` is currently marked as accredited.
+    pub fn is_investor_accredited(env: Env, investor: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::InvestorAccredited(investor))
+            .unwrap_or(false)
+    }
+
     /// Set a per-risk-tier fee override. Admin only. (#210)
     pub fn set_tier_fee_bps(
         env: Env,
@@ -599,6 +660,48 @@ impl MarketplaceContract {
 
         let config = Self::load_config(&env)?;
 
+        // === #436: Investor compliance gate — must precede any token movement ===
+        // Mirrors the seller-side require_compliance_attested check in list_invoice.
+        // An investor whose accreditation flag is absent or explicitly false is
+        // rejected before touching any other state.
+        Self::require_investor_accredited(&env, &investor)?;
+
+        // === #435: Per-listing investor concentration cap ===
+        // Compute prospective gross (pre-fee) cumulative contribution and reject
+        // if it would exceed cap_bps of asking_price.  0 = uncapped (default).
+        let cap_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxInvestorShareBps)
+            .unwrap_or(0);
+        if cap_bps > 0 {
+            let gross_key = DataKey::GrossContribution(invoice_id, investor.clone());
+            let prev_gross: i128 = env
+                .storage()
+                .persistent()
+                .get(&gross_key)
+                .unwrap_or(0);
+            let prospective = safe_add(prev_gross, amount)?;
+            // prospective * 10_000 / asking_price > cap_bps
+            // rearranged to avoid division: prospective * 10_000 > cap_bps * asking_price
+            let lhs = prospective
+                .checked_mul(10_000)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+            let rhs = (cap_bps as i128)
+                .checked_mul(listing.asking_price)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+            if lhs > rhs {
+                events::investor_concentration_exceeded(
+                    &env,
+                    invoice_id,
+                    &investor,
+                    prospective,
+                    cap_bps,
+                );
+                return Err(KoraError::InvestorConcentrationExceeded);
+            }
+        }
+
         // Check per-invoice freeze before any token operations.
         // Enforced in addition to the protocol-wide pause so a single disputed
         // invoice can be frozen without halting all protocol activity.
@@ -966,6 +1069,146 @@ impl MarketplaceContract {
         Ok(())
     }
 
+    /// Amend an active, **unfunded** listing's asking price, funding deadline,
+    /// or token. Only the seller or admin may call this, and only while
+    /// `funded_amount == 0`. Any partial funding makes the listing immutable
+    /// until it is cancelled and re-listed. (#437)
+    ///
+    /// All provided values are re-validated using the same rules as
+    /// `list_invoice`: asking_price < face_value, future deadline, whitelisted
+    /// token. Pass `None` for any field you do not want to change.
+    ///
+    /// **Errors:**
+    /// - `NotAdmin` / `Unauthorized` — caller is neither seller nor admin.
+    /// - `ListingNotFound` — no active listing for `invoice_id`.
+    /// - `ListingAlreadyCancelled` — listing is inactive.
+    /// - `ListingAlreadyFunded` — `funded_amount > 0`; amendment is not allowed.
+    /// - `InvalidAmount` — new asking price is invalid or not discounted enough.
+    /// - `InvalidDueDate` — new deadline is not in the future.
+    /// - `TokenNotWhitelisted` — new token is not on the whitelist.
+    pub fn amend_listing(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_asking_price: Option<i128>,
+        new_funding_deadline: Option<u64>,
+        new_token: Option<Address>,
+    ) -> Result<(), KoraError> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let mut listing: Listing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Listing(invoice_id))
+            .ok_or(KoraError::ListingNotFound)?;
+
+        if !listing.is_active {
+            return Err(KoraError::ListingAlreadyCancelled);
+        }
+
+        // Amendment is only allowed before any investor capital has been committed.
+        if listing.funded_amount > 0 {
+            return Err(KoraError::ListingAlreadyFunded);
+        }
+
+        let config = Self::load_config(&env)?;
+        if caller != listing.seller && caller != config.admin {
+            return Err(KoraError::Unauthorized);
+        }
+
+        // Snapshot old values for the event.
+        let old_asking_price = listing.asking_price;
+        let old_deadline = listing.funding_deadline;
+
+        // Apply and validate each optional field.
+        if let Some(price) = new_asking_price {
+            require_non_zero_amount(price)?;
+            require_within_max_amount(price)?;
+            if price >= listing.face_value {
+                return Err(KoraError::InvalidAmount);
+            }
+            listing.asking_price = price;
+        }
+        if let Some(deadline) = new_funding_deadline {
+            kora_shared::validation::require_future_timestamp(&env, deadline)?;
+            listing.funding_deadline = deadline;
+        }
+        if let Some(ref token) = new_token {
+            Self::require_whitelisted_token(&env, token)?;
+            listing.token = token.clone();
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(invoice_id), &listing);
+        Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
+
+        events::listing_amended(
+            &env,
+            invoice_id,
+            &caller,
+            old_asking_price,
+            listing.asking_price,
+            old_deadline,
+            listing.funding_deadline,
+        );
+        Ok(())
+    }
+
+    /// Return a page of investor addresses that have funded `invoice_id`. (#438)
+    ///
+    /// `page` is 0-indexed; results are in order of first contribution.
+    /// `page_size` is clamped to 1–50.
+    pub fn get_listing_investors(
+        env: Env,
+        invoice_id: u64,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<Address> {
+        let page_size = (page_size.max(1).min(50)) as usize;
+        let all: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ListingInvestors(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let start = (page as usize).saturating_mul(page_size);
+        let mut out = Vec::new(&env);
+        let mut i = start as u32;
+        let end = (start + page_size).min(all.len() as usize) as u32;
+        while i < end {
+            out.push_back(all.get_unchecked(i));
+            i += 1;
+        }
+        out
+    }
+
+    /// Sum of all net (post-fee) contributions still outstanding for `invoice_id`. (#438)
+    ///
+    /// Iterates the `ListingInvestors` index and sums `Contribution` entries,
+    /// providing an on-chain reconciliation view that should equal
+    /// `listing.funded_amount` minus any fees collected.
+    pub fn get_total_outstanding_contribution(env: Env, invoice_id: u64) -> i128 {
+        let investors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ListingInvestors(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total: i128 = 0;
+        for investor in investors.iter() {
+            let contrib: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Contribution(invoice_id, investor.clone()))
+                .unwrap_or(0);
+            // Saturating add: malformed storage cannot cause a panic.
+            total = total.saturating_add(contrib);
+        }
+        total
+    }
+
     /// Get a listing by invoice_id.
     pub fn get_listing(env: Env, invoice_id: u64) -> Result<Listing, KoraError> {
         env.storage()
@@ -981,6 +1224,21 @@ impl MarketplaceContract {
         let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &config.risk_registry);
         if !rr.is_compliance_attested(sme) {
             return Err(KoraError::ComplianceNotAttested);
+        }
+        Ok(())
+    }
+
+    /// Enforce investor-side accreditation gate (#436).
+    /// Returns `Err(InvestorNotAccredited)` when the investor's accreditation
+    /// flag is absent or explicitly `false`.
+    fn require_investor_accredited(env: &Env, investor: &Address) -> Result<(), KoraError> {
+        let accredited: bool = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::InvestorAccredited(investor.clone()))
+            .unwrap_or(false);
+        if !accredited {
+            return Err(KoraError::InvestorNotAccredited);
         }
         Ok(())
     }

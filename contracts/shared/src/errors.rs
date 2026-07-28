@@ -89,6 +89,12 @@ pub enum KoraError {
     CreditLimitExceeded = 121,
     // invoice_nft: currency symbol is not on the allowlist
     CurrencyNotAllowed = 122,
+    // marketplace: investor's prospective share would exceed the per-listing concentration cap (#435)
+    InvestorConcentrationExceeded = 123,
+    // marketplace: investor address has not been marked accredited (#436)
+    InvestorNotAccredited = 124,
+    // marketplace: amendment rejected because funding has already begun (#437)
+    ListingAlreadyFunded = 125,
 }
 
 /// Common validation/arithmetic errors shared by every contract's
