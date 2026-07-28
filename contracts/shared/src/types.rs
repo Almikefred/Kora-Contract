@@ -285,6 +285,7 @@ pub struct Proposal {
     pub proposer: Address,
     pub approvals: Vec<Address>,
     pub executed: bool,
+    pub cancelled: bool,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -319,6 +320,7 @@ pub struct ParameterProposal {
     pub approvals: Vec<Address>, // signers that have voted in favour
     pub created_at: u64,
     pub executed: bool,
+    pub cancelled: bool,
 }
 
 /// A multisig signer recovery proposal for lost-key scenarios.

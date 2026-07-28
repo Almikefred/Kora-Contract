@@ -46,6 +46,8 @@ pub enum AccessControlError {
     ThresholdNotMet = 25,
     Unauthorized = 26,
     UpgradeTimelockNotElapsed = 27,
+    ProposalCancelled = 28,
+    ParameterProposalCancelled = 29,
 }
 
 impl From<CommonError> for AccessControlError {
@@ -438,6 +440,7 @@ impl AccessControlContract {
             proposer: proposer.clone(),
             approvals,
             executed: false,
+            cancelled: false,
             created_at: env.ledger().timestamp(),
             expires_at: env.ledger().timestamp() + PROPOSAL_TTL_LEDGERS,
         };
@@ -504,6 +507,9 @@ impl AccessControlContract {
         if proposal.executed {
             return Err(AccessControlError::ProposalAlreadyExecuted);
         }
+        if proposal.cancelled {
+            return Err(AccessControlError::ProposalCancelled);
+        }
         if env.ledger().timestamp() > proposal.expires_at {
             return Err(AccessControlError::ProposalExpired);
         }
@@ -569,6 +575,9 @@ impl AccessControlContract {
 
         if proposal.executed {
             return Err(AccessControlError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(AccessControlError::ProposalCancelled);
         }
         if env.ledger().timestamp() > proposal.expires_at {
             return Err(AccessControlError::ProposalExpired);
@@ -643,6 +652,42 @@ impl AccessControlContract {
         Ok(())
     }
 
+    /// Cancel a proposal before execution. Only the proposer or a quorum of signers may cancel.
+    pub fn cancel_action(
+        env: Env,
+        canceller: Address,
+        proposal_id: u64,
+    ) -> Result<(), AccessControlError> {
+        canceller.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &canceller)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(AccessControlError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(AccessControlError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(AccessControlError::ProposalCancelled);
+        }
+
+        if proposal.proposer != canceller && proposal.approvals.len() < config.threshold {
+            return Err(AccessControlError::Unauthorized);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+
+        Ok(())
+    }
+
     /// Get a proposal by ID.
     ///
     /// **Parameters:**
@@ -707,6 +752,7 @@ impl AccessControlContract {
             approvals,
             created_at: env.ledger().timestamp(),
             executed: false,
+            cancelled: false,
         };
 
         env.storage()
@@ -762,6 +808,9 @@ impl AccessControlContract {
         if proposal.executed {
             return Err(AccessControlError::ParameterProposalAlreadyExecuted);
         }
+        if proposal.cancelled {
+            return Err(AccessControlError::ParameterProposalCancelled);
+        }
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == signer {
                 return Err(KoraError::AlreadyInitialized);
@@ -802,6 +851,9 @@ impl AccessControlContract {
         if proposal.executed {
             return Err(AccessControlError::ParameterProposalAlreadyExecuted);
         }
+        if proposal.cancelled {
+            return Err(AccessControlError::ParameterProposalCancelled);
+        }
         if proposal.approvals.len() < config.threshold {
             return Err(AccessControlError::GovernanceThresholdNotMet);
         }
@@ -824,6 +876,42 @@ impl AccessControlContract {
         events::action_executed(&env, proposal_id, &caller);
         let details = (proposal.key, proposal.new_value).into_val(&env);
         Self::append_audit_entry(&env, &caller, AdminActionType::ExecuteParameter, details);
+        Ok(())
+    }
+
+    /// Cancel a parameter-change proposal before execution. Only the proposer or a quorum of signers may cancel.
+    pub fn cancel_parameter_change(
+        env: Env,
+        canceller: Address,
+        proposal_id: u64,
+    ) -> Result<(), AccessControlError> {
+        canceller.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &canceller)?;
+
+        let mut proposal: ParameterProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ParameterProposal(proposal_id))
+            .ok_or(AccessControlError::ParameterProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(AccessControlError::ParameterProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(AccessControlError::ParameterProposalCancelled);
+        }
+
+        if proposal.proposer != canceller && proposal.approvals.len() < config.threshold {
+            return Err(AccessControlError::Unauthorized);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ParameterProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::ParameterProposal(proposal_id));
+
         Ok(())
     }
 
